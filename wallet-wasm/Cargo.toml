@@ -1,0 +1,18 @@
+[package]
+name = "bitcheque-web"
+version = "0.1.0"
+edition = "2021"
+description = "The browser's copy of the wallet: the same Rust book and registration code as the node, compiled to WebAssembly. No dependencies."
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+bitcheque = { path = ".." }
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"

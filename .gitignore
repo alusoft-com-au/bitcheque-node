@@ -1,0 +1,7 @@
+/target/
+/wallet-wasm/target/
+__pycache__/
+*.dat
+*.dat.peers
+*.snap
+*.log
