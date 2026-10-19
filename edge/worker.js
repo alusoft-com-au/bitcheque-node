@@ -21,7 +21,7 @@ const QUIET_S = 50;              // the backup miner mines when no block has com
                                  // mining it finds one each wake, about one a minute (the block target)
 const MINE_MS = 3000;            // at most this long per wake (the floor is ~2^19 hashes: about a second here)
 const MINE_TRIES = 50_000;       // nonces per call into the wasm, between clock checks
-const CHAIN_VERSION = '5';        // bump to reset the network: each region forgets its chain and starts from block 0
+const CHAIN_VERSION = '6';        // bump to reset the network: each region forgets its chain and starts from block 0
 const FALLBACK_S = 120;          // each further region in MINE_REGIONS waits this much longer (if the first is down)
 const RERELAY_MAX = 50;          // waiting transactions offered again to each other region per wake
 const POOL_MAX = 1000;           // waiting transactions kept in the database across unloads (all offered again on load)
@@ -156,7 +156,7 @@ export class EdgeNode extends DurableObject {
   // ---- the backup miner: so the chain never stalls for want of miners. Only the regions in MINE_REGIONS, only
   // after QUIET_S without a block (later regions wait longer, so they step in only if the first is down);
   // real miners keep the tip fresh, so it stays idle while anyone else is mining ----
-  backup() {
+  async backup() {
     const x = this.x;
     const rank = (this.env.MINE_REGIONS || '').split(',').map(s => s.trim()).indexOf(this.meta('region'));
     if (rank < 0) return;
@@ -166,8 +166,10 @@ export class EdgeNode extends DurableObject {
     while (Date.now() < end) {
       this.now();
       const r = x.mine(payee, start, MINE_TRIES); start = (start + MINE_TRIES) >>> 0;
+      // hand the block to the other regions before the alarm returns: background work started in an alarm is
+      // cut off when it ends, which left the others a minute behind until their own sync
       if (r === 1) { const body = this.out(x.io_len()); note({ found: true });
-        this.ctx.waitUntil(Promise.allSettled(this.upstreams().map(up => this.call(up, '/block', { method: 'POST', body })))); return; }
+        await Promise.allSettled(this.upstreams().map(up => this.call(up, '/block', { method: 'POST', body }))); return; }
       if (r === 2) { const why = this.out(x.io_len());
         if (payee && /payee/.test(why)) { payee = 0; continue; }   // the account does not exist yet: mine to nobody
         note({ error: why }); return; }
@@ -189,7 +191,7 @@ export class EdgeNode extends DurableObject {
       for (const tx of live.slice(0, RERELAY_MAX)) { try { await this.call(up, '/tx', { method: 'POST', body: tx }); } catch (_) {} }
   }
   // every minute; straight away again while catching up
-  async alarm() { let n = 0; try { n = await this.sync(); if (n < MAX_PER_WAKE) this.backup(); } finally { await this.ctx.storage.setAlarm(Date.now() + (n >= MAX_PER_WAKE ? 1000 : SYNC_MS)); } }
+  async alarm() { let n = 0; try { n = await this.sync(); if (n < MAX_PER_WAKE) await this.backup(); } finally { await this.ctx.storage.setAlarm(Date.now() + (n >= MAX_PER_WAKE ? 1000 : SYNC_MS)); } }
 
   async fetch(req) {
     const url = new URL(req.url);
@@ -210,7 +212,7 @@ export class EdgeNode extends DurableObject {
     // a new transaction or a newly mined block goes on to the other regions and upstream nodes at once
     // (not back to the region that sent it); polling every minute is only the safety net
     if (req.method === 'POST' && (url.pathname === '/tx' || url.pathname === '/block') && code === 200 && !req.headers.get('X-Edge-Peer'))
-      this.ctx.waitUntil(this.relayed = this.relayed.then(() => Promise.allSettled(this.upstreams().map(up => this.call(up, url.pathname, { method: 'POST', body })))));
+      await (this.relayed = this.relayed.then(() => Promise.allSettled(this.upstreams().map(up => this.call(up, url.pathname, { method: 'POST', body })))));   // before replying: background work may be cut off
     if (req.method === 'POST' && url.pathname === '/block') this.trim();
     return text(reply, code);
   }
