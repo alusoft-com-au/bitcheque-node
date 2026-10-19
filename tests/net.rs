@@ -15,7 +15,7 @@ fn wait(cond: impl Fn() -> bool) { let t = Instant::now(); while !cond() { asser
 
 #[test]
 fn sync_and_relay() {
-    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, reg_pow_target: U256::MAX.shr(4), slow_start_blocks: 1, ..Params::mainnet() };
+    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, reg_pow_target: U256::MAX.shr(4), launch_blocks: 0, ..Params::mainnet() };
     let g = Chain::genesis(&p, bitcheque::net::now() - 100_000, b"net test");
     let a = Node::new(Store::open(p.clone(), &g, None).unwrap());
     let b = Node::new(Store::open(p.clone(), &g, None).unwrap());
@@ -44,7 +44,7 @@ fn sync_and_relay() {
 fn queued_cheque_does_not_block_the_next() {
     use bitcheque::message::Message;
     use bitcheque::params::COIN;
-    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, reg_pow_target: U256::MAX.shr(4), slow_start_blocks: 1, reward_maturity: 2, number_maturity: 2,
+    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, reg_pow_target: U256::MAX.shr(4), launch_blocks: 0, reward_maturity: 2, number_maturity: 2,
                      piece_lifetime: 3, reward_base: 50 * COIN, ..Params::mainnet() };
     let g = Chain::genesis(&p, bitcheque::net::now() - 100_000, b"queue test");
     let a = Node::new(Store::open(p.clone(), &g, None).unwrap());
@@ -80,7 +80,7 @@ fn queued_cheque_does_not_block_the_next() {
 /// A passed it on in reply to GET_ADDR), and dials B on its own.
 #[test]
 fn peers_find_each_other_through_gossip() {
-    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, slow_start_blocks: 1, ..Params::mainnet() };
+    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, launch_blocks: 0, ..Params::mainnet() };
     let g = Chain::genesis(&p, bitcheque::net::now() - 100_000, b"gossip test");
     let mk = || Node::new(Store::open(p.clone(), &g, None).unwrap());
     let (a, b, c) = (mk(), mk(), mk());

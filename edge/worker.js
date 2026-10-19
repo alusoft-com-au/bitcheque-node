@@ -3,8 +3,10 @@
 // and send mined blocks to POST /block; transactions arrive at POST /tx. Whatever one region accepts it
 // passes straight to the others (and to any upstream nodes); each also wakes every minute and pulls what
 // it missed (GET /height, GET /block/<n>). Blocks live in its SQLite database. Cost: it sleeps between
-// wakes (no duration billed). One region (MINE_REGION) is also a backup miner: when no block has come for
-// QUIET_S, it mines for up to MINE_MS at the current target, paying account MINER_TO (0 = nobody).
+// wakes (no duration billed). The regions in MINE_REGIONS are also backup miners: when no block has come for
+// QUIET_S (the first region), QUIET_S + FALLBACK_S (the second) and so on, one mines for up to MINE_MS at the
+// current target, paying account MINER_TO (0 = nobody). Changing CHAIN_VERSION wipes every region's database
+// once, on its next wake: a network reset.
 import { DurableObject } from 'cloudflare:workers';
 import WASM from './bitcheque_edge.wasm';
 
@@ -18,8 +20,11 @@ const QUIET_S = 50;              // the backup miner mines when no block has com
                                  // mining it finds one each wake, about one a minute (the block target)
 const MINE_MS = 3000;            // at most this long per wake (the floor is ~2^19 hashes: about a second here)
 const MINE_TRIES = 50_000;       // nonces per call into the wasm, between clock checks
-const POOL_MAX = 5000;           // waiting transactions kept in the database across unloads
-const NOT_CACHED = new Set(['height', 'tip', 'template']);   // miners and the status page need these fresh
+const CHAIN_VERSION = '3';        // bump to reset the network: each region forgets its chain and starts from block 0
+const FALLBACK_S = 120;          // each further region in MINE_REGIONS waits this much longer (if the first is down)
+const POOL_MAX = 1000;           // waiting transactions kept in the database across unloads (all offered again on load)
+const FRESH = new Set(['height', 'tip', 'template']);   // miners and the status page need these nearly fresh
+const FRESH_S = 2;               // ...but a short cache still collapses a flood of them into one request per colo
 const CACHE_S = 15;              // seconds the front worker caches a GET reply (status pages poll every 10 s)
 // the RPC's first path segments: anything else is refused here, without waking a Durable Object
 const ROUTES = new Set(['height', 'peers', 'addrs', 'tip', 'block', 'summary', 'account', 'id', 'lookup', 'proof', 'regtarget', 'history', 'stats', 'mempool', 'top', 'template', 'tx', 'check', 'edge']);
@@ -38,6 +43,11 @@ export class EdgeNode extends DurableObject {
                    CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
                    CREATE TABLE IF NOT EXISTS pool (id INTEGER PRIMARY KEY AUTOINCREMENT, tx TEXT NOT NULL UNIQUE)`);
     this.x = null;
+    if (this.meta('chain_version') !== CHAIN_VERSION) {   // a network reset: start again from block 0
+      this.sql.exec('DELETE FROM blocks; DELETE FROM headers; DELETE FROM snap; DELETE FROM pool');
+      this.sql.exec('DELETE FROM meta WHERE k != ?', 'region');   // keep the region: an alarm may wake it before any request
+      this.meta('chain_version', CHAIN_VERSION);
+    }
   }
   meta(k, v) { if (v === undefined) return this.sql.exec('SELECT v FROM meta WHERE k = ?', k).toArray()[0]?.v; this.sql.exec('INSERT OR REPLACE INTO meta VALUES (?, ?)', k, String(v)); }
   bytes(p, n) { return new Uint8Array(this.x.memory.buffer, p, n).slice(); }
@@ -134,12 +144,14 @@ export class EdgeNode extends DurableObject {
     this.meta('last_sync', JSON.stringify({ at: new Date().toISOString(), height: x.height(), fetched, log }));
     return fetched;
   }
-  // ---- the backup miner: so the chain never stalls for want of miners. Only MINE_REGION, only after QUIET_S
-  // without a block; real miners keep the tip fresh, so it stays idle while anyone else is mining ----
+  // ---- the backup miner: so the chain never stalls for want of miners. Only the regions in MINE_REGIONS, only
+  // after QUIET_S without a block (later regions wait longer, so they step in only if the first is down);
+  // real miners keep the tip fresh, so it stays idle while anyone else is mining ----
   backup() {
     const x = this.x;
-    if (!this.env.MINE_REGION || this.meta('region') !== this.env.MINE_REGION) return;
-    this.now(); if (x.quiet() < QUIET_S) return;
+    const rank = (this.env.MINE_REGIONS || '').split(',').map(s => s.trim()).indexOf(this.meta('region'));
+    if (rank < 0) return;
+    this.now(); if (x.quiet() < QUIET_S + rank * FALLBACK_S) return;
     let payee = +(this.env.MINER_TO || 0), start = (Math.random() * 2 ** 32) >>> 0;
     const end = Date.now() + MINE_MS, note = o => this.meta('last_mined', JSON.stringify({ at: new Date().toISOString(), height: x.height(), payee, ...o }));
     while (Date.now() < end) {
@@ -192,13 +204,12 @@ export default {
     const inner = new URL(url.pathname + `?region=${region}`, 'https://edge');
     if (req.method === 'HEAD') { const r = await stub.fetch(inner); return new Response(null, r); }   // headers only
     if (req.method !== 'GET') return stub.fetch(inner, { method: req.method, body: await req.text() });
-    if (NOT_CACHED.has(url.pathname.split('/')[1])) return stub.fetch(inner);
-    const cache = caches.default, key = new Request(url.origin + url.pathname);
+    const fresh = FRESH.has(url.pathname.split('/')[1]), cache = caches.default, key = new Request(url.origin + url.pathname);
     const hit = await cache.match(key);
     if (hit) return hit;
     const res = await stub.fetch(inner);
     const out = new Response(res.body, res);
-    if (res.ok) { out.headers.set('Cache-Control', `public, max-age=${CACHE_S}`); ctx.waitUntil(cache.put(key, out.clone())); }
+    if (res.ok) { out.headers.set('Cache-Control', `public, max-age=${fresh ? FRESH_S : CACHE_S}`); ctx.waitUntil(cache.put(key, out.clone())); }
     return out;
   },
   // a watchdog: wake each region so its alarm keeps running even if nothing has called it

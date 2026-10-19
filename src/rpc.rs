@@ -200,7 +200,7 @@ impl Node {
                 let total: u64 = v.iter().map(|a| a.balance).sum();
                 let pending: u64 = c.state.pending.values().flatten().map(|(_, amt)| amt).sum();
                 let minted: u64 = (1..=c.height()).map(|h| c.params.block_reward(h)).sum();
-                let max_supply: u64 = (0..64u32).map(|k| c.params.reward_base >> k).sum::<u64>() * c.params.halving_interval as u64;
+                let max_supply = c.params.max_supply();
                 let head = format!("height {}\naccounts {}\ntotal {total}\npending {pending}\nminted {minted}\nmax_supply {max_supply}\n", c.height(), v.len());
                 let rows: Vec<String> = v.iter().filter(|a| is_final(c, a.number)).take(200).map(|a| format!("{} {} {} {} {}\n", a.number, a.balance, a.book_size, a.nonce.map_or(-1, |x| x as i64), a.commits.len())).collect();
                 let out = head.clone() + &rows[..n.min(rows.len())].concat();
@@ -210,9 +210,9 @@ impl Node {
             ("GET", ["stats"]) => {
                 let next = c.height() + 1;
                 let p = &c.params;
-                Ok(format!("height {}\naccounts {}\nregistrations {}\ntransfers {}\ntransactions {}\npieces {}\nrewards {}\nblock_target {}\nreward {}\nreward_base {}\nhalving_interval {}\nnext_halving {}\nreward_maturity {}\nslow_start {}",
+                Ok(format!("height {}\naccounts {}\nregistrations {}\ntransfers {}\ntransactions {}\npieces {}\nrewards {}\nblock_target {}\nreward {}\nreward_base {}\nhalving_interval {}\nnext_halving {}\nreward_maturity {}\nlaunch_blocks {}\nlaunch_reward {}",
                     c.height(), c.state.accounts.len(), c.totals.registrations, c.totals.transfers, c.totals.txs, c.totals.pieces, c.totals.rewards, p.block_target_seconds,
-                    p.block_reward(next), p.reward_base, p.halving_interval, (next / p.halving_interval + 1) * p.halving_interval, p.reward_maturity, p.slow_start_blocks))
+                    p.block_reward(next), p.reward_base, p.halving_interval, p.next_halving(next), p.reward_maturity, p.launch_blocks, p.launch_reward))
             }
             ("GET", ["regtarget"]) => Ok(c.state.reg_target.0.iter().map(|l| format!("{l:016x}")).collect::<Vec<_>>().join(" ")),
             ("GET", ["proof", n]) => {

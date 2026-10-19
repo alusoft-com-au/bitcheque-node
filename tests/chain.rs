@@ -9,7 +9,7 @@ use bitcheque::wallet::{mine_registration, Book, Domain};
 
 fn params() -> Params {
     Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, reg_pow_target: U256::MAX.shr(4), reward_maturity: 2, number_maturity: 2,
-             slow_start_blocks: 1, piece_lifetime: 3, unfunded_pow_lifetime: 50, max_future_seconds: 1 << 30, reward_base: 50 * COIN, ..Params::mainnet() }
+             launch_blocks: 0, piece_lifetime: 3, unfunded_pow_lifetime: 50, max_future_seconds: 1 << 30, reward_base: 50 * COIN, ..Params::mainnet() }
 }
 struct Net { chain: Chain, t: u32 }
 impl Net {
@@ -101,7 +101,7 @@ fn genesis_vector() {
 fn stall_relief_restarts_an_abandoned_chain() {
     use bitcheque::block::{next_bits, relieved_bits};
     use bitcheque::u256::U256;
-    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, stall_relief: true, slow_start_blocks: 1, ..Params::mainnet() };
+    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, stall_relief: true, launch_blocks: 0, ..Params::mainnet() };
     let (t, f) = (p.block_target_seconds, p.max_future_seconds);
     let t0 = 1000u32;
     let mut c = Chain::new(p.clone(), &Chain::genesis(&p, t0, b"relief")).unwrap();
@@ -130,7 +130,7 @@ fn stall_relief_restarts_an_abandoned_chain() {
 #[test]
 fn alternating_timestamps_earn_no_relief() {
     use bitcheque::block::{next_bits, relieved_bits};
-    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, stall_relief: true, slow_start_blocks: 1, ..Params::mainnet() };
+    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, stall_relief: true, launch_blocks: 0, ..Params::mainnet() };
     let now = 1_000_000u32;
     let mut c = Chain::new(p.clone(), &Chain::genesis(&p, now - 1000, b"relief")).unwrap();
     for i in 1..=12 { let b = c.make_block(now - 120 + 10 * i, 0, vec![]).unwrap(); c.add(&b, now).unwrap(); }   // an active chain, up to now
@@ -200,4 +200,20 @@ fn a_book_grows_a_batch_at_a_time() {
     let last = book.registrations(240, 300);
     assert_eq!(last.len(), 1);
     if let Tx::RegisterBatch { batch, .. } = &last[0] { assert_eq!((batch.start, batch.cheques.len()), (240, 16)); } else { panic!() }
+}
+
+/// The fair launch: the first year mines 10% of the supply, the rest follows Bitcoin's halvings, and the total
+/// stays under 21 million coins.
+#[test]
+fn launch_year_is_ten_percent() {
+    let p = Params::testnet();
+    assert_eq!((p.block_reward(0), p.block_reward(1), p.block_reward(525_000)), (0, 4 * COIN, 4 * COIN));
+    assert_eq!((p.block_reward(525_001), p.block_reward(525_000 + 2_100_000)), (4 * COIN + COIN / 2, 4 * COIN + COIN / 2));
+    assert_eq!(p.block_reward(525_000 + 2_100_001), 2 * COIN + COIN / 4);
+    let year1 = 525_000u64 * p.block_reward(1);
+    assert_eq!(year1, 2_100_000 * COIN);
+    assert!(p.max_supply() <= 21_000_000 * COIN && p.max_supply() > 20_999_999 * COIN);
+    assert_eq!(year1 * 10, 21_000_000 * COIN);
+    assert_eq!((p.next_halving(1), p.next_halving(525_000 + 2_100_000)), (525_000 + 2_100_001, 525_000 + 2_100_001));
+    assert_eq!(p.next_halving(525_000 + 2_100_001), 525_000 + 4_200_001);
 }

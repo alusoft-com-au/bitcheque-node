@@ -9,7 +9,8 @@ pub struct Params {
     pub block_target_seconds: u32,
     pub reward_base: u64,
     pub halving_interval: u32,
-    pub slow_start_blocks: u32,
+    pub launch_blocks: u32,   // the launch year: blocks 1..=launch_blocks pay launch_reward
+    pub launch_reward: u64,
     pub reward_maturity: u32,
     pub number_maturity: u32,
     pub lwma_window: usize,
@@ -40,9 +41,13 @@ impl Params {
         Params {
             // one-minute blocks with Bitcoin's issuance per hour: a tenth of the reward, ten times the blocks
             block_target_seconds: 60,
-            reward_base: 5 * COIN,
+            // a fair launch: the first year (525,000 blocks, about 365 days) mines 4 coins a block, 2,100,000 coins or
+            // 10% of the supply, so people have time to hear of it and join. After that 4.5 coins, halving every
+            // 2,100,000 blocks (about four years): 18,900,000 more, so each of years 2-4 mines more than the first.
+            reward_base: 4 * COIN + COIN / 2,
             halving_interval: 2_100_000,   // about four years
-            slow_start_blocks: 200_000,
+            launch_blocks: 525_000,
+            launch_reward: 4 * COIN,
             reward_maturity: 100,
             number_maturity: 100,
             lwma_window: 60,
@@ -73,25 +78,30 @@ impl Params {
         // the easiest target is about 2^19 hashes a block: under a second for any computer, and about a second for
         // the edge node's backup miner (WebAssembly, ~0.8 MH/s), which mines only when nobody else has for 50
         // seconds. Real miners joining raise it within a few blocks (LWMA, up to 3x per block).
-        Params { initial_bits: 0x1F00_FFFF, min_bits: 0x1E20_0000, slow_start_blocks: 1, stall_relief: true, magic: [0xBC, 0x4E, 0x51, 0x01], ..Params::mainnet() }
+        Params { initial_bits: 0x1F00_FFFF, min_bits: 0x1E20_0000, stall_relief: true, magic: [0xBC, 0x4E, 0x51, 0x01], ..Params::mainnet() }
     }
     /// Private network for running several nodes on one machine: 1-minute blocks, short maturities, easy work.
     pub fn local() -> Params {
-        Params { block_target_seconds: 60, initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, slow_start_blocks: 1, reward_maturity: 10, number_maturity: 10,
+        Params { block_target_seconds: 60, initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, reward_maturity: 10, number_maturity: 10,
                  reg_pow_target: U256::one_shl(240), stall_relief: true, magic: [0xBC, 0x4E, 0x51, 0x02], ..Params::mainnet() }
     }
-    /// Block subsidy at `height` with the slow start of §12.5.
+    /// Block subsidy at `height` (§12.5): nothing for block 0, `launch_reward` through the launch year, then
+    /// `reward_base` halving every `halving_interval` blocks.
     pub fn block_reward(&self, height: u32) -> u64 {
-        let halvings = height / self.halving_interval;
-        if halvings >= 64 {
-            return 0;
-        }
-        let base = self.reward_base >> halvings;
-        if height < self.slow_start_blocks {
-            (base as u128 * height as u128 / self.slow_start_blocks as u128) as u64
-        } else {
-            base
-        }
+        if height == 0 { return 0; }
+        if height <= self.launch_blocks { return self.launch_reward; }
+        let halvings = (height - self.launch_blocks - 1) / self.halving_interval;
+        if halvings >= 64 { 0 } else { self.reward_base >> halvings }
+    }
+    /// Every coin the schedule will ever create, in base units.
+    pub fn max_supply(&self) -> u64 {
+        self.launch_blocks as u64 * self.launch_reward + (0..64u32).map(|k| self.reward_base >> k).sum::<u64>() * self.halving_interval as u64
+    }
+    /// The first height above `height` where the reward halves (the end of the launch year raises it, so it does not count).
+    pub fn next_halving(&self, height: u32) -> u32 {
+        // halvings take effect at launch_blocks + k × halving_interval + 1, k = 1, 2, …
+        let k = if height <= self.launch_blocks { 1 } else { (height - self.launch_blocks - 1) / self.halving_interval + 1 };
+        self.launch_blocks + k * self.halving_interval + 1
     }
 }
 

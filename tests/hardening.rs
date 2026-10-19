@@ -12,7 +12,7 @@ use bitcheque::rpc::unhex;
 use bitcheque::store::{Store, SNAP_EVERY};
 use bitcheque::tx::{Tx, R};
 
-fn params() -> Params { Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, slow_start_blocks: 1, reward_maturity: 1, number_maturity: 1, ..Params::mainnet() } }
+fn params() -> Params { Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, launch_blocks: 0, reward_maturity: 1, number_maturity: 1, ..Params::mainnet() } }
 fn tmp(name: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!("bitcheque-hard-{name}-{}.dat", std::process::id()));
     let _ = std::fs::remove_file(&p); let _ = std::fs::remove_file(p.with_extension("snap"));

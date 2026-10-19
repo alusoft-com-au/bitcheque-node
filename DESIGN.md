@@ -57,7 +57,7 @@ any m from 1 to 7. The website does not offer split books.
 | Area | Bitcoin | Bitcheque |
 |---|---|---|
 | Consensus | SHA-256d PoW, 10 min target | SHA-256d PoW, 60 s target (merge-mining is an open decision, §8) |
-| Supply | 21M, 50 coins, halving / 210,000 blocks | ≈ 21M, 5 coins, halving / 2,100,000 blocks: Bitcoin's issuance per hour, with a slow start (§12.5) |
+| Supply | 21M, 50 coins, halving / 210,000 blocks | ≈ 21M: a launch year of 4 coins a block (10 % of the supply), then 4.5 coins halving / 2,100,000 blocks (§12.5) |
 | Difficulty | retarget every 2016 blocks | every block, LWMA over 60 blocks (§12.1); a small chain cannot survive a 2016-block window |
 | Header | 80 bytes | 80 bytes + 32-byte `state_root` = 112 bytes |
 | Tx Merkle tree | SHA-256d | SHA-256d over txids, zero-padded to a power of two (no duplicate-last malleability) |
@@ -748,7 +748,7 @@ is unspendable, as in Bitcoin.
 | Parameter | Value | Note |
 |---|---|---|
 | Block target | 60 s | |
-| Reward | 5 coins, halving every 2,100,000 blocks (~4 years), with a slow start: `reward = 5 × min(1, height / 200,000)` | Bitcoin's issuance per hour; max 2,099,999,997,690,000 base units (≈ 21M) less ≈ 500,000 coins forgone in the ramp; 10^8 base units per coin; see §12.5 |
+| Reward | blocks 1–525,000 (~1 year): 4 coins; then 4.5 coins, halving every 2,100,000 blocks (~4 years) | the launch year mines 2,100,000 coins, 10 % of the supply; the rest 18,900,000 less integer rounding, so the total stays under 21M; 10^8 base units per coin; see §12.5 |
 | Reward maturity | credited to the miner's account 100 blocks later | state keeps a pending-reward queue by height |
 | Difficulty | per-block LWMA over the last 60 blocks, solve times clamped to ±6 targets, result clamped ×3 / ÷3 per block | survives hashrate arriving or leaving at once |
 | Stall relief (research network only) | a block more than two targets (plus the 720 s future allowance) late may use a target doubled for every further two targets of silence, up to the easiest target | a chain abandoned at a high difficulty can be restarted by whoever is left; mainnet relies on hashrate instead |
@@ -769,7 +769,7 @@ is unspendable, as in Bitcoin.
 
 The public research network uses the mainnet parameters except: initial
 target ≈ 2^240 (`0x1F00FFFF`), easiest later target 2^237 (`0x1E200000`,
-about 2^19 hashes a block: under a second for one CPU core), no slow start,
+about 2^19 hashes a block: under a second for one CPU core), the same launch year,
 stall relief on. The difficulty is set by the hash power present: with one
 small miner it sits at the floor, and each block can raise it up to 3× when
 more join. So the chain never stalls for want of miners, the edge nodes
@@ -827,11 +827,13 @@ most blocks, and SHA-256 means ASIC owners, so one party will likely
 dominate the first days. The rules aim to make that worthless rather than
 impossible:
 
-- **Slow start** (Zcash, 2016): the reward ramps linearly from 0 to 5
-  coins over the first 200,000 blocks (~139 days). Mining 100 % of the
-  first week earns about 0.1 % of the first year's coins. There is no prize
-  for being first. The research network skips the ramp so that coins exist
-  at once.
+- **A launch year at 10 %**: the first 525,000 blocks (~365 days) mine
+  4 coins each, 2,100,000 coins in all, 10 % of the supply; after that each
+  block mines 4.5 coins, halving every 2,100,000 blocks. Each of years two
+  to four creates more coins than the first, so people who hear of the
+  network late are not left behind, and mining 100 % of the first week
+  earns about 0.2 % of the supply. (This replaced a Zcash-style linear slow
+  start over 200,000 blocks.)
 - **Per-block difficulty** (§12.1) raises the target within an hour of
   hashrate arriving, so an easy initial target cannot be ground into
   thousands of blocks.

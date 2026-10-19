@@ -5,7 +5,7 @@ use bitcheque::{block::Chain, message::Message, net::{now, Node}, params::Params
                 wallet::{mine_registration, Book, Domain}};
 
 fn main() {
-    let p = Params { initial_bits: 0x1F0F_FFFF, min_bits: 0x1F0F_FFFF, block_target_seconds: 5, reg_pow_target: U256::MAX.shr(10), slow_start_blocks: 1,
+    let p = Params { initial_bits: 0x1F0F_FFFF, min_bits: 0x1F0F_FFFF, block_target_seconds: 5, reg_pow_target: U256::MAX.shr(10), launch_blocks: 0,
                      reward_maturity: 2, number_maturity: 2, ..Params::testnet() };
     let g = Chain::genesis(&p, now() - 3600, b"Bitcheque local demo");
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
