@@ -1,6 +1,6 @@
 // A fourth node, in Oceania (Sydney), deployed as its own Worker so the three in wrangler.jsonc are not touched:
 //   npx wrangler deploy -c wrangler.oc.jsonc
-// It follows node-ap, node-us and node-eu as upstreams (pulls their blocks every minute, passes transactions on to
+// It follows node-ap, node-us and node-eu as upstreams (pulls their blocks every 30 seconds, passes transactions on to
 // them) through a service binding to their Worker, and does not mine.
 {
   "$schema": "https://unpkg.com/wrangler@4/config-schema.json",
@@ -14,5 +14,5 @@
   "routes": [{ "pattern": "node-oc.bitcheque.org", "custom_domain": true }],
   "vars": { "NET": "0", "REGIONS": "{\"oc\":\"oc\"}",
             "UPSTREAMS": "https://node-ap.bitcheque.org,https://node-us.bitcheque.org,https://node-eu.bitcheque.org",
-            "MINE_REGIONS": "", "MINER_TO": "0" }
+            "MINE_REGIONS": "", "MINER_TO": "0", "SYNC_S": "30" }
 }

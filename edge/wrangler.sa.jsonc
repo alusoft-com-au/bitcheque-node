@@ -1,0 +1,18 @@
+// A fifth node, in South America (São Paulo), deployed as its own Worker so the three in wrangler.jsonc are not touched:
+//   npx wrangler deploy -c wrangler.sa.jsonc
+// It follows node-ap, node-us and node-eu as upstreams (pulls their blocks every 30 seconds, passes transactions on to
+// them) through a service binding to their Worker, and does not mine.
+{
+  "$schema": "https://unpkg.com/wrangler@4/config-schema.json",
+  "name": "bitcheque-node-sa",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-12",
+  "durable_objects": { "bindings": [{ "name": "NODE", "class_name": "EdgeNode" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["EdgeNode"] }],
+  "services": [{ "binding": "UPSTREAM_SVC", "service": "bitcheque-node" }],
+  "triggers": { "crons": ["*/30 * * * *"] },
+  "routes": [{ "pattern": "node-sa.bitcheque.org", "custom_domain": true }],
+  "vars": { "NET": "0", "REGIONS": "{\"sa\":\"sam\"}",
+            "UPSTREAMS": "https://node-ap.bitcheque.org,https://node-us.bitcheque.org,https://node-eu.bitcheque.org",
+            "MINE_REGIONS": "", "MINER_TO": "0", "SYNC_S": "30" }
+}

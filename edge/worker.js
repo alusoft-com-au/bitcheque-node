@@ -13,7 +13,7 @@ import WASM from './bitcheque_edge.wasm';
 const REGIONS = { ap: 'apac', us: 'enam', eu: 'weur' };   // node-<key>.bitcheque.org -> location hint
 // a deployment may run other regions (env REGIONS, JSON like {"oc":"oc"}): a further node that follows these as upstreams
 const regions = env => env.REGIONS ? JSON.parse(env.REGIONS) : REGIONS;
-const SYNC_MS = 60_000;          // between wakes
+const SYNC_MS = 60_000;          // between wakes (env SYNC_S overrides, in seconds: the follower nodes use 30)
 const SNAP_EVERY = 100;          // blocks between state snapshots (a cold start replays fewer than this)
 const MAX_PER_WAKE = 500;        // blocks fetched in one wake
 const HDR_CHUNK = 1000;          // headers per database row (fewer rows read on a cold start)
@@ -135,7 +135,7 @@ export class EdgeNode extends DurableObject {
     const x = await this.node();
     let fetched = 0, log = [];
     for (const up of this.upstreams()) {
-      if (up.startsWith('do:') && log.some(l => l.ok)) break;   // other regions only when no upstream answered
+      if (log.some(l => l.ok)) break;   // one source per wake: the first that answers (other regions only if no upstream did)
       try {
         const theirs = +(await this.call(up, '/height'));
         let h = x.height() + 1, back = 0;
@@ -193,7 +193,7 @@ export class EdgeNode extends DurableObject {
       for (const tx of live.slice(0, RERELAY_MAX)) { try { await this.call(up, '/tx', { method: 'POST', body: tx }); } catch (_) {} }
   }
   // every minute; straight away again while catching up
-  async alarm() { let n = 0; try { n = await this.sync(); if (n < MAX_PER_WAKE) await this.backup(); } finally { await this.ctx.storage.setAlarm(Date.now() + (n >= MAX_PER_WAKE ? 1000 : SYNC_MS)); } }
+  async alarm() { let n = 0; try { n = await this.sync(); if (n < MAX_PER_WAKE) await this.backup(); } finally { await this.ctx.storage.setAlarm(Date.now() + (n >= MAX_PER_WAKE ? 1000 : this.env.SYNC_S ? +this.env.SYNC_S * 1000 : SYNC_MS)); } }
 
   async fetch(req) {
     const url = new URL(req.url);

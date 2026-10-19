@@ -242,7 +242,7 @@ Planned: a Noise-style handshake with hybrid X25519 + ML-KEM-768,
 upgradeable any time. Transport encryption is not implemented yet.
 
 **Seeds and upstreams.** The research network's seed nodes are the edge
-nodes on Cloudflare (`node-ap`, `node-us`, `node-eu`, `node-oc`.bitcheque.org),
+nodes on Cloudflare (`node-ap`, `node-us`, `node-eu`, `node-oc`, `node-sa`.bitcheque.org),
 which cannot speak this TCP protocol: Workers neither open nor accept raw
 connections. So a node also follows *upstreams* over the HTTP RPC: every
 minute it pulls the blocks an upstream has above its own tip (`/height`,

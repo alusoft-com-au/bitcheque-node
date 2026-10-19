@@ -54,7 +54,7 @@ pub fn seeds(magic: &[u8; 4]) -> &'static [&'static str] {
 /// RPC, not this TCP protocol. A node follows them as upstreams (`follow`) unless told otherwise.
 pub fn http_seeds(magic: &[u8; 4]) -> &'static [&'static str] {
     match magic[3] {
-        0x01 => &["node-ap.bitcheque.org:80", "node-us.bitcheque.org:80", "node-eu.bitcheque.org:80", "node-oc.bitcheque.org:80"],
+        0x01 => &["node-ap.bitcheque.org:80", "node-us.bitcheque.org:80", "node-eu.bitcheque.org:80", "node-oc.bitcheque.org:80", "node-sa.bitcheque.org:80"],
         _ => &[],
     }
 }

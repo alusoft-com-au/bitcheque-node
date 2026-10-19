@@ -2,7 +2,7 @@
 //! bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR]... [--upstream HOST:PORT]... [--no-upstream]
 //! bitcheque mine --rpc ADDR --to NUMBER [--threads N]   (mines against any node's RPC, e.g. node-ap.bitcheque.org:80; 0 burns the reward)
 //!   With no --peer a node dials the compiled-in seeds, then keeps about 8 connections from the addresses peers share.
-//!   On the research network it also follows the edge nodes (node-ap/us/eu/oc.bitcheque.org:80, the seeds) over their
+//!   On the research network it also follows the edge nodes (node-ap/us/eu/oc/sa.bitcheque.org:80, the seeds) over their
 //!   HTTP RPC: pulls their blocks every minute and passes on what it accepts. --upstream picks others, --no-upstream none.
 //!   --listen defaults to 0.0.0.0:8730 (mainnet) or 0.0.0.0:8731 (testnet); --advertise is the address others can reach you on.
 //! bitcheque wallet new | info|register|more|send|sweep --seed HEX --rpc ADDR [--cheques N] [--to NUMBER --amount COINS [--fee TIER]]
