@@ -885,7 +885,7 @@ lines. Module map: `sha256` (own FIPS 180-4, with midstate), `u256`,
 `state` (§2.1, §10.11, §10.12, Merkle state root with account proofs),
 `block` (§1, §12, LWMA, stall relief, per-account history and totals for
 the RPC), `store` (blocks left in the data file and read by offset, state
-snapshots every 1,000 blocks (the latest two kept), most-work chain selection among forks at most 100 blocks deep (`max_reorg`), reorg by replay
+snapshots every 1,000 blocks (as many kept as a reorg of `max_reorg` could need), most-work chain selection (a fork deeper than 100 blocks, `max_reorg`, needs twice the work of what it replaces), reorg by replay
 from the latest snapshot), `net` (§7 discovery, connection caps,
 misbehaviour strikes, mempool, mining; no transport encryption yet), `rpc`
 (plain-text HTTP, 120 requests per minute per address), `wallet` (§4.2

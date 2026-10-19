@@ -90,7 +90,7 @@ pub fn http(addr: &str, method: &str, path: &str, body: &str) -> Result<String, 
 }
 
 /// Text from another machine, safe to print to a terminal: control characters (escape sequences) become '?'.
-pub fn clean(s: &str) -> String { s.chars().take(500).map(|c| if c.is_control() && c != '\n' { '?' } else { c }).collect() }
+pub fn clean(s: &str) -> String { s.chars().map(|c| if c.is_control() && c != '\n' { '?' } else { c }).collect() }
 
 /// The network an address belongs to for diversity limits: /16 or /24 of IPv4, /32 or /64 of IPv6 (`wide` picks the first).
 fn group(ip: std::net::IpAddr, wide: bool) -> Vec<u8> {
@@ -102,11 +102,17 @@ fn group(ip: std::net::IpAddr, wide: bool) -> Vec<u8> {
 /// An address another node may pass us: a public IP literal (no names to look up, no private or loopback hosts).
 fn public_ip(a: &str) -> Option<std::net::IpAddr> {
     let ip = a.parse::<SocketAddr>().ok()?.ip();
-    let ok = match ip {
+    // an IPv4 address written as IPv6 (::ffff:10.0.0.1) is judged as the IPv4 address it reaches
+    let v = match ip { std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4), x => x };
+    let ok = match v {
         std::net::IpAddr::V4(v) => !(v.is_private() || v.is_loopback() || v.is_link_local() || v.is_unspecified() || v.is_broadcast() || v.is_documentation() || v.octets()[0] == 0 || v.octets()[0] >= 224 || (v.octets()[0] == 100 && v.octets()[1] & 0xC0 == 64)),
-        std::net::IpAddr::V6(v) => !(v.is_loopback() || v.is_unspecified() || v.is_multicast() || (v.segments()[0] & 0xfe00) == 0xfc00 || (v.segments()[0] & 0xffc0) == 0xfe80),
+        std::net::IpAddr::V6(v) => !(v.is_loopback() || v.is_unspecified() || v.is_multicast() || (v.segments()[0] & 0xfe00) == 0xfc00 || (v.segments()[0] & 0xffc0) == 0xfe80 || (v.segments()[0], v.segments()[1]) == (0x2001, 0xdb8)),
     };
     ok.then_some(ip)
+}
+/// What a ban applies to: an IPv4 address, or the /64 an IPv6 address is in (one machine has a whole /64).
+fn ban_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip { std::net::IpAddr::V6(a) if a.to_ipv4_mapped().is_none() => { let s = a.segments(); std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)) } x => x }
 }
 /// A cheap random number (no crypto needed): for picking which addresses to share or evict.
 fn rand64() -> u64 {
@@ -232,7 +238,7 @@ impl Node {
         let Some(ip) = ip else { return false };
         let mut b = self.banned.lock().unwrap();
         b.retain(|_, until| *until > Instant::now());
-        b.contains_key(&ip)
+        b.contains_key(&ban_key(ip))
     }
     fn save_book(&self) {
         if let Some(p) = self.book_path.lock().unwrap().clone() {
@@ -259,6 +265,7 @@ impl Node {
     }
     pub fn connect(self: &Arc<Self>, addr: &str) -> std::io::Result<()> {
         let a = addr.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::other("no address"))?;
+        if !a.ip().is_loopback() && self.is_banned(Some(a.ip())) { return Err(std::io::Error::other("banned for a while")); }
         let s = TcpStream::connect_timeout(&a, Duration::from_secs(5))?;
         self.add_peer_from(s, Some(addr.to_string()), true);
         Ok(())
@@ -299,7 +306,7 @@ impl Node {
                         *s = None;
                         if let Some(p) = node.peers.lock().unwrap().iter().find(|p| p.id == id) {
                             *p.height.lock().unwrap() = my; *p.barred.lock().unwrap() = Some(Instant::now() + BAR);
-                            if let Some(ip) = p.ip.filter(|a| !a.is_loopback()) { node.banned.lock().unwrap().insert(ip, Instant::now() + BAR); let _ = p.stream.lock().unwrap().shutdown(std::net::Shutdown::Both); }
+                            if let Some(ip) = p.ip.filter(|a| !a.is_loopback()) { node.banned.lock().unwrap().insert(ban_key(ip), Instant::now() + BAR); let _ = p.stream.lock().unwrap().shutdown(std::net::Shutdown::Both); }
                         }
                     } }
                     if s.is_some() { None } else {
@@ -348,7 +355,7 @@ impl Node {
             // a panic while serving must still free the slot (and the sync source)
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| node.serve(peer.clone(), reader)));
             if matches!(&r, Ok(Err(e)) if e.to_string() == "misbehaving peer dropped") {
-                if let Some(ip) = ip.filter(|a| !a.is_loopback()) { node.banned.lock().unwrap().insert(ip, Instant::now() + BAN); }
+                if let Some(ip) = ip.filter(|a| !a.is_loopback()) { node.banned.lock().unwrap().insert(ban_key(ip), Instant::now() + BAN); }
             }
             let _ = peer.stream.lock().unwrap().shutdown(std::net::Shutdown::Both);
             node.peers.lock().unwrap().retain(|p| p.id != id);
@@ -516,10 +523,18 @@ impl Node {
                     self.mempool_bytes.store(m.iter().map(|t| t.encode().len()).sum(), Ordering::Relaxed);
                     Vec::new()
                 }
-                Accepted::Reorged(abandoned) => {
+                Accepted::Reorged(abandoned, fork) => {
                     let mut m = self.mempool.lock().unwrap();
                     let old = std::mem::take(&mut *m);
                     *self.next.lock().unwrap() = None; self.mempool_bytes.store(0, Ordering::Relaxed);
+                    // the whole new branch goes to the peers, not just this block: side blocks are not relayed, so a
+                    // peer may never have seen the earlier ones (at most a batch's worth; a peer missing more asks)
+                    // (this block itself, the tip, goes out below as usual)
+                    let tip = s.chain.height() as usize;
+                    let start = (fork as usize + 1).max(tip.saturating_sub(BATCH - 1));
+                    let branch = s.chain.blocks.read_many(start, tip - start);
+                    drop(m); drop(s);
+                    for raw in branch { self.relay(BLOCK, &raw, from); }
                     [abandoned, old].concat()
                 }
             }

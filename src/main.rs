@@ -56,7 +56,8 @@ fn main() {
 
 /// A software wallet for one book from one seed: the same 256-cheque book the website prints, so a seed works in both.
 /// `register` registers the first cheques (16 by default, `--cheques` for more), `more` the next ones, 16 per proof of work.
-/// The book salt is derived from the seed, so the seed alone recreates the book. Talks to a node's RPC; keeps no files.
+/// The book salt is derived from the seed, so the seed alone recreates the book. Talks to a node's RPC; keeps one
+/// small file per book (~/.config/bitcheque/used-<id>: the last cheque number it signed), so a number is never used twice.
 fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     let cmd = args.get(2).map(String::as_str).unwrap_or("");
     if cmd == "new" {
@@ -146,17 +147,21 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
             if to != 0 && !http(&rpc, "GET", &format!("/account/{to}"), "").is_ok_and(|t| t.lines().any(|l| l.starts_with("number "))) {
                 return Err(format!("account {to} is not a final number yet (or does not exist)"));
             }
-            // cheques already in the node's queue (an earlier send that has not been mined) are skipped
-            let queued: Vec<u16> = http(&rpc, "GET", "/mempool", "").unwrap_or_default().lines()
-                .filter(|l| l.starts_with("piece ") && l.contains(&format!("account={id} ")))
-                .filter_map(|l| l.split_whitespace().find_map(|w| w.strip_prefix("cheque="))?.parse().ok()).collect();
-            let cheque = field(&a, "unspent").split(',').filter_map(|x| x.parse::<u16>().ok()).filter(|&n| nonce.map_or(true, |k| n > k) && !queued.contains(&n)).min().ok_or("no unused cheques left")?;
+            // never two cheques with one number: skip those waiting in the node's queue (asked fresh, and failing hard
+            // if the node will not say) and any this machine signed before (a node's answers may be a few seconds old)
+            let queued: Vec<u16> = http(&rpc, "GET", &format!("/queued/{id}"), "")?.trim().split(',').filter_map(|x| x.parse().ok()).collect();
+            let used_file = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config/bitcheque").join(format!("used-{id}")));
+            let used: Option<u16> = used_file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|t| t.trim().parse().ok());
+            let cheque = field(&a, "unspent").split(',').filter_map(|x| x.parse::<u16>().ok())
+                .filter(|&n| nonce.map_or(true, |k| n > k) && used.map_or(true, |k| n > k) && !queued.contains(&n)).min().ok_or("no unused cheques left")?;
             // the last cheque of a book is kept for the sweep to a new book (DESIGN.md §10.11): spent on anything
             // else, whatever is left in the account can never move again
             if cmd == "send" && cheque as u32 == size - 1 && opt("--last").is_none() {
                 return Err(format!("cheque {cheque} is the last one in this book: keep it for `wallet sweep --to <new book>`, or pass --last to spend it anyway"));
             }
             let pieces = book.sign(cheque, &msg);
+            // recorded before anything is sent: once its cells may have left this machine, the number is used
+            if let Some(f) = &used_file { let _ = std::fs::create_dir_all(f.parent().unwrap()); std::fs::write(f, cheque.to_string()).map_err(|e| format!("{}: {e}", f.display()))?; }
             post_all(&pieces)?;
             if cmd == "sweep" { println!("cheque {cheque} sent: {} sweeps the whole balance to {to}, fee tier {tier}", msg.display()); }
             else { println!("cheque {cheque} sent: {} to {to}, {} coins, fee tier {tier}", msg.display(), msg.amount().unwrap_or(0) as f64 / COIN as f64); }

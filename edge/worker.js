@@ -31,11 +31,11 @@ const POOL_MAX = 1000;           // waiting transactions kept in the database ac
 const BODY_MAX = 4 << 20;        // request body bytes (16 registrations of 16 cheques and a cheque are under 2 MB of hex)
 const ROW_MAX = 1_900_000;       // a SQLite row holds at most 2 MB: a bigger pool batch is kept a line per row
 const PEER_MS = 10_000;          // a peer that has not answered by then is given up on
-const FRESH = new Set(['height', 'tip', 'template']);   // miners and the status page need these nearly fresh
+const FRESH = new Set(['height', 'tip', 'template', 'queued']);   // miners and the status page need these nearly fresh
 const FRESH_S = 2;               // ...but a short cache still collapses a flood of them into one request per colo
 const CACHE_S = 15;              // seconds the front worker caches a GET reply (status pages poll every 10 s)
 // the RPC's first path segments: anything else is refused here, without waking a Durable Object
-const ROUTES = new Set(['height', 'peers', 'addrs', 'tip', 'block', 'summary', 'account', 'id', 'lookup', 'proof', 'regtarget', 'history', 'stats', 'mempool', 'top', 'template', 'tx', 'check', 'edge']);
+const ROUTES = new Set(['height', 'peers', 'addrs', 'tip', 'block', 'summary', 'account', 'id', 'lookup', 'proof', 'regtarget', 'history', 'stats', 'mempool', 'top', 'template', 'tx', 'check', 'edge', 'queued']);
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
 const enc = new TextEncoder(), dec = new TextDecoder();
 const timeout = (p, ms) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error('timeout')), ms))]);
@@ -48,6 +48,9 @@ async function readBody(req, max = BODY_MAX) {
   const all = new Uint8Array(n); let o = 0; for (const p of parts) { all.set(p, o); o += p.length; }
   return dec.decode(all);
 }
+// the rate-limit key: an IPv4 address, or the /64 of an IPv6 one (one machine has a whole /64)
+const limitKey = ip => { if (!ip.includes(':')) return ip; const [a, b = ''] = ip.split('::'); const l = a ? a.split(':') : [], r = b ? b.split(':') : [];
+  return [...l, ...Array(8 - l.length - r.length).fill('0'), ...r].slice(0, 4).join(':') + '::/64'; };
 const text = (body, status = 200, extra = {}) => new Response(body, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8', ...CORS, ...extra } });
 const unhex = s => { s = s.trim(); if (!/^([0-9a-f]{2})*$/i.test(s)) return null; const b = new Uint8Array(s.length / 2); for (let i = 0; i < b.length; i++) b[i] = parseInt(s.substr(2 * i, 2), 16); return b; };
 
@@ -261,8 +264,10 @@ export class EdgeNode extends DurableObject {
     // (not back to the region that sent it, and not a side block: nobody needs it unless it wins); polling every
     // minute is only the safety net
     const moved = url.pathname === '/tx' || reply.trim() === 'accepted';
-    if (req.method === 'POST' && (url.pathname === '/tx' || url.pathname === '/block') && code === 200 && moved && !peer)
-      await (this.relayed = this.relayed.then(() => Promise.allSettled(this.upstreams().map(up => this.call(up, url.pathname, { method: 'POST', body })))));   // before replying: background work may be cut off
+    // of a batch, only the lines this node accepted go on (the peers would refuse the rest too)
+    const fwd = url.pathname !== '/tx' ? body : (() => { const ls = body.trim().split(/\s*\n\s*/), rs = reply.trim().split('\n'); return ls.length === 1 ? body : ls.filter((_, i) => rs[i] === 'ok').join('\n'); })();
+    if (req.method === 'POST' && (url.pathname === '/tx' || url.pathname === '/block') && code === 200 && moved && fwd && !peer)
+      await (this.relayed = this.relayed.then(() => Promise.allSettled(this.upstreams().map(up => this.call(up, url.pathname, { method: 'POST', body: fwd })))));   // before replying: background work may be cut off
     if (req.method === 'POST' && url.pathname === '/block') this.trim();
     return text(reply, code);
   }
@@ -282,7 +287,7 @@ export default {
     // being passed on at once). Without a secret configured, any value counts (a local devnet).
     const peer = env.EDGE_SECRET ? req.headers.get('X-Edge-Peer') === env.EDGE_SECRET : !!req.headers.get('X-Edge-Peer');
     // the public's uncached requests are rate limited per address (cache hits cost nothing and are not counted)
-    const limited = async () => !peer && env.RL && !(await env.RL.limit({ key: req.headers.get('CF-Connecting-IP') || 'unknown' })).success;
+    const limited = async () => !peer && env.RL && !(await env.RL.limit({ key: limitKey(req.headers.get('CF-Connecting-IP') || '') })).success;
     // an edge node has no TCP peers: its peers are the other regions and the upstream nodes it syncs with
     if (url.pathname === '/peers') return text(String(Object.keys(R).length - 1 + (env.UPSTREAMS || '').split(',').filter(s => s.trim()).length));
     const stub = env.NODE.get(env.NODE.idFromName(region), { locationHint: R[region] });
@@ -295,14 +300,15 @@ export default {
     }
     // GET and HEAD share the cache (HEAD answers with the headers only)
     const head = r => req.method === 'HEAD' ? new Response(null, r) : r;
+    // peers skip the cache: after a reorg a cached /block/<h> would be the abandoned one for a few seconds
     const fresh = FRESH.has(url.pathname.split('/')[1]), cache = caches.default, key = new Request(url.origin + url.pathname);
-    const hit = await cache.match(key);
+    const hit = peer ? null : await cache.match(key);
     if (hit) return head(hit);
     if (await limited()) return text('too many requests', 429);
     const res = await stub.fetch(inner, { headers: peer ? { 'X-Edge-Peer': '1' } : {} });
     const out = new Response(res.body, res);
     // /edge differs for peers and the public: never cached
-    if (res.ok && url.pathname !== '/edge') { out.headers.set('Cache-Control', `public, max-age=${fresh ? FRESH_S : CACHE_S}`); ctx.waitUntil(cache.put(key, out.clone())); }
+    if (res.ok && url.pathname !== '/edge' && !peer) { out.headers.set('Cache-Control', `public, max-age=${fresh ? FRESH_S : CACHE_S}`); ctx.waitUntil(cache.put(key, out.clone())); }
     return head(out);
   },
   // a watchdog: wake each region so its alarm keeps running even if nothing has called it

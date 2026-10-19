@@ -3,7 +3,7 @@
 //!   GET  /account/<number>    GET /id/<account id hex>   GET /lookup/<code> (start of the id after its scheme byte)
 //!   (a number appears in any output only once it is final, number_maturity blocks deep; /account/<n> of a
 //!   number not final yet answers only "pending" and its ready_at)
-//!   GET /proof/<number>   GET /regtarget (4 LE limbs, hex)
+//!   GET /proof/<number>   GET /regtarget (4 LE limbs, hex)   GET /queued/<account id hex> (cheque numbers of that account waiting in the mempool, comma-separated)
 //!   GET  /history/<number>  (newest first, the last block::HISTORY_CAP events: height kind key=value...; a cheque to yourself is listed as receive, then send)
 //!   GET  /stats   (lifetime totals, and the reward schedule: reward of the next block, base, halving interval, next halving, maturity)
 //!   GET  /mempool (count, then one line per waiting transaction in the /summary format (the first MEMPOOL_LIST), then a cheque line per waiting cheque whose recipient is readable)
@@ -81,8 +81,9 @@ impl Node {
         let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(10)));
         // the whole request within DEADLINE (a per-read timeout alone lets a client trickle a byte at a time forever)
         let start = std::time::Instant::now();
+        let deadline = std::cell::Cell::new(DEADLINE);
         let read = |s: &mut TcpStream, tmp: &mut [u8]| -> Option<usize> {
-            let left = DEADLINE.checked_sub(start.elapsed()).filter(|d| !d.is_zero())?;
+            let left = deadline.get().checked_sub(start.elapsed()).filter(|d| !d.is_zero())?;
             s.set_read_timeout(Some(left)).ok()?;
             match s.read(tmp) { Ok(0) | Err(_) => None, Ok(n) => Some(n) }
         };
@@ -97,6 +98,7 @@ impl Node {
                 let lens: Vec<&str> = head.lines().filter_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")).map(|(_, v)| v.trim())).collect();
                 let len = match lens.as_slice() { [] => 0, [v] => match v.parse::<usize>() { Ok(n) => n, Err(_) => return reply(&mut s, "400 Bad Request") }, _ => return reply(&mut s, "400 Bad Request") };
                 if len > BODY_MAX { return reply(&mut s, "413 Payload Too Large"); }
+                deadline.set(DEADLINE + std::time::Duration::from_secs(len as u64 / 32_768));   // a big body: a second more per 32 KB
                 break (i + 4, len);
             }
             if buf.len() > HEAD_MAX { return reply(&mut s, "431 Request Header Fields Too Large"); }
@@ -105,8 +107,10 @@ impl Node {
         // the limit is per address; behind a reverse proxy on this machine every request comes from loopback, so the
         // proxy's X-Forwarded-For names the client. Loopback with no such header is the operator's own tools: not limited.
         if let Ok(a) = s.peer_addr() {
-            let fwd = head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("x-forwarded-for")).and_then(|(_, v)| v.split(',').next()?.trim().parse::<std::net::IpAddr>().ok()));
-            let who = if a.ip().is_loopback() { fwd } else { Some(a.ip()) };
+            // the proxy appends the address it saw: the last entry (earlier ones are whatever the client claimed). One
+            // that does not parse is limited as loopback, so a made-up header buys nothing.
+            let fwd = head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("x-forwarded-for")).map(|(_, v)| v.to_string()));
+            let who = if !a.ip().is_loopback() { Some(a.ip()) } else { fwd.map(|v| v.rsplit(',').next().and_then(|x| x.trim().parse().ok()).unwrap_or(a.ip())) };
             if who.is_some_and(|ip| !self.allow(ip)) { return reply(&mut s, "429 Too Many Requests"); }
         }
         while buf.len() < head_end + body_len { let Some(n) = read(&mut s, &mut tmp) else { return }; buf.extend_from_slice(&tmp[..n]); }
@@ -256,6 +260,14 @@ impl Node {
                 Ok(format!("height {}\naccounts {}\nregistrations {}\ntransfers {}\ntransactions {}\npieces {}\nrewards {}\nblock_target {}\nreward {}\nreward_base {}\nhalving_interval {}\nnext_halving {}\nreward_maturity {}\nlaunch_blocks {}\nlaunch_reward {}",
                     c.height(), c.state.accounts.len(), c.totals.registrations, c.totals.transfers, c.totals.txs, c.totals.pieces, c.totals.rewards, p.block_target_seconds,
                     p.block_reward(next), p.reward_base, p.halving_interval, p.next_halving(next), p.reward_maturity, p.launch_blocks, p.launch_reward))
+            }
+            ("GET", ["queued", h]) => {
+                // a wallet must never sign a second cheque with a number already waiting: this lists them, uncapped
+                let id = unhex(h).ok_or("bad hex")?;
+                let m = self.mempool.lock().unwrap();
+                let mut ns: Vec<u16> = m.iter().filter_map(|t| match t { Tx::ChequePiece { account, cheque, .. } if *account == id => Some(*cheque), _ => None }).collect();
+                ns.sort_unstable(); ns.dedup();
+                Ok(ns.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","))
             }
             ("GET", ["regtarget"]) => Ok(c.state.reg_target.0.iter().map(|l| format!("{l:016x}")).collect::<Vec<_>>().join(" ")),
             ("GET", ["proof", n]) => {

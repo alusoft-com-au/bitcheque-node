@@ -114,11 +114,37 @@ fn side_blocks_are_checked_and_never_written() {
     // well-formed siblings are kept, in memory only
     for k in 0..20u32 { let mut b = side.template(g.header.time + 130 + k, 0, vec![]).unwrap(); b.header.mine(); assert!(matches!(s.accept(&b, now()), Ok(Accepted::Side))); }
     assert_eq!(std::fs::metadata(&path).unwrap().len(), len0, "side blocks never reach the data file");
-    // the main chain grows past max_reorg: a fork at block 1 is now too deep
+    // the main chain grows past max_reorg: a branch from block 1 is kept, but more work alone no longer wins
     for i in 3..8 { let b = c.make_block(g.header.time + 60 * (i + 1), 0, vec![]).unwrap(); c.add(&b, now()).unwrap(); s.accept(&b, now()).unwrap(); }
-    let mut late = side.template(g.header.time + 200, 0, vec![]).unwrap(); late.header.mine();
-    assert_eq!(s.accept(&late, now()).err(), Some("reorg too deep"));
+    let mut branch = Chain::new(p.clone(), &g).unwrap();
+    branch.add(&c.blocks.get(1).unwrap(), now()).unwrap();
+    for k in 0..8u32 { let b = branch.make_block(g.header.time + 300 + 61 * k, 0, vec![]).unwrap(); branch.add(&b, now()).unwrap(); assert!(matches!(s.accept(&b, now()), Ok(Accepted::Side))); }
+    assert_eq!(s.chain.tip(), c.tip(), "8 blocks against 7: deeper than max_reorg needs twice the work");
     let _ = std::fs::remove_file(&path);
+}
+
+fn quick() -> Params { Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, reg_pow_target: U256::MAX.shr(4), launch_blocks: 0, reward_maturity: 1, number_maturity: 1, max_reorg: 10, ..Params::mainnet() } }
+/// main[1..=fork] then `n` new blocks (`salt` shifts the times so the hashes differ)
+fn build(p: &Params, g: &Block, base: &[Block], fork: usize, n: usize, salt: u32) -> Vec<Block> {
+    let mut c = Chain::new(p.clone(), g).unwrap();
+    let mut out = vec![g.clone()];
+    for b in &base[1..=fork] { c.add(b, now()).unwrap(); out.push(b.clone()); }
+    for _ in 0..n { let t = c.headers.last().unwrap().time + 60 + salt; let b = c.make_block(t, 0, vec![]).unwrap(); c.add(&b, now()).unwrap(); out.push(b); }
+    out
+}
+
+/// A node that ended up deep on a lighter branch (synced from a liar first, say) moves to the honest one once it has
+/// twice the work: deep reorgs are harder, not impossible.
+#[test]
+fn a_node_deep_on_a_wrong_branch_finds_its_way_back() {
+    let p = quick();
+    let g = Chain::genesis(&p, now() - 1_000_000, b"x");
+    let liar = build(&p, &g, &[g.clone()], 0, 15, 0);
+    let honest = build(&p, &g, &[g.clone()], 0, 40, 1);
+    let mut s = Store::open(p.clone(), &g, None).unwrap();
+    for x in &liar[1..] { s.accept(x, now()).unwrap(); }
+    for x in &honest[1..] { s.accept(x, now()).unwrap(); }
+    assert_eq!(s.chain.tip(), honest[40].header.hash());
 }
 
 thread_local! { static DB: std::cell::RefCell<std::collections::HashMap<usize, Vec<u8>>> = Default::default(); }
@@ -145,6 +171,48 @@ fn a_failed_reorg_writes_nothing_to_the_host() {
     assert_eq!(st.accept(&s6, now).err(), Some("state root"));
     assert_eq!(st.chain.tip(), main.tip());
     for h in 1..=5 { assert_eq!(Block::decode(&host_get(h).unwrap()).unwrap(), main.blocks.get(h).unwrap(), "host block {h} untouched"); }
+}
+
+/// A heavier branch of big blocks wins on a host: making room never evicts the branch's own earlier blocks.
+#[test]
+fn eviction_keeps_the_branch_being_built() {
+    let p = Params { max_reorg: 100, ..quick() };
+    let g = Chain::genesis(&p, now() - 1_000_000, b"z");
+    let mut st = Store::open_host(p.clone(), &g, bitcheque::block::HostBlocks { get: host_get, put: host_put }, None, &[], 100, host_snap).unwrap();
+    let mut a = Chain::new(p.clone(), &g).unwrap();
+    for _ in 0..9 { let t = a.headers.last().unwrap().time + 60; let b = a.make_block(t, 0, vec![]).unwrap(); a.add(&b, now()).unwrap(); st.accept(&b, now()).unwrap(); }
+    let mut c = Chain::new(p.clone(), &g).unwrap();
+    for _ in 0..12 {
+        let t = c.headers.last().unwrap().time + 61;
+        let mut b = c.template(t, 0, vec![]).unwrap();
+        if let Tx::Coinbase { message, .. } = &mut b.txs[0] { *message = vec![7u8; 950_000]; }
+        b.header.tx_root = bitcheque::block::tx_root(&b.txs); b.header.mine();
+        c.add(&b, now()).unwrap();
+        st.accept(&b, now()).unwrap();
+    }
+    assert_eq!(st.chain.tip(), c.tip());
+}
+
+static LOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn counting_get(h: usize) -> Option<Vec<u8>> { if h <= 3 { LOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } host_get(h) }
+
+/// Snapshots cover max_reorg even after a reorg replaced the latest: a second reorg never replays from genesis.
+#[test]
+fn a_reorg_after_a_reorg_starts_from_a_snapshot() {
+    let p = quick();
+    let g = Chain::genesis(&p, now() - 1_000_000, b"y");
+    let mut st = Store::open_host(p.clone(), &g, bitcheque::block::HostBlocks { get: counting_get, put: host_put }, None, &[], 10, host_snap).unwrap();
+    let main = build(&p, &g, &[g.clone()], 0, 25, 0);
+    for x in &main[1..] { st.accept(x, now()).unwrap(); }
+    let b1 = build(&p, &g, &main, 19, 7, 1);
+    for x in &b1[20..] { st.accept(x, now()).unwrap(); }
+    let b2 = build(&p, &g, &b1, 26, 8, 0);
+    for x in &b2[27..] { st.accept(x, now()).unwrap(); }
+    LOW.store(0, std::sync::atomic::Ordering::Relaxed);
+    let b3 = build(&p, &g, &b2, 25, 10, 2);
+    for x in &b3[26..] { st.accept(x, now()).unwrap(); }
+    assert_eq!(st.chain.tip(), b3[35].header.hash());
+    assert_eq!(LOW.load(std::sync::atomic::Ordering::Relaxed), 0, "no replay from genesis");
 }
 
 fn frame(magic: &[u8; 4], kind: u8, payload: &[u8]) -> Vec<u8> { [&magic[..], &[kind], &(payload.len() as u32).to_le_bytes(), payload].concat() }

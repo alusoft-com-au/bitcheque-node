@@ -26,7 +26,7 @@ pub struct Params {
     pub reg_fee: u64,
     pub renew_fee: u64,
     pub renew_window: u32,     // a batch may be renewed only this close to its expiry (so a renewal, which anyone may send, costs its owner one fee per lifetime at most)
-    pub max_reorg: u32,        // deepest reorg a node follows: forks further back are refused (bounds side blocks, replay and rewrites)
+    pub max_reorg: u32,        // reorgs deeper than this need twice the work of what they replace (and snapshots are kept to cover this deep)
     pub unfunded_pow_lifetime: u32,
     pub number_quarantine: u32,
     pub batch_lifetime: u32,
@@ -64,7 +64,7 @@ impl Params {
             reg_fee: 100 * 1000,
             renew_fee: 10 * 1000,
             renew_window: 43_200,          // the last 30 days of a batch's life
-            max_reorg: 100,                // as deep as number_maturity: a final number is never on a branch a node would follow
+            max_reorg: 100,                // as deep as number_maturity: replacing a final number takes twice the work
             unfunded_pow_lifetime: 43_200, // 30 days
             number_quarantine: 525_600,    // a year
             batch_lifetime: 2_100_000,     // about four years
