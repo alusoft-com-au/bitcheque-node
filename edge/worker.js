@@ -11,6 +11,8 @@ import { DurableObject } from 'cloudflare:workers';
 import WASM from './bitcheque_edge.wasm';
 
 const REGIONS = { ap: 'apac', us: 'enam', eu: 'weur' };   // node-<key>.bitcheque.org -> location hint
+// a deployment may run other regions (env REGIONS, JSON like {"oc":"oc"}): a further node that follows these as upstreams
+const regions = env => env.REGIONS ? JSON.parse(env.REGIONS) : REGIONS;
 const SYNC_MS = 60_000;          // between wakes
 const SNAP_EVERY = 100;          // blocks between state snapshots (a cold start replays fewer than this)
 const MAX_PER_WAKE = 500;        // blocks fetched in one wake
@@ -120,12 +122,12 @@ export class EdgeNode extends DurableObject {
   upstreams() {
     const list = (this.env.UPSTREAMS || '').split(',').map(s => s.trim()).filter(Boolean);
     const me = this.meta('region');
-    return [...list, ...Object.keys(REGIONS).filter(r => r !== me).map(r => 'do:' + r)];
+    return [...list, ...Object.keys(regions(this.env)).filter(r => r !== me).map(r => 'do:' + r)];
   }
   async call(up, path, init) {
     const r = up.startsWith('do:')
       ? await this.env.NODE.get(this.env.NODE.idFromName(up.slice(3))).fetch('https://edge' + path, { ...init, headers: { 'X-Edge-Peer': '1' } })
-      : await fetch(up.replace(/\/$/, '') + path, { ...init, signal: AbortSignal.timeout(10_000) });
+      : await (this.env.UPSTREAM_SVC || globalThis).fetch(up.replace(/\/$/, '') + path, { ...init, signal: AbortSignal.timeout(10_000) });   // UPSTREAM_SVC: a service binding to the upstream Worker
     if (!r.ok) throw new Error(`${up}${path}: ${r.status}`);
     return r.text();
   }
@@ -223,12 +225,13 @@ export default {
     const url = new URL(req.url);
     const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1';   // wrangler dev: ?node=ap
     const region = local ? url.searchParams.get('node') || 'ap' : url.hostname.match(/^node-([a-z]+)\./)?.[1];
-    if (!REGIONS[region]) return text('unknown node', 404);
+    const R = regions(env);
+    if (!R[region]) return text('unknown node', 404);
     if (req.method === 'OPTIONS') return new Response(null, { headers: CORS });
     if (!ROUTES.has(url.pathname.split('/')[1])) return text('unknown route', 404);
     // an edge node has no TCP peers: its peers are the other regions and the upstream nodes it syncs with
-    if (url.pathname === '/peers') return text(String(Object.keys(REGIONS).length - 1 + (env.UPSTREAMS || '').split(',').filter(s => s.trim()).length));
-    const stub = env.NODE.get(env.NODE.idFromName(region), { locationHint: REGIONS[region] });
+    if (url.pathname === '/peers') return text(String(Object.keys(R).length - 1 + (env.UPSTREAMS || '').split(',').filter(s => s.trim()).length));
+    const stub = env.NODE.get(env.NODE.idFromName(region), { locationHint: R[region] });
     const inner = new URL(url.pathname + `?region=${region}`, 'https://edge');
     if (req.method === 'HEAD') { const r = await stub.fetch(inner); return new Response(null, r); }   // headers only
     if (req.method !== 'GET') return stub.fetch(inner, { method: req.method, body: await req.text() });
@@ -242,6 +245,6 @@ export default {
   },
   // a watchdog: wake each region so its alarm keeps running even if nothing has called it
   async scheduled(_ev, env) {
-    await Promise.allSettled(Object.entries(REGIONS).map(([r, hint]) => env.NODE.get(env.NODE.idFromName(r), { locationHint: hint }).fetch(`https://edge/edge?region=${r}`)));
+    await Promise.allSettled(Object.entries(regions(env)).map(([r, hint]) => env.NODE.get(env.NODE.idFromName(r), { locationHint: hint }).fetch(`https://edge/edge?region=${r}`)));
   },
 };
