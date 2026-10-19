@@ -30,6 +30,9 @@ const ADDR_REPLY: usize = 50;    // addresses shared per GET_ADDR
 const GIVE_UP: u32 = 3;          // failed dials before an address is forgotten
 const MAX_INBOUND: usize = 125;  // inbound connections accepted (Bitcoin's default)
 const MAX_PER_IP: usize = 4;     // connections from one address
+const MAX_PER_GROUP: usize = 8;  // ...and from one /24 (IPv4) or /64 (IPv6)
+const BOOK_PER_GROUP: usize = 8; // addresses remembered per /16 (IPv4) or /32 (IPv6): one network cannot fill the book
+const HELLO_WAIT: Duration = Duration::from_secs(10);  // a new connection that has not said HELLO by then is dropped
 const STRIKES: u32 = 3;          // bad messages before a peer is dropped
 const GET_BLOCKS_GAP: Duration = Duration::from_millis(200); // fastest a peer may ask for the next batch
 const QUEUE_BYTES: usize = 64 << 20;   // bytes waiting to be written to one peer; past this, messages to it are dropped
@@ -38,7 +41,10 @@ const STALL: Duration = Duration::from_secs(30);       // a sync source that del
 const BAR: Duration = Duration::from_secs(600);        // ...and not chosen again for this long
 const BAN: Duration = Duration::from_secs(1800);       // a misbehaving peer's address is refused for this long
 const ADDR_GAP: Duration = Duration::from_secs(10);    // fastest a peer's ADDR messages are read
-const MEMPOOL_BYTES: usize = 64 << 20; // waiting transactions kept, in encoded bytes (Bitcoin keeps 300 MB)
+const MEMPOOL_BYTES: usize = 64 << 20; // waiting transactions kept, in encoded bytes (Bitcoin keeps 300 MB); see set_mempool_cap
+const HTTP_MAX: usize = 32 << 20;      // largest reply the HTTP client reads
+const HTTP_DEADLINE: Duration = Duration::from_secs(60);   // ...and the longest it waits for one, in all
+const UPSTREAM_QUEUE: usize = 1000;    // posts waiting for one upstream; past this the newest are dropped (the pull catches up)
 
 /// Seed nodes a fresh node dials when it knows nobody else (DESIGN.md §7). Placeholders: the
 /// project has no domain yet, so these names do not resolve and a node just moves on.
@@ -63,16 +69,51 @@ const FROM_UPSTREAM: u64 = u64::MAX - 1;
 const UPSTREAM_BATCH: u32 = 2000;   // blocks pulled from an upstream per round
 
 /// A plain HTTP/1.0 request to a node's RPC at "host:port" (no TLS: blocks and transactions check themselves, so a
-/// party in between can at most withhold them). The reply body, or an error with the status line.
+/// party in between can at most withhold them, or lie about what it has not shown). The reply body, or an error with
+/// the status line. A reply is read up to HTTP_MAX bytes within HTTP_DEADLINE, so a hostile server cannot exhaust
+/// memory or hold the caller forever. Text from the server is cleaned of control characters before it is shown.
 pub fn http(addr: &str, method: &str, path: &str, body: &str) -> Result<String, String> {
     let sa = addr.to_socket_addrs().map_err(|e| format!("{addr}: {e}"))?.next().ok_or(format!("{addr}: no address"))?;
     let mut s = TcpStream::connect_timeout(&sa, Duration::from_secs(10)).map_err(|e| format!("{addr}: {e}"))?;
-    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    s.set_write_timeout(Some(Duration::from_secs(30))).ok();
     write!(s, "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
-    let mut out = String::new();
-    s.read_to_string(&mut out).map_err(|e| e.to_string())?;
+    let (start, mut out, mut buf) = (Instant::now(), Vec::new(), [0u8; 16384]);
+    loop {
+        let left = HTTP_DEADLINE.checked_sub(start.elapsed()).filter(|d| !d.is_zero()).ok_or(format!("{addr}: reply too slow"))?;
+        s.set_read_timeout(Some(left.min(Duration::from_secs(30)))).ok();
+        match s.read(&mut buf) { Ok(0) => break, Ok(n) => out.extend_from_slice(&buf[..n]), Err(e) => return Err(format!("{addr}: {e}")) }
+        if out.len() > HTTP_MAX { return Err(format!("{addr}: reply too large")); }
+    }
+    let out = String::from_utf8_lossy(&out);
     let (head, text) = out.split_once("\r\n\r\n").ok_or("bad reply")?;
-    if head.split_whitespace().nth(1) == Some("200") { Ok(text.to_string()) } else { Err(format!("{path}: {}", text.trim())) }
+    if head.split_whitespace().nth(1) == Some("200") { Ok(text.to_string()) } else { Err(format!("{path}: {}", clean(text.trim()))) }
+}
+
+/// Text from another machine, safe to print to a terminal: control characters (escape sequences) become '?'.
+pub fn clean(s: &str) -> String { s.chars().take(500).map(|c| if c.is_control() && c != '\n' { '?' } else { c }).collect() }
+
+/// The network an address belongs to for diversity limits: /16 or /24 of IPv4, /32 or /64 of IPv6 (`wide` picks the first).
+fn group(ip: std::net::IpAddr, wide: bool) -> Vec<u8> {
+    match ip {
+        std::net::IpAddr::V4(a) => a.octets()[..if wide { 2 } else { 3 }].to_vec(),
+        std::net::IpAddr::V6(a) => match a.to_ipv4_mapped() { Some(v4) => group(std::net::IpAddr::V4(v4), wide), None => a.octets()[..if wide { 4 } else { 8 }].to_vec() },
+    }
+}
+/// An address another node may pass us: a public IP literal (no names to look up, no private or loopback hosts).
+fn public_ip(a: &str) -> Option<std::net::IpAddr> {
+    let ip = a.parse::<SocketAddr>().ok()?.ip();
+    let ok = match ip {
+        std::net::IpAddr::V4(v) => !(v.is_private() || v.is_loopback() || v.is_link_local() || v.is_unspecified() || v.is_broadcast() || v.is_documentation() || v.octets()[0] == 0 || v.octets()[0] >= 224 || (v.octets()[0] == 100 && v.octets()[1] & 0xC0 == 64)),
+        std::net::IpAddr::V6(v) => !(v.is_loopback() || v.is_unspecified() || v.is_multicast() || (v.segments()[0] & 0xfe00) == 0xfc00 || (v.segments()[0] & 0xffc0) == 0xfe80),
+    };
+    ok.then_some(ip)
+}
+/// A cheap random number (no crypto needed): for picking which addresses to share or evict.
+fn rand64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64));
+    h.finish()
 }
 
 /// "host:port" with a numeric port and no spaces or control characters.
@@ -116,7 +157,10 @@ pub struct Node {
     next: Mutex<Option<State>>,        // the tip state with the mempool applied; None = rebuild on next use
     mempool_bytes: AtomicUsize,
     banned: Mutex<HashMap<std::net::IpAddr, Instant>>,
-    upstream: Mutex<Option<std::sync::mpsc::Sender<(&'static str, String)>>>,   // (path, body) to POST to every upstream, in order
+    upstream: Mutex<Vec<SyncSender<(&'static str, String)>>>,   // per upstream: (path, body) to POST to it, in order
+    mempool_cap: AtomicUsize,
+    mempool_version: AtomicUsize,      // bumped whenever the mempool changes (for the template cache)
+    tpl_cache: Mutex<Option<((u32, [u8; 32], usize, u32), Block)>>,   // (payee, tip, mempool version, time) -> template
 }
 
 /// Queue a message for a peer. Never blocks: false when the peer's queue is full (it is not reading).
@@ -148,8 +192,11 @@ impl Node {
         Arc::new(Node { store: Mutex::new(store), mempool: Mutex::new(Vec::new()), peers: Mutex::new(Vec::new()), next_id: Mutex::new(1), magic,
                         book: Mutex::new(BTreeMap::new()), book_path: Mutex::new(None), advertise: Mutex::new(None),
                         sync: Mutex::new(None), rpc_limit: Mutex::new(std::collections::HashMap::new()), top_cache: Mutex::new(None),
-                        next: Mutex::new(None), mempool_bytes: AtomicUsize::new(0), banned: Mutex::new(HashMap::new()), upstream: Mutex::new(None) })
+                        next: Mutex::new(None), mempool_bytes: AtomicUsize::new(0), banned: Mutex::new(HashMap::new()), upstream: Mutex::new(Vec::new()),
+                        mempool_cap: AtomicUsize::new(MEMPOOL_BYTES), mempool_version: AtomicUsize::new(0), tpl_cache: Mutex::new(None) })
     }
+    /// Keep at most this many bytes of waiting transactions (the edge node, with 128 MB in all, keeps far fewer).
+    pub fn set_mempool_cap(&self, bytes: usize) { self.mempool_cap.store(bytes, Ordering::Relaxed); }
     pub fn height(&self) -> u32 { self.store.lock().unwrap().chain.height() }
     /// The address other nodes can reach us on; sent in HELLO so peers can pass it around.
     pub fn set_advertise(&self, addr: &str) { if valid_addr(addr) { *self.advertise.lock().unwrap() = Some(addr.to_string()); } }
@@ -162,13 +209,20 @@ impl Node {
         *self.book_path.lock().unwrap() = Some(path);
     }
     pub fn known_addrs(&self) -> Vec<String> { self.book.lock().unwrap().keys().cloned().collect() }
-    fn add_addr(&self, a: &str) -> bool {
+    /// An address a peer told us about: only a public IP literal (a local devnet may use loopback, and `seen` marks one
+    /// we saw the peer connect from), and only a few per network, so gossip can neither point us at private or
+    /// arbitrary hosts nor fill the book from one network.
+    fn add_addr(&self, a: &str, seen: bool) -> bool {
         if !valid_addr(a) || self.advertise.lock().unwrap().as_deref() == Some(a) { return false; }
+        let devnet = self.magic[3] == 0x02;
+        let ip = match public_ip(a) { Some(ip) => ip, None if devnet || seen => match a.parse::<SocketAddr>() { Ok(s) => s.ip(), Err(_) => return false }, None => return false };
         let mut b = self.book.lock().unwrap();
         if b.contains_key(a) { return false; }
+        let g = group(ip, true);
+        if !devnet && b.keys().filter(|k| k.parse::<SocketAddr>().is_ok_and(|s| group(s.ip(), true) == g)).count() >= BOOK_PER_GROUP { return false; }
         if b.len() >= MAX_BOOK {
             // full: replace a random entry, so nobody can fill the book once and keep it (Bitcoin's addrman evicts too)
-            let k = (Instant::now().elapsed().subsec_nanos() as usize ^ a.len().wrapping_mul(2654435761) ^ now() as usize) % b.len();
+            let k = rand64() as usize % b.len();
             if let Some(old) = b.keys().nth(k).cloned() { if seeds(&self.magic).contains(&old.as_str()) { return false; } b.remove(&old); }
         }
         b.insert(a.to_string(), 0);
@@ -194,9 +248,11 @@ impl Node {
         let node = self.clone();
         std::thread::spawn(move || for s in l.incoming().flatten() {
             let ip = s.peer_addr().ok().map(|a| a.ip());
-            let (inbound, same_ip) = { let ps = node.peers.lock().unwrap(); (ps.iter().filter(|p| !p.outbound).count(), ps.iter().filter(|p| p.ip == ip && ip.is_some()).count()) };
+            let (inbound, same_ip, same_group) = { let ps = node.peers.lock().unwrap();
+                (ps.iter().filter(|p| !p.outbound).count(), ps.iter().filter(|p| p.ip == ip && ip.is_some()).count(),
+                 ps.iter().filter(|p| ip.is_some() && p.ip.map(|x| group(x, false)) == ip.map(|x| group(x, false))).count()) };
             let local = ip.map_or(false, |a| a.is_loopback());   // many nodes on one machine share 127.0.0.1
-            if inbound >= MAX_INBOUND || (same_ip >= MAX_PER_IP && !local) || node.is_banned(ip) { continue; }   // dropped: over the cap, or banned
+            if inbound >= MAX_INBOUND || ((same_ip >= MAX_PER_IP || same_group >= MAX_PER_GROUP) && !local) || node.is_banned(ip) { continue; }   // dropped: over the cap, or banned
             node.add_peer(s);
         });
         Ok(local)
@@ -238,9 +294,13 @@ impl Node {
                 let pick = {
                     let mut s = node.sync.lock().unwrap();
                     if let Some((id, at, since)) = *s { if my == at && since.elapsed() > STALL {
-                        // it claimed more than it delivered: believe our own height for it, and try someone else for a while
+                        // it claimed more than it delivered: believe our own height for it, try someone else, and keep its
+                        // address away for a while (a fresh connection with a fresh claim would otherwise take the slot again)
                         *s = None;
-                        if let Some(p) = node.peers.lock().unwrap().iter().find(|p| p.id == id) { *p.height.lock().unwrap() = my; *p.barred.lock().unwrap() = Some(Instant::now() + BAR); }
+                        if let Some(p) = node.peers.lock().unwrap().iter().find(|p| p.id == id) {
+                            *p.height.lock().unwrap() = my; *p.barred.lock().unwrap() = Some(Instant::now() + BAR);
+                            if let Some(ip) = p.ip.filter(|a| !a.is_loopback()) { node.banned.lock().unwrap().insert(ip, Instant::now() + BAR); let _ = p.stream.lock().unwrap().shutdown(std::net::Shutdown::Both); }
+                        }
                     } }
                     if s.is_some() { None } else {
                         let usable = |p: &&Arc<Peer>| p.barred.lock().unwrap().map_or(true, |t| t < Instant::now());
@@ -265,7 +325,7 @@ impl Node {
     pub fn peer_count(&self) -> usize { self.peers.lock().unwrap().len() }
     fn add_peer(self: &Arc<Self>, stream: TcpStream) { self.add_peer_from(stream, None, false) }
     fn add_peer_from(self: &Arc<Self>, stream: TcpStream, addr: Option<String>, outbound: bool) {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(600)));
+        let _ = stream.set_read_timeout(Some(HELLO_WAIT));   // until it says HELLO; then 600 s (serve)
         let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));   // a peer that stops reading is dropped, not waited on forever
         let reader = match stream.try_clone() { Ok(r) => r, Err(_) => return };
         let mut writer = match stream.try_clone() { Ok(w) => w, Err(_) => return };
@@ -307,44 +367,60 @@ impl Node {
         let (mut strikes, mut last_get) = (0u32, std::time::Instant::now() - GET_BLOCKS_GAP);
         let mut last_addr = Instant::now() - ADDR_GAP;
         let mut last_backoff = (0u32, std::time::Instant::now() - Duration::from_secs(10), 100u32);   // (our height, when, how far) we last stepped back during sync
+        let mut said_hello = false;
         loop {
             let (kind, payload) = recv(&mut reader, &self.magic)?;
+            if !said_hello && kind != HELLO { return Err(std::io::Error::other("no hello")); }
             let mut bad = false;
             match kind {
-                HELLO if payload.len() >= 36 => {
+                HELLO if payload.len() >= 36 && !said_hello => {
+                    // once per connection: a peer cannot keep re-claiming a height to hold the sync slot
+                    said_hello = true;
+                    let _ = reader.set_read_timeout(Some(Duration::from_secs(600)));
                     peer_height = u32::from_le_bytes(payload[..4].try_into().unwrap());
                     *peer.height.lock().unwrap() = peer_height;
-                    let want_sync = peer_height > self.height() && { let mut s = self.sync.lock().unwrap(); if s.is_none() { *s = Some((peer.id, self.height(), std::time::Instant::now())); true } else { false } };
+                    let barred = peer.barred.lock().unwrap().is_some_and(|t| t > Instant::now());
+                    let want_sync = !barred && peer_height > self.height() && { let mut s = self.sync.lock().unwrap(); if s.is_none() { *s = Some((peer.id, self.height(), std::time::Instant::now())); true } else { false } };
                     if let Ok(a) = std::str::from_utf8(&payload[36..]) { if !a.is_empty() && valid_addr(a) {
                         // believe an advertised address only when it is the IP the peer is really connecting from;
                         // otherwise a peer could claim honest nodes' addresses and stop us dialling them
                         let own = a.rsplit_once(':').and_then(|(h, _)| h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok()).is_some_and(|h| Some(h) == peer.ip);
                         if own {
                             peer.addr.lock().unwrap().get_or_insert_with(|| a.to_string());   // so we never dial a peer that is already connected to us
-                            if self.add_addr(a) { self.relay(ADDR, a.as_bytes(), Some(peer.id)); }
+                            if self.add_addr(a, true) { self.relay(ADDR, a.as_bytes(), Some(peer.id)); }
                         } } }
                     send(&peer, &self.magic, GET_ADDR, &[]);
                     if want_sync { self.request_from(&peer, self.height() + 1); }
                 }
                 GET_ADDR => {
+                    // a random sample, so no address (chosen to sort first, say) spreads further than any other
                     let own = peer.addr.lock().unwrap().clone();
-                    let list: Vec<String> = self.book.lock().unwrap().keys().filter(|a| Some(a.as_str()) != own.as_deref()).take(ADDR_REPLY).cloned().collect();
+                    let mut list: Vec<String> = self.book.lock().unwrap().keys().filter(|a| Some(a.as_str()) != own.as_deref()).cloned().collect();
+                    for i in (1..list.len()).rev() { list.swap(i, rand64() as usize % (i + 1)); }
+                    list.truncate(ADDR_REPLY);
                     send(&peer, &self.magic, ADDR, list.join("\n").as_bytes());
                 }
                 ADDR => {
                     if last_addr.elapsed() < ADDR_GAP { continue; }   // a peer may not flood the address book
                     last_addr = Instant::now();
-                    if let Ok(text) = std::str::from_utf8(&payload) { for a in text.lines().take(ADDR_REPLY) { self.add_addr(a); } }
+                    if let Ok(text) = std::str::from_utf8(&payload) { for a in text.lines().take(ADDR_REPLY) { self.add_addr(a, false); } }
                 }
                 GET_BLOCKS if payload.len() == 4 => {
                     if last_get.elapsed() < GET_BLOCKS_GAP { continue; }   // a batch is 500 blocks: faster than this is ignored, not served
                     last_get = std::time::Instant::now();
                     let from = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
                     let (window, at) = { let st = self.store.lock().unwrap(); st.chain.blocks.window(from, BATCH) };   // copy only what is asked for
-                    for b in window.read_many(at, BATCH) { if !send(&peer, &self.magic, BLOCK, &b) { break; } }   // queue full: it asks again
+                    // read a few at a time, and stop once its queue is full (it asks again), so a batch never sits in memory whole
+                    let mut i = 0;
+                    'batch: while i < BATCH {
+                        let chunk = window.read_many(at + i, 16);
+                        if chunk.is_empty() { break; }
+                        i += chunk.len();
+                        for b in chunk { if !send(&peer, &self.magic, BLOCK, &b) { break 'batch; } }
+                    }
                 }
                 BLOCK => {
-                    let res = match Block::decode(&payload) { Ok(b) => self.submit_block(&b, Some(peer.id)), Err(_) => Err("decode") };
+                    let res = match Block::decode(&payload) { Ok(b) => self.submit_block(&b, Some(peer.id)).map(|_| ()), Err(_) => Err("decode") };
                     let from_source = self.sync.lock().unwrap().is_some_and(|(id, _, _)| id == peer.id);
                     // a reply to our batch request counts whatever became of the block (new, side, already known)
                     if from_source && matches!(res, Ok(()) | Err("known")) {
@@ -368,7 +444,7 @@ impl Node {
                                 last_backoff = (self.height(), std::time::Instant::now(), depth);
                                 self.request_from(&peer, self.height().saturating_sub(depth).max(1));
                             }
-                            Err("pow") | Err("bits") | Err("tx root") | Err("state root") | Err("decode") => bad = true,   // invalid, not merely unknown (a bad time can be clock skew)
+                            Err("pow") | Err("bits") | Err("tx root") | Err("state root") | Err("decode") | Err("coinbase") | Err("block too large") | Err("duplicate transaction") => bad = true,   // invalid, not merely unknown (a bad time can be clock skew)
                             _ => {}
                     }
                 }
@@ -386,7 +462,7 @@ impl Node {
     /// Hand something to the upstreams (POST path body), unless it came from one.
     fn push_up(&self, path: &'static str, body: String, from: Option<u64>) {
         if from == Some(FROM_UPSTREAM) { return; }
-        if let Some(q) = self.upstream.lock().unwrap().as_ref() { let _ = q.send((path, body)); }
+        for q in self.upstream.lock().unwrap().iter() { let _ = q.try_send((path, body.clone())); }   // full: dropped, the pull catches up
     }
 
     /// Follow upstream nodes over their HTTP RPC (the edge nodes speak no TCP): every `every`, pull new blocks from the
@@ -394,10 +470,12 @@ impl Node {
     /// them, in order. Pulled blocks are relayed to TCP peers too, so this node bridges the two.
     pub fn follow(self: &Arc<Self>, ups: Vec<String>, every: Duration) {
         if ups.is_empty() { return; }
-        let (q, rx) = std::sync::mpsc::channel::<(&'static str, String)>();
-        *self.upstream.lock().unwrap() = Some(q);
-        let targets = ups.clone();
-        std::thread::spawn(move || for (path, body) in rx { for up in &targets { if let Err(e) = http(up, "POST", path, &body) { eprintln!("upstream {up}: {e}"); } } });
+        // one bounded queue and thread per upstream: a slow or dead one delays nobody else, and its backlog stays small
+        for up in ups.clone() {
+            let (q, rx) = sync_channel::<(&'static str, String)>(UPSTREAM_QUEUE);
+            self.upstream.lock().unwrap().push(q);
+            std::thread::spawn(move || for (path, body) in rx { if let Err(e) = http(&up, "POST", path, &body) { eprintln!("upstream {up}: {e}"); } });
+        }
         let node = self.clone();
         std::thread::spawn(move || loop {
             for up in &ups { match node.pull_from(up) { Ok(()) => break, Err(e) => eprintln!("upstream {up}: {e}") } }
@@ -413,7 +491,9 @@ impl Node {
             let b = Block::decode(&raw).map_err(|e| format!("block {h}: {e}"))?;
             n += 1;
             match self.submit_block(&b, Some(FROM_UPSTREAM)) {
-                Ok(()) | Err("known") => { let mine = self.height(); h = if mine >= h { mine + 1 } else { h + 1 }; }
+                // the tip moved (extended or reorganised): carry on above it; a side block or a known one: the next height
+                Ok(true) => h = self.height() + 1,
+                Ok(false) | Err("known") => h += 1,
                 Err("prev unknown") if back < 200 && h > 1 => { back += 1; h -= 1; }
                 Err(e) => return Err(format!("block {h}: {e}")),
             }
@@ -421,13 +501,14 @@ impl Node {
         Ok(())
     }
 
-    /// Store the block, extend or reorganize the chain, fix up the mempool, relay.
-    pub fn submit_block(&self, b: &Block, from: Option<u64>) -> Result<(), &'static str> {
+    /// Store the block, extend or reorganize the chain, fix up the mempool, relay. Ok(true): the main chain changed
+    /// (and the block was relayed); Ok(false): kept as a side block (not relayed: nobody needs it unless it wins).
+    pub fn submit_block(&self, b: &Block, from: Option<u64>) -> Result<bool, &'static str> {
         let returned = {
             let mut s = self.store.lock().unwrap();
             match s.accept(b, now())? {
                 Accepted::Known => return Err("known"),
-                Accepted::Side => return Ok(()),
+                Accepted::Side => return Ok(false),
                 Accepted::Extended => {
                     let mut m = self.mempool.lock().unwrap();
                     m.retain(|t| !b.txs.contains(t));
@@ -443,11 +524,12 @@ impl Node {
                 }
             }
         };
+        self.mempool_version.fetch_add(1, Ordering::Relaxed);
         for t in returned { let _ = self.submit_tx(t, Some(u64::MAX)); }
         let raw = b.encode();
         self.relay(BLOCK, &raw, from);
         self.push_up("/block", crate::crypto::hex(&raw), from);
-        Ok(())
+        Ok(true)
     }
     /// Drop queued transactions the chain can no longer mine (their account moved on, their cheque
     /// expired...). Without this a dead transaction would sit in memory, and in the explorer, forever.
@@ -482,10 +564,10 @@ impl Node {
             let mut next = self.next.lock().unwrap();
             for t in txs {
                 let raw = t.encode();
-                let r = if self.mempool_bytes.load(Ordering::Relaxed) + raw.len() > MEMPOOL_BYTES { Err("mempool full") }
+                let r = if self.mempool_bytes.load(Ordering::Relaxed) + raw.len() > self.mempool_cap.load(Ordering::Relaxed) { Err("mempool full") }
                         else if m.contains(&t) { Err("already in mempool") }
                         else { Self::next_state(c, &m, &mut next).apply(&c.params, &t).map(|_| ()) };
-                if r.is_ok() { m.push(t); self.mempool_bytes.fetch_add(raw.len(), Ordering::Relaxed); accepted.push(raw); }
+                if r.is_ok() { m.push(t); self.mempool_bytes.fetch_add(raw.len(), Ordering::Relaxed); self.mempool_version.fetch_add(1, Ordering::Relaxed); accepted.push(raw); }
                 out.push(r);
             }
         }
@@ -495,12 +577,16 @@ impl Node {
         out
     }
     /// Dry run: apply `txs` in order on a copy of the next block's state (after the mempool).
-    /// Nothing is stored or relayed. Returns one result per transaction.
-    pub fn check_txs(&self, txs: &[Tx]) -> Vec<Result<(), &'static str>> {
+    /// Nothing is stored or relayed. Returns one result per transaction: for a cheque piece, the row (digit) its
+    /// cell matched, so a wallet can tell a cell copied from the wrong row of the right column.
+    pub fn check_txs(&self, txs: &[Tx]) -> Vec<Result<Option<u8>, &'static str>> {
         let s = self.store.lock().unwrap(); let c = &s.chain;
         let m = self.mempool.lock().unwrap();
         let mut st = Self::next_state(c, &m, &mut self.next.lock().unwrap()).clone();
-        txs.iter().map(|t| st.apply(&c.params, t).map(|_| ())).collect()
+        txs.iter().map(|t| {
+            let row = match t { Tx::ChequePiece { account, cheque, column, shares } => st.piece_digit(account, *cheque, *column, shares), _ => None };
+            st.apply(&c.params, t).map(|_| row)
+        }).collect()
     }
     /// The next block to mine for `payee`, nonce 0: the tip, the time, and waiting transactions oldest
     /// first up to the block size limit. The node does not mine: miners fetch this over RPC
@@ -508,6 +594,9 @@ impl Node {
     pub fn template(&self, payee: u32) -> Result<Block, &'static str> {
         if self.sync.lock().unwrap().is_some() { return Err("syncing"); }   // never hand out a stale tip while catching up
         let st = self.store.lock().unwrap(); let c = &st.chain;
+        // the same template for the same payee, tip, mempool and second: a flood of requests costs one build
+        let key = (payee, c.tip(), self.mempool_version.load(Ordering::Relaxed), now().max(c.median_time() + 1));
+        if let Some((k, b)) = self.tpl_cache.lock().unwrap().as_ref() { if *k == key { return Ok(b.clone()); } }
         let m = self.mempool.lock().unwrap();
         let mut s = c.state.clone();
         s.begin_block(&c.params, c.height() + 1);
@@ -519,6 +608,8 @@ impl Node {
             if used + n > room || s.apply(&c.params, t).is_err() { return false; }
             used += n; true
         }).cloned().collect();
-        c.template(now().max(c.median_time() + 1), payee, txs)
+        let b = c.template(key.3, payee, txs)?;
+        *self.tpl_cache.lock().unwrap() = Some((key, b.clone()));
+        Ok(b)
     }
 }

@@ -15,6 +15,8 @@ use bitcheque::store::Store;
 static mut IO: Vec<u8> = Vec::new();
 static mut BUF: Vec<u8> = Vec::new();   // where the host writes a block it was asked for
 static mut NODE: Option<Arc<Node>> = None;
+/// Waiting transactions kept: a Durable Object has 128 MB in all, and they are kept decoded, with copies of the state.
+const MEMPOOL_BYTES: usize = 8 << 20;
 
 #[link(wasm_import_module = "env")]
 extern "C" {
@@ -64,19 +66,21 @@ pub extern "C" fn open(net: u32, every: u32) -> u32 {
     let (sn, headers) = if n > 0 && raw.len() >= 4 + n { (Some(&raw[4..4 + n]), &raw[4 + n..]) } else { (None, &raw[raw.len().min(4 + n)..]) };
     let Ok(store) = Store::open_host(p, &g, HostBlocks { get, put }, sn, headers, every, snap) else { return 0 };
     let h = store.chain.height();
-    unsafe { NODE = Some(Node::new(store)) };
+    let node = Node::new(store);
+    node.set_mempool_cap(MEMPOOL_BYTES);
+    unsafe { NODE = Some(node) };
     h + 1
 }
 
 #[no_mangle]
 pub extern "C" fn height() -> u32 { node().height() }
 
-/// io = an encoded block. 1 = accepted (onto the main chain or a side branch), 2 = already known,
-/// 0 = refused, with the reason in io. Main-chain blocks reach the host through `host_put`.
+/// io = an encoded block. 1 = accepted, and the main chain moved (extended or reorganised); 3 = kept as a side block;
+/// 2 = already known; 0 = refused, with the reason in io. Main-chain blocks reach the host through `host_put`.
 #[no_mangle]
 pub extern "C" fn add_block() -> u32 {
     let Ok(b) = Block::decode(io()) else { out("bad block"); return 0 };
-    match node().submit_block(&b, None) { Ok(()) => 1, Err("known") => 2, Err(e) => { out(e); 0 } }
+    match node().submit_block(&b, None) { Ok(true) => 1, Ok(false) => 3, Err("known") => 2, Err(e) => { out(e); 0 } }
 }
 
 /// io = "METHOD /path\n" then the body -> io = the status code, a newline, then the reply text.
@@ -106,7 +110,7 @@ pub extern "C" fn mine(payee: u32, start: u32, tries: u32) -> u32 {
     for k in 0..tries {
         b.header.nonce = start.wrapping_add(k);
         if b.header.meets_target() {
-            return match n.submit_block(&b, None) { Ok(()) => { out(&bitcheque::crypto::hex(&b.encode())); 1 } Err(e) => { out(e); 2 } };
+            return match n.submit_block(&b, None) { Ok(true) => { out(&bitcheque::crypto::hex(&b.encode())); 1 } Ok(false) => { out("side block"); 2 } Err(e) => { out(e); 2 } };
         }
     }
     0

@@ -5,8 +5,9 @@
 // it missed (GET /height, GET /block/<n>). Blocks live in its SQLite database. Cost: it sleeps between
 // wakes (no duration billed). The regions in MINE_REGIONS are also backup miners: when no block has come for
 // QUIET_S (the first region), QUIET_S + FALLBACK_S (the second) and so on, one mines for up to MINE_MS at the
-// current target, paying account MINER_TO (0 = nobody). Changing CHAIN_VERSION wipes every region's database
-// once, on its next wake: a network reset.
+// current target, paying the account whose id is MINER_ID (hex; nobody while it has no final number). Changing
+// CHAIN_VERSION wipes every region's database once, on its next wake: a network reset. Peers prove themselves to each
+// other with the secret EDGE_SECRET (wrangler secret) in X-Edge-Peer; the public's requests are rate limited (RL).
 import { DurableObject } from 'cloudflare:workers';
 import WASM from './bitcheque_edge.wasm';
 
@@ -27,6 +28,9 @@ const CHAIN_VERSION = '8';        // bump to reset the network: each region forg
 const FALLBACK_S = 120;          // each further region in MINE_REGIONS waits this much longer (if the first is down)
 const RERELAY_MAX = 50;          // waiting transactions offered again to each other region per wake
 const POOL_MAX = 1000;           // waiting transactions kept in the database across unloads (all offered again on load)
+const BODY_MAX = 4 << 20;        // request body bytes (16 registrations of 16 cheques and a cheque are under 2 MB of hex)
+const ROW_MAX = 1_900_000;       // a SQLite row holds at most 2 MB: a bigger pool batch is kept a line per row
+const PEER_MS = 10_000;          // a peer that has not answered by then is given up on
 const FRESH = new Set(['height', 'tip', 'template']);   // miners and the status page need these nearly fresh
 const FRESH_S = 2;               // ...but a short cache still collapses a flood of them into one request per colo
 const CACHE_S = 15;              // seconds the front worker caches a GET reply (status pages poll every 10 s)
@@ -34,6 +38,16 @@ const CACHE_S = 15;              // seconds the front worker caches a GET reply 
 const ROUTES = new Set(['height', 'peers', 'addrs', 'tip', 'block', 'summary', 'account', 'id', 'lookup', 'proof', 'regtarget', 'history', 'stats', 'mempool', 'top', 'template', 'tx', 'check', 'edge']);
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
 const enc = new TextEncoder(), dec = new TextDecoder();
+const timeout = (p, ms) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error('timeout')), ms))]);
+// the body, refused (null) past `max` bytes: by its Content-Length at once, else while it streams in
+async function readBody(req, max = BODY_MAX) {
+  if (+(req.headers.get('content-length') || 0) > max) return null;
+  if (!req.body) return '';
+  const parts = [], rd = req.body.getReader(); let n = 0;
+  for (;;) { const { done, value } = await rd.read(); if (done) break; n += value.length; if (n > max) { rd.cancel(); return null; } parts.push(value); }
+  const all = new Uint8Array(n); let o = 0; for (const p of parts) { all.set(p, o); o += p.length; }
+  return dec.decode(all);
+}
 const text = (body, status = 200, extra = {}) => new Response(body, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8', ...CORS, ...extra } });
 const unhex = s => { s = s.trim(); if (!/^([0-9a-f]{2})*$/i.test(s)) return null; const b = new Uint8Array(s.length / 2); for (let i = 0; i < b.length; i++) b[i] = parseInt(s.substr(2 * i, 2), 16); return b; };
 
@@ -46,7 +60,7 @@ export class EdgeNode extends DurableObject {
                    CREATE TABLE IF NOT EXISTS snap (part INTEGER PRIMARY KEY, data BLOB NOT NULL);
                    CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
                    CREATE TABLE IF NOT EXISTS pool (id INTEGER PRIMARY KEY AUTOINCREMENT, tx TEXT NOT NULL UNIQUE)`);
-    this.x = null;
+    this.x = null; this.ready = false; this.starting = null;
     this.relayed = Promise.resolve();   // forwards go out one after another, in the order they were accepted
     if (this.meta('chain_version') !== CHAIN_VERSION) {   // a network reset: start again from block 0
       this.sql.exec('DELETE FROM blocks; DELETE FROM headers; DELETE FROM snap; DELETE FROM pool');
@@ -62,7 +76,13 @@ export class EdgeNode extends DurableObject {
 
   // ---- the wasm node and its storage ----
   async node() {
-    if (this.x) return this.x;
+    if (this.ready) return this.x;
+    if (!this.starting) this.starting = this.start().finally(() => { this.starting = null; });
+    return this.starting;
+  }
+  // the instance is published (this.x) only once it has fully started; a failure leaves nothing half-made behind
+  async start() {
+    this.ready = false;
     const env = {
       host_get: h => { const r = this.sql.exec('SELECT data FROM blocks WHERE h = ?', h).toArray()[0]; if (!r) return 0;
                        const b = new Uint8Array(r.data), p = this.x.buf_reserve(b.length); new Uint8Array(this.x.memory.buffer, p, b.length).set(b); return b.length; },
@@ -71,6 +91,7 @@ export class EdgeNode extends DurableObject {
                              for (let i = 0; i * PART < b.length; i++) this.sql.exec('INSERT INTO snap VALUES (?, ?)', i, b.subarray(i * PART, (i + 1) * PART)); },
     };
     const x = this.x = (await WebAssembly.instantiate(WASM, { env })).exports;
+    try {
     this.now();
     // restore: the snapshot, the headers up to it, then every stored block above it
     const parts = this.sql.exec('SELECT data FROM snap ORDER BY part').toArray().map(r => new Uint8Array(r.data));
@@ -92,8 +113,13 @@ export class EdgeNode extends DurableObject {
       const live = why.trim().split('\n').some(x => x === 'ok' || x === 'already in mempool');
       if (!(code === 200 && live) && why.trim() !== 'already in mempool') this.sql.exec('DELETE FROM pool WHERE id = ?', r.id);
     }
+    } catch (e) { this.x = null; throw e; }
+    this.ready = true;
     return x;
   }
+  // a trap inside the wasm (an abort) leaves its state unusable, its lock held: drop the instance so the next call
+  // starts a fresh one from the database
+  guard(f) { try { return f(); } catch (e) { if (e instanceof WebAssembly.RuntimeError) { this.x = null; this.ready = false; } throw e; } }
   header(h, b) {   // keep block h's header in its chunk row
     const c = Math.floor((h - 1) / HDR_CHUNK), at = ((h - 1) % HDR_CHUNK) * 112;
     const old = this.sql.exec('SELECT data FROM headers WHERE chunk = ?', c).toArray()[0];
@@ -115,8 +141,8 @@ export class EdgeNode extends DurableObject {
     const h = this.x.height();
     this.sql.exec('DELETE FROM blocks WHERE h > ?', h);
   }
-  add(b) { this.put(b); this.now(); const r = this.x.add_block(); return r ? { r } : { r, why: this.out(this.x.io_len()) }; }
-  rpc(method, path, body = '') { this.put(enc.encode(`${method} ${path}\n${body}`)); this.now(); const s = this.out(this.x.rpc()); const i = s.indexOf('\n'); return [+s.slice(0, i), s.slice(i + 1)]; }
+  add(b) { return this.guard(() => { this.put(b); this.now(); const r = this.x.add_block(); return r ? { r } : { r, why: this.out(this.x.io_len()) }; }); }
+  rpc(method, path, body = '') { return this.guard(() => { this.put(enc.encode(`${method} ${path}\n${body}`)); this.now(); const s = this.out(this.x.rpc()); const i = s.indexOf('\n'); return [+s.slice(0, i), s.slice(i + 1)]; }); }
 
   // ---- upstreams: other nodes' RPC ("https://host"), or another region ("do:eu") ----
   upstreams() {
@@ -127,12 +153,12 @@ export class EdgeNode extends DurableObject {
   // a peer in this Worker ("do:eu"), or another node's RPC ("https://host"), reached through the service binding SERVICES
   // names for its host (a Worker may not fetch another on its own zone). X-Edge-Peer tells it not to pass this on.
   async call(up, path, init) {
-    const peer = { ...init, headers: { 'X-Edge-Peer': '1' } };
+    const peer = { ...init, headers: { 'X-Edge-Peer': this.env.EDGE_SECRET || '1' } };
     let r;
-    if (up.startsWith('do:')) r = await this.env.NODE.get(this.env.NODE.idFromName(up.slice(3))).fetch('https://edge' + path, peer);
+    if (up.startsWith('do:')) r = await timeout(this.env.NODE.get(this.env.NODE.idFromName(up.slice(3))).fetch('https://edge' + path, peer), PEER_MS);
     else {
       const via = this.env[JSON.parse(this.env.SERVICES || '{}')[new URL(up).host]] || this.env.UPSTREAM_SVC || globalThis;
-      r = await via.fetch(up.replace(/\/$/, '') + path, { ...peer, signal: AbortSignal.timeout(10_000) });
+      r = await via.fetch(up.replace(/\/$/, '') + path, { ...peer, signal: AbortSignal.timeout(PEER_MS) });
     }
     if (!r.ok) throw new Error(`${up}${path}: ${r.status}`);
     return r.text();
@@ -150,8 +176,9 @@ export class EdgeNode extends DurableObject {
         while (h <= theirs && fetched < MAX_PER_WAKE) {
           const b = unhex(await this.call(up, `/block/${h}`)); fetched++;
           const a = b ? this.add(b) : { r: 0, why: 'bad hex' };
-          // accepted: carry on from the tip if it moved past h, else (a side block, or one we had) from h + 1
-          if (a.r) { h = x.height() >= h ? x.height() + 1 : h + 1; continue; }
+          // the tip moved (1: extended or reorganised): carry on above it; a side block (3) or one we had (2): from h + 1
+          if (a.r === 1) { h = x.height() + 1; continue; }
+          if (a.r) { h++; continue; }
           if (a.why === 'prev unknown' && back < 200 && h > 1) { back++; h--; continue; }   // a fork: walk back to where we agree
           throw new Error(`block ${h} refused: ${a.why}`);
         }
@@ -172,11 +199,14 @@ export class EdgeNode extends DurableObject {
     const rank = (this.env.MINE_REGIONS || '').split(',').map(s => s.trim()).indexOf(this.meta('region'));
     if (rank < 0) return;
     this.now(); if (x.quiet() < QUIET_S + rank * FALLBACK_S) return;
-    let payee = +(this.env.MINER_TO || 0), start = (Math.random() * 2 ** 32) >>> 0;
+    // the payee is pinned by account id, not number: a number goes to whoever registers first after a reset (or
+    // takes it over once it expires), an id only to the holder of that book. No final number yet: mine to nobody.
+    const [code, acct] = this.env.MINER_ID ? this.rpc('GET', '/id/' + this.env.MINER_ID) : [0, ''];
+    let payee = code === 200 ? +(acct.match(/^number (\d+)$/m)?.[1] || 0) : 0, start = (Math.random() * 2 ** 32) >>> 0;
     const end = Date.now() + MINE_MS, note = o => this.meta('last_mined', JSON.stringify({ at: new Date().toISOString(), height: x.height(), payee, ...o }));
     while (Date.now() < end) {
       this.now();
-      const r = x.mine(payee, start, MINE_TRIES); start = (start + MINE_TRIES) >>> 0;
+      const r = this.guard(() => x.mine(payee, start, MINE_TRIES)); start = (start + MINE_TRIES) >>> 0;
       // hand the block to the other regions before the alarm returns: background work started in an alarm is
       // cut off when it ends, which left the others a minute behind until their own sync
       if (r === 1) { const body = this.out(x.io_len()); note({ found: true });
@@ -198,8 +228,10 @@ export class EdgeNode extends DurableObject {
       if (why.trim().split('\n').some(x => x === 'ok' || x === 'already in mempool')) live.push(r.tx);
       else this.sql.exec('DELETE FROM pool WHERE id = ?', r.id);
     }
-    for (const up of this.upstreams())
-      for (const tx of live.slice(0, RERELAY_MAX)) { try { await this.call(up, '/tx', { method: 'POST', body: tx }); } catch (_) {} }
+    // each peer gets them as batched requests (at most 64 transactions each, the RPC's limit), all peers at once
+    const lines = live.slice(0, RERELAY_MAX).flatMap(t => t.split('\n')), batches = [];
+    for (let i = 0; i < lines.length; i += 64) batches.push(lines.slice(i, i + 64).join('\n'));
+    await Promise.allSettled(this.upstreams().map(async up => { for (const body of batches) { try { await this.call(up, '/tx', { method: 'POST', body }); } catch (_) {} } }));
   }
   // every minute; straight away again while catching up
   async alarm() { let n = 0; try { n = await this.sync(); if (n < MAX_PER_WAKE) await this.backup(); } finally { await this.ctx.storage.setAlarm(Date.now() + (n >= MAX_PER_WAKE ? 1000 : this.env.SYNC_S ? +this.env.SYNC_S * 1000 : SYNC_MS)); } }
@@ -210,19 +242,26 @@ export class EdgeNode extends DurableObject {
     if (region && region !== this.region) { this.region = region; if (this.meta('region') !== region) this.meta('region', region); }
     if (!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now() + 1000);
     await this.node();
-    if (url.pathname === '/edge') return text(`region ${this.meta('region')}\nheight ${this.x.height()}\nupstreams ${this.upstreams().join(' ')}\nlast_sync ${this.meta('last_sync') ?? 'never'}\nlast_mined ${this.meta('last_mined') ?? 'never'}\n`);
-    const body = req.method === 'POST' ? await req.text() : '';
+    const peer = !!req.headers.get('X-Edge-Peer');   // the front worker passes the header on only from a real peer
+    // the sync and mining details help nobody but the operator (and an attacker timing a fork): peers only
+    if (url.pathname === '/edge') return text(`region ${this.meta('region')}\nheight ${this.x.height()}\nupstreams ${this.upstreams().join(' ')}\n` +
+      (peer ? `last_sync ${this.meta('last_sync') ?? 'never'}\nlast_mined ${this.meta('last_mined') ?? 'never'}\n` : ''));
+    const body = req.method === 'POST' ? await readBody(req) : '';
+    if (body === null) return text('request too large', 413);
     const [code, reply] = this.rpc(req.method, url.pathname, body);
     if (req.method === 'POST' && url.pathname === '/tx' && code === 200) {
-      // keep what was accepted (for a batch, the lines whose result is "ok"), together, as one row
+      // keep what was accepted (for a batch, the lines whose result is "ok"), together, as one row (a line per row if too big)
       const lines = body.trim().split(/\s*\n\s*/), res = reply.trim().split('\n');
       const ok = lines.length === 1 ? lines : lines.filter((_, i) => res[i] === 'ok');
-      if (ok.length) this.sql.exec('INSERT OR IGNORE INTO pool (tx) VALUES (?)', ok.join('\n'));
+      const rows = ok.join('\n').length > ROW_MAX ? ok : ok.length ? [ok.join('\n')] : [];
+      for (const row of rows) { try { this.sql.exec('INSERT OR IGNORE INTO pool (tx) VALUES (?)', row); } catch (_) {} }
       this.sql.exec('DELETE FROM pool WHERE id <= (SELECT MAX(id) FROM pool) - ?', POOL_MAX);
     }
-    // a new transaction or a newly mined block goes on to the other regions and upstream nodes at once
-    // (not back to the region that sent it); polling every minute is only the safety net
-    if (req.method === 'POST' && (url.pathname === '/tx' || url.pathname === '/block') && code === 200 && !req.headers.get('X-Edge-Peer'))
+    // a new transaction or a block that moved the main chain goes on to the other regions and upstream nodes at once
+    // (not back to the region that sent it, and not a side block: nobody needs it unless it wins); polling every
+    // minute is only the safety net
+    const moved = url.pathname === '/tx' || reply.trim() === 'accepted';
+    if (req.method === 'POST' && (url.pathname === '/tx' || url.pathname === '/block') && code === 200 && moved && !peer)
       await (this.relayed = this.relayed.then(() => Promise.allSettled(this.upstreams().map(up => this.call(up, url.pathname, { method: 'POST', body })))));   // before replying: background work may be cut off
     if (req.method === 'POST' && url.pathname === '/block') this.trim();
     return text(reply, code);
@@ -237,20 +276,34 @@ export default {
     const R = regions(env);
     if (!R[region]) return text('unknown node', 404);
     if (req.method === 'OPTIONS') return new Response(null, { headers: CORS });
+    if (!['GET', 'HEAD', 'POST'].includes(req.method)) return text('method not allowed', 405);
     if (!ROUTES.has(url.pathname.split('/')[1])) return text('unknown route', 404);
+    // X-Edge-Peer from a peer carries the shared secret; anyone else's is dropped (it would stop their transactions
+    // being passed on at once). Without a secret configured, any value counts (a local devnet).
+    const peer = env.EDGE_SECRET ? req.headers.get('X-Edge-Peer') === env.EDGE_SECRET : !!req.headers.get('X-Edge-Peer');
+    // the public's uncached requests are rate limited per address (cache hits cost nothing and are not counted)
+    const limited = async () => !peer && env.RL && !(await env.RL.limit({ key: req.headers.get('CF-Connecting-IP') || 'unknown' })).success;
     // an edge node has no TCP peers: its peers are the other regions and the upstream nodes it syncs with
     if (url.pathname === '/peers') return text(String(Object.keys(R).length - 1 + (env.UPSTREAMS || '').split(',').filter(s => s.trim()).length));
     const stub = env.NODE.get(env.NODE.idFromName(region), { locationHint: R[region] });
     const inner = new URL(url.pathname + `?region=${region}`, 'https://edge');
-    if (req.method === 'HEAD') { const r = await stub.fetch(inner); return new Response(null, r); }   // headers only
-    if (req.method !== 'GET') return stub.fetch(inner, { method: req.method, body: await req.text(), headers: req.headers.get('X-Edge-Peer') ? { 'X-Edge-Peer': '1' } : {} });   // a peer's forward is not passed on again
+    if (req.method === 'POST') {
+      if (await limited()) return text('too many requests', 429);
+      const body = await readBody(req);
+      if (body === null) return text('request too large', 413);
+      return stub.fetch(inner, { method: 'POST', body, headers: peer ? { 'X-Edge-Peer': '1' } : {} });   // a peer's forward is not passed on again
+    }
+    // GET and HEAD share the cache (HEAD answers with the headers only)
+    const head = r => req.method === 'HEAD' ? new Response(null, r) : r;
     const fresh = FRESH.has(url.pathname.split('/')[1]), cache = caches.default, key = new Request(url.origin + url.pathname);
     const hit = await cache.match(key);
-    if (hit) return hit;
-    const res = await stub.fetch(inner);
+    if (hit) return head(hit);
+    if (await limited()) return text('too many requests', 429);
+    const res = await stub.fetch(inner, { headers: peer ? { 'X-Edge-Peer': '1' } : {} });
     const out = new Response(res.body, res);
-    if (res.ok) { out.headers.set('Cache-Control', `public, max-age=${fresh ? FRESH_S : CACHE_S}`); ctx.waitUntil(cache.put(key, out.clone())); }
-    return out;
+    // /edge differs for peers and the public: never cached
+    if (res.ok && url.pathname !== '/edge') { out.headers.set('Cache-Control', `public, max-age=${fresh ? FRESH_S : CACHE_S}`); ctx.waitUntil(cache.put(key, out.clone())); }
+    return head(out);
   },
   // a watchdog: wake each region so its alarm keeps running even if nothing has called it
   async scheduled(_ev, env) {

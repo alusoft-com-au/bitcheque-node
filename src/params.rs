@@ -25,6 +25,8 @@ pub struct Params {
     pub fee_unit: u64,
     pub reg_fee: u64,
     pub renew_fee: u64,
+    pub renew_window: u32,     // a batch may be renewed only this close to its expiry (so a renewal, which anyone may send, costs its owner one fee per lifetime at most)
+    pub max_reorg: u32,        // deepest reorg a node follows: forks further back are refused (bounds side blocks, replay and rewrites)
     pub unfunded_pow_lifetime: u32,
     pub number_quarantine: u32,
     pub batch_lifetime: u32,
@@ -56,11 +58,13 @@ impl Params {
             max_block_bytes: 1_000_000,    // about 1 MB a minute: well within what home connections relay
             max_future_seconds: 720,       // twelve blocks, as Bitcoin's two hours are twelve of its blocks
             reg_pow_target: U256::one_shl(228), // 2^256 / 2^28
-            reg_pow_window: 20_160,        // two weeks
-            reg_pow_per_block_cap: 200,
+            reg_pow_window: 1_440,         // a day: the target follows demand within days, not weeks
+            reg_pow_per_block_cap: 16,     // about what fits in a block (a registration of 16 cheques is ~58 KB)
             fee_unit: 1000,
             reg_fee: 100 * 1000,
             renew_fee: 10 * 1000,
+            renew_window: 43_200,          // the last 30 days of a batch's life
+            max_reorg: 100,                // as deep as number_maturity: a final number is never on a branch a node would follow
             unfunded_pow_lifetime: 43_200, // 30 days
             number_quarantine: 525_600,    // a year
             batch_lifetime: 2_100_000,     // about four years

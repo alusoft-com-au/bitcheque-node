@@ -56,29 +56,30 @@ pub struct R<'a> { pub b: &'a [u8], pub i: usize }
 impl<'a> R<'a> {
     pub fn new(b: &'a [u8]) -> R<'a> { R { b, i: 0 } }
     pub fn take(&mut self, k: usize) -> Result<&'a [u8], &'static str> {
-        if self.i + k > self.b.len() { return Err("truncated"); }
-        let s = &self.b[self.i..self.i + k]; self.i += k; Ok(s)
+        // checked: on a 32-bit target (the edge node's wasm) a length near u32::MAX would wrap past the bounds check
+        let end = self.i.checked_add(k).filter(|&e| e <= self.b.len()).ok_or("truncated")?;
+        let s = &self.b[self.i..end]; self.i = end; Ok(s)
     }
     pub fn u8(&mut self) -> Result<u8, &'static str> { Ok(self.take(1)?[0]) }
     pub fn u16(&mut self) -> Result<u16, &'static str> { Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap())) }
     pub fn u32(&mut self) -> Result<u32, &'static str> { Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap())) }
     pub fn u64(&mut self) -> Result<u64, &'static str> { Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap())) }
     pub fn bytes(&mut self) -> Result<Vec<u8>, &'static str> { let k = self.u32()? as usize; Ok(self.take(k)?.to_vec()) }
-    /// A hash share: at most 32 bytes (n is 16 or 32), so a frame cannot decode into far more memory than it took on the wire.
-    pub fn share(&mut self) -> Result<Vec<u8>, &'static str> { let k = self.u32()? as usize; if k > 32 { return Err("share too long"); } Ok(self.take(k)?.to_vec()) }
-    pub fn batch(&mut self, m: usize) -> Result<Batch, &'static str> {
+    /// A hash share of exactly `n` bytes (the book's 16 or 32), so a frame cannot decode into far more memory than it took on the wire.
+    pub fn share(&mut self, n: usize) -> Result<Vec<u8>, &'static str> { let k = self.u32()? as usize; if k != n { return Err("bad share length"); } Ok(self.take(k)?.to_vec()) }
+    pub fn batch(&mut self, m: usize, n: usize) -> Result<Batch, &'static str> {
         let start = self.u32()?; let count = self.u32()?; let nch = self.u32()?;
         if nch > 256 { return Err("batch too large"); }
         let mut cheques = Vec::with_capacity(nch as usize);
         for _ in 0..nch {
             let mut ch = Vec::with_capacity(18);
             for _ in 0..18 { let mut col = Vec::with_capacity(10);
-                for _ in 0..10 { let mut row = Vec::with_capacity(m); for _ in 0..m { row.push(self.share()?) } col.push(row) }
+                for _ in 0..10 { let mut row = Vec::with_capacity(m); for _ in 0..m { row.push(self.share(n)?) } col.push(row) }
                 ch.push(col) }
             cheques.push(ch);
         }
         let np = self.u32()?; if np > 32 { return Err("path too long"); }
-        let mut path = Vec::new(); for _ in 0..np { path.push(self.share()?) }
+        let mut path = Vec::new(); for _ in 0..np { path.push(self.share(n)?) }
         Ok(Batch { start, count, cheques, path })
     }
 }
@@ -110,17 +111,19 @@ impl Tx {
                 let salt: [u8; 16] = r.take(16)?.try_into().unwrap();
                 let m = r.u8()?; let n256 = r.u8()? != 0; let book_size = r.u32()?; let root = r.bytes()?;
                 if !(1..=7).contains(&m) { return Err("bad m"); }
-                let batch = r.batch(m as usize)?;
+                let n = if n256 { 32 } else { 16 };
+                if root.len() != n { return Err("bad root"); }
+                let batch = r.batch(m as usize, n)?;
                 let pay = match r.u8()? { 0 => Payment::Pow(r.u64()?), _ => return Err("bad payment") };
                 Tx::RegisterBook { salt, m, n256, book_size, root, batch, pay }
             }
             2 => {
-                let account = account(r)?; let m = id_m(&account) as usize; let batch = r.batch(m)?;
+                let account = account(r)?; let batch = r.batch(id_m(&account) as usize, id_n(&account))?;
                 let pay = match r.u8()? { 0 => Payment::Pow(r.u64()?), _ => return Err("bad payment") };
                 Tx::RegisterBatch { account, batch, pay }
             }
-            3 => { let account = account(r)?; let cheque = r.u16()?; let column = r.u8()?; let k = r.u8()?; if k > 7 { return Err("too many shares"); }
-                   let mut shares = Vec::new(); for _ in 0..k { shares.push(r.share()?) }
+            3 => { let account = account(r)?; let cheque = r.u16()?; let column = r.u8()?; let k = r.u8()?; if k != id_m(&account) { return Err("bad share count"); }
+                   let n = id_n(&account); let mut shares = Vec::new(); for _ in 0..k { shares.push(r.share(n)?) }
                    Tx::ChequePiece { account, cheque, column, shares } }
             4 => Tx::Renew { account: account(r)?, start: r.u32()? },
             _ => return Err("unknown tx type"),

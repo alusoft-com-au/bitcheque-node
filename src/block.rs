@@ -51,8 +51,8 @@ impl Block {
 }
 
 /// Merkle root over txids, zero-padded to a power of two (no duplicate-last malleability).
-pub fn tx_root(txs: &[Tx]) -> [u8; 32] {
-    let mut level: Vec<[u8; 32]> = txs.iter().map(|t| t.txid()).collect();
+pub fn tx_root(txs: &[Tx]) -> [u8; 32] { root_of(txs.iter().map(|t| t.txid()).collect()) }
+fn root_of(mut level: Vec<[u8; 32]>) -> [u8; 32] {
     if level.is_empty() { return [0u8; 32]; }
     while !level.len().is_power_of_two() { level.push([0u8; 32]); }
     while level.len() > 1 {
@@ -61,15 +61,20 @@ pub fn tx_root(txs: &[Tx]) -> [u8; 32] {
     level[0]
 }
 
-/// LWMA-1 (Zawy) over the last `window` headers, clamped to ×/÷ `clamp` per block.
+/// LWMA-1 (Zawy) over the last `window` headers, clamped to ×/÷ `clamp` per block. A solve time is measured from
+/// the latest timestamp so far (at least 1 s, at most 6 targets), so a timestamp set back and then forward cannot
+/// earn an easier target the way a symmetric clamp of raw differences allows.
 pub fn next_bits(p: &Params, headers: &[Header]) -> u32 {
     let n = headers.len().min(p.lwma_window);
     if n < 2 { return p.min_bits; }
     let hs = &headers[headers.len() - n..];
     let t = p.block_target_seconds as i64;
     let (mut weighted, mut sum_targets) = (0i64, U256::ZERO);
+    let mut latest = hs[0].time as i64;
     for i in 1..n {
-        let solve = (hs[i].time as i64 - hs[i - 1].time as i64).clamp(-6 * t, 6 * t);
+        let this = (hs[i].time as i64).max(latest + 1);
+        let solve = (this - latest).min(6 * t);
+        latest = this;
         weighted += solve * i as i64;
         sum_targets = sum_targets.add(&U256::from_compact(hs[i].bits).div_u64(n as u64 - 1));   // the mean of the n-1 targets
     }
@@ -86,13 +91,15 @@ pub fn next_bits(p: &Params, headers: &[Header]) -> u32 {
 
 /// Main-chain blocks: in memory (tests, no --data) or left in the data file and read back by offset,
 /// so a node's memory does not grow with the chain. `at[h]` is the (offset, length) of block h.
-pub enum Blocks { Mem(Vec<Block>), File { path: std::path::PathBuf, genesis: Block, at: Vec<(u64, u32)> }, Host { genesis: Block, n: usize, io: HostBlocks } }
+/// `Count` keeps nothing but how many there are: a reorg replays into it, so nothing is stored until the new branch
+/// has proved valid.
+pub enum Blocks { Mem(Vec<Block>), File { path: std::path::PathBuf, genesis: Block, at: Vec<(u64, u32)> }, Host { genesis: Block, n: usize, io: HostBlocks }, Count(usize) }
 /// Block storage kept by a host, by height (the edge node keeps blocks in a Durable Object's database):
 /// `get` the encoded block at a height, `put` one there, replacing what was there.
 #[derive(Clone, Copy)]
 pub struct HostBlocks { pub get: fn(usize) -> Option<Vec<u8>>, pub put: fn(usize, &[u8]) }
 impl Blocks {
-    pub fn len(&self) -> usize { match self { Blocks::Mem(v) => v.len(), Blocks::File { at, .. } => at.len(), Blocks::Host { n, .. } => *n } }
+    pub fn len(&self) -> usize { match self { Blocks::Mem(v) => v.len(), Blocks::File { at, .. } => at.len(), Blocks::Host { n, .. } | Blocks::Count(n) => *n } }
     pub fn get(&self, h: usize) -> Option<Block> {
         match self {
             Blocks::Mem(v) => v.get(h).cloned(),
@@ -107,6 +114,7 @@ impl Blocks {
                 Block::decode(&buf).ok()
             }
             Blocks::Host { genesis, n, io } => if h == 0 { Some(genesis.clone()) } else if h < *n { Block::decode(&(io.get)(h)?).ok() } else { None },
+            Blocks::Count(_) => None,
         }
     }
     /// Encoded blocks `from..from+n` (fewer at the tip), opening the file once.
@@ -127,6 +135,7 @@ impl Blocks {
                 out
             }
             Blocks::Host { genesis, n, io } => (from..(from + n).min(*n)).map_while(|h| if h == 0 { Some(genesis.encode()) } else { (io.get)(h) }).collect(),
+            Blocks::Count(_) => Vec::new(),
         }
     }
     /// A copy holding only blocks `from..from+n` (block 0 stays at index 0), so a peer's request
@@ -138,6 +147,7 @@ impl Blocks {
             Blocks::Mem(v) => (Blocks::Mem([&v[..1], &v[from..end]].concat()), 1),
             Blocks::File { path, genesis, at } => (Blocks::File { path: path.clone(), genesis: genesis.clone(), at: [&at[..1], &at[from..end]].concat() }, 1),
             Blocks::Host { genesis, io, .. } => (Blocks::Host { genesis: genesis.clone(), n: end, io: *io }, from),
+            Blocks::Count(_) => (Blocks::Count(end), from),
         }
     }
     pub fn loc(&self, h: usize) -> Option<(u64, u32)> { if let Blocks::File { at, .. } = self { at.get(h).copied() } else { None } }
@@ -146,9 +156,10 @@ impl Blocks {
             Blocks::Mem(v) => v.push(b.clone()),
             Blocks::File { at, .. } => at.push(loc.expect("a file-backed chain needs the block's location")),
             Blocks::Host { n, io, .. } => { (io.put)(*n, &b.encode()); *n += 1 }
+            Blocks::Count(n) => *n += 1,
         }
     }
-    pub fn truncate(&mut self, k: usize) { match self { Blocks::Mem(v) => v.truncate(k), Blocks::File { at, .. } => at.truncate(k), Blocks::Host { n, .. } => *n = (*n).min(k) } }
+    pub fn truncate(&mut self, k: usize) { match self { Blocks::Mem(v) => v.truncate(k), Blocks::File { at, .. } => at.truncate(k), Blocks::Host { n, .. } | Blocks::Count(n) => *n = (*n).min(k) } }
     /// The same kind of store holding only block 0.
     pub fn empty_like(&self) -> Blocks { self.prefix(1) }
     /// The first `k` blocks (genesis included), sharing the same storage: nothing is read or written.
@@ -157,6 +168,7 @@ impl Blocks {
             Blocks::Mem(v) => Blocks::Mem(v[..k.min(v.len())].to_vec()),
             Blocks::File { path, genesis, at } => Blocks::File { path: path.clone(), genesis: genesis.clone(), at: at[..k.min(at.len())].to_vec() },
             Blocks::Host { genesis, n, io } => Blocks::Host { genesis: genesis.clone(), n: k.min(*n), io: *io },
+            Blocks::Count(n) => Blocks::Count(k.min(*n)),
         }
     }
 }
@@ -263,7 +275,10 @@ impl Chain {
         if h.bits != next_bits(p, &self.headers) && h.bits != relieved_bits(p, &self.headers, h.time) { return Err("bits"); }
         if !h.meets_target() { return Err("pow"); }
         if b.encode().len() > p.max_block_bytes { return Err("block too large"); }
-        if h.tx_root != tx_root(&b.txs) { return Err("tx root"); }
+        let ids: Vec<[u8; 32]> = b.txs.iter().map(|t| t.txid()).collect();
+        if h.tx_root != root_of(ids.clone()) { return Err("tx root"); }
+        // the same transaction twice is never valid (a copy of a fee-paying one would charge its account again)
+        if ids.iter().collect::<std::collections::HashSet<_>>().len() != ids.len() { return Err("duplicate transaction"); }
         let payee = match b.txs.first() { Some(Tx::Coinbase { height: ch, payee, .. }) if *ch == height => *payee, _ => return Err("coinbase") };
         if b.txs[1..].iter().any(|t| matches!(t, Tx::Coinbase { .. })) { return Err("second coinbase"); }
         let mut s = self.state.clone();

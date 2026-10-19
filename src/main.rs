@@ -5,8 +5,10 @@
 //!   On the research network it also follows the edge nodes (node-ap/us/eu/oc/sa.bitcheque.org:80, the seeds) over their
 //!   HTTP RPC: pulls their blocks every minute and passes on what it accepts. --upstream picks others, --no-upstream none.
 //!   --listen defaults to 0.0.0.0:8730 (mainnet) or 0.0.0.0:8731 (testnet); --advertise is the address others can reach you on.
-//! bitcheque wallet new | info|register|more|send|sweep --seed HEX --rpc ADDR [--cheques N] [--to NUMBER --amount COINS [--fee TIER]]
-//! bitcheque wallet pieces --seed HEX --cheque N --digits D18   (raw pieces as hex, no checks: for tests)
+//! bitcheque wallet new | info|register|more|send|sweep --seed-file FILE --rpc ADDR [--cheques N] [--to NUMBER --amount COINS [--fee TIER]]
+//! bitcheque wallet pieces --seed-file FILE --cheque N --digits D18   (raw pieces as hex, no checks: for tests)
+//!   The seed (64 hex digits) comes from --seed-file (keep it 0600), or the BITCHEQUE_SEED environment variable, or
+//!   standard input with --seed-file -. --seed HEX still works, but every user of the machine can read a command line.
 use bitcheque::{block::Chain, crypto::{hex, sha256}, message::Message, net::Node, params::{Params, COIN, GENESIS_MESSAGE as MESSAGE, LAUNCH_TIME, LOCAL_TIME, TESTNET_TIME}, rpc::unhex, store::Store,
                 u256::U256, wallet::{mine_registration, Book, Domain, BATCH, BOOK_SIZE}};
 
@@ -48,7 +50,7 @@ fn main() {
         }
         Some("mine") => if let Err(e) = mine(&opt) { eprintln!("error: {e}"); std::process::exit(1) },
         Some("wallet") => if let Err(e) = wallet(&args, &opt) { eprintln!("error: {e}"); std::process::exit(1) },
-        _ => eprintln!("usage: bitcheque genesis [--mainnet|--local] | bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR] [--upstream HOST:PORT] [--no-upstream]\n       bitcheque mine --rpc ADDR --to NUMBER [--threads N]\n       bitcheque wallet new | info|register|more|send|sweep --seed HEX --rpc ADDR [--cheques N] [--to NUMBER --amount COINS [--fee TIER]]"),
+        _ => eprintln!("usage: bitcheque genesis [--mainnet|--local] | bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR] [--upstream HOST:PORT] [--no-upstream]\n       bitcheque mine --rpc ADDR --to NUMBER [--threads N]\n       bitcheque wallet new | info|register|more|send|sweep --seed-file FILE --rpc ADDR [--cheques N] [--to NUMBER --amount COINS [--fee TIER]]"),
     }
 }
 
@@ -63,7 +65,14 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
         println!("{}", hex(&seed));
         return Ok(());
     }
-    let seed: [u8; 32] = unhex(&opt("--seed").ok_or("--seed HEX needed")?).and_then(|v| v.try_into().ok()).ok_or("seed must be 32 bytes of hex")?;
+    let text = match (opt("--seed-file"), std::env::var("BITCHEQUE_SEED").ok(), opt("--seed")) {
+        (Some(f), _, _) if f == "-" => { let mut t = String::new(); std::io::Read::read_to_string(&mut std::io::stdin(), &mut t).map_err(|e| e.to_string())?; t }
+        (Some(f), _, _) => std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?,
+        (None, Some(t), _) => t,
+        (None, None, Some(t)) => { eprintln!("warning: --seed puts the seed on the command line, where other users of this machine (ps) and the shell history can read it; use --seed-file or BITCHEQUE_SEED"); t }
+        _ => return Err("the seed is needed: --seed-file FILE (or - for standard input), or BITCHEQUE_SEED".into()),
+    };
+    let seed: [u8; 32] = unhex(text.trim()).and_then(|v| v.try_into().ok()).ok_or("seed must be 32 bytes of hex")?;
     let rpc = opt("--rpc").unwrap_or_default();
     if rpc.is_empty() && cmd != "pieces" { return Err("--rpc ADDR needed".into()); }
     let salt: [u8; 16] = sha256(&[b"bitcheque/salt".as_slice(), &seed].concat())[..16].try_into().unwrap();
@@ -73,14 +82,14 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
     let book = Book { salt, n256: false, book_size: size, domains: vec![Domain(seed)] };
     let id = hex(&book.id());
     let account = || -> Result<Vec<(String, String)>, String> {
-        Ok(http(&rpc, "GET", &format!("/id/{id}"), "")?.lines().filter_map(|l| l.split_once(' ').map(|(k, v)| (k.to_string(), v.to_string()))).collect())
+        Ok(http(&rpc, "GET", &format!("/id/{id}"), "")?.lines().filter_map(|l| l.split_once(' ').map(|(k, v)| (clean(k), clean(v)))).collect())
     };
     let field = |a: &[(String, String)], k: &str| a.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
     // everything a command sends goes in one request, so it all lands in the same block (a registration with its
     // cheque 0, or a cheque's 18 pieces). A batch already on the chain is refused as a duplicate, which is fine.
     let post_all = |txs: &[bitcheque::tx::Tx]| -> Result<(), String> {
         let reply = http(&rpc, "POST", "/tx", &txs.iter().map(|t| hex(&t.encode())).collect::<Vec<_>>().join("\n"))?;
-        match reply.lines().find(|l| !matches!(l.trim(), "ok" | "already in mempool" | "batch overlaps")) { None => Ok(()), Some(e) => Err(format!("node refused: {e}")) }
+        match reply.lines().find(|l| !matches!(l.trim(), "ok" | "already in mempool" | "batch overlaps")) { None => Ok(()), Some(e) => Err(format!("node refused: {}", clean(e))) }
     };
     if cmd == "pieces" {
         let cheque: u16 = opt("--cheque").ok_or("--cheque N needed")?.parse().map_err(|_| "bad --cheque")?;
@@ -105,6 +114,8 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
             if first >= size { return Err("every cheque of this book is registered already".into()); }
             let limbs: Vec<u64> = http(&rpc, "GET", "/regtarget", "")?.split_whitespace().map(|w| u64::from_str_radix(w, 16).unwrap_or(0)).collect();
             let target = U256(limbs.try_into().map_err(|_| "bad regtarget")?);
+            // a node can only make registration harder, never impossible: a target this low would never be met
+            if target < U256::one_shl(192) { return Err("the node's registration target is implausibly hard: try another node".into()); }
             let regs = book.registrations(first, first + cheques - 1);
             let mut txs: Vec<_> = regs.iter().map(|reg| mine_registration(reg.clone(), target)).collect(); // each batch of 16 pays its own proof of work
             if cmd == "register" { txs.extend(book.sign(0, &Message::new(0, 0, 0, 0))); } // honesty check: cheque 0, zero coins, to nobody
@@ -125,25 +136,27 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
             // a half-submitted cheque is abandoned by starting a higher one (consensus deletes it)
             let nonce: Option<u16> = field(&a, "open").parse().ok().or(field(&a, "nonce").parse().ok());
             let msg = Message::new(to, mantissa, exponent, tier);
-            // dry run each candidate first: a cheque whose last piece fails would sit half-spent until it expires.
-            // A cheque already in use in the node's queue (an earlier send, or a half-submitted one) is skipped;
-            // writing a higher number abandons a half-submitted cheque.
-            let mut chosen = None;
-            for cheque in field(&a, "unspent").split(',').filter_map(|x| x.parse::<u16>().ok()).filter(|&n| nonce.map_or(true, |k| n > k)) {
-                let pieces = book.sign(cheque, &msg);
-                let check = http(&rpc, "POST", "/check", &pieces.iter().map(|t| hex(&t.encode())).collect::<Vec<_>>().join("\n"))?;
-                match check.lines().find(|l| *l != "ok") {
-                    None => { chosen = Some((cheque, pieces)); break; }
-                    Some("cheque number already consumed") | Some("column already revealed") => continue, // in use in the queue
-                    Some(e) => return Err(format!("node would reject this cheque: {e}")),
-                }
+            // the checks happen here, from what the chain says publicly: no cell leaves this machine before the cheque is
+            // sent for real (a node shown a signed cheque in a dry run could keep it), and exactly one cheque is signed
+            // per payment, so a node that lies about the result cannot collect a second one
+            let balance: u64 = field(&a, "balance").parse().map_err(|_| "the node gave no balance")?;
+            let fee = tier as u64 * bitcheque::params::Params::mainnet().fee_unit;
+            let amount = msg.amount().unwrap_or(0);
+            if balance < amount + fee { return Err(format!("balance {} is less than {} coins and the fee", balance as f64 / COIN as f64, (amount + fee) as f64 / COIN as f64)); }
+            if to != 0 && !http(&rpc, "GET", &format!("/account/{to}"), "").is_ok_and(|t| t.lines().any(|l| l.starts_with("number "))) {
+                return Err(format!("account {to} is not a final number yet (or does not exist)"));
             }
-            let (cheque, pieces) = chosen.ok_or("no unused cheques left")?;
+            // cheques already in the node's queue (an earlier send that has not been mined) are skipped
+            let queued: Vec<u16> = http(&rpc, "GET", "/mempool", "").unwrap_or_default().lines()
+                .filter(|l| l.starts_with("piece ") && l.contains(&format!("account={id} ")))
+                .filter_map(|l| l.split_whitespace().find_map(|w| w.strip_prefix("cheque="))?.parse().ok()).collect();
+            let cheque = field(&a, "unspent").split(',').filter_map(|x| x.parse::<u16>().ok()).filter(|&n| nonce.map_or(true, |k| n > k) && !queued.contains(&n)).min().ok_or("no unused cheques left")?;
             // the last cheque of a book is kept for the sweep to a new book (DESIGN.md §10.11): spent on anything
             // else, whatever is left in the account can never move again
             if cmd == "send" && cheque as u32 == size - 1 && opt("--last").is_none() {
                 return Err(format!("cheque {cheque} is the last one in this book: keep it for `wallet sweep --to <new book>`, or pass --last to spend it anyway"));
             }
+            let pieces = book.sign(cheque, &msg);
             post_all(&pieces)?;
             if cmd == "sweep" { println!("cheque {cheque} sent: {} sweeps the whole balance to {to}, fee tier {tier}", msg.display()); }
             else { println!("cheque {cheque} sent: {} to {to}, {} coins, fee tier {tier}", msg.display(), msg.amount().unwrap_or(0) as f64 / COIN as f64); }
@@ -171,13 +184,18 @@ fn mine(opt: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     const TEMPLATE_SECONDS: u64 = 20;
     let rpc = opt("--rpc").ok_or("--rpc ADDR needed (host:port of a node's RPC)")?;
     let to: u32 = opt("--to").ok_or("--to NUMBER needed (the account that gets the reward; 0 burns it)")?.parse().map_err(|_| "bad --to")?;
-    let threads = opt("--threads").and_then(|t| t.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let threads = opt("--threads").and_then(|t| t.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())).max(1);
+    let min = U256::from_compact(bitcheque::params::Params::testnet().min_bits.max(bitcheque::params::Params::local().min_bits));
     eprintln!("mining for account {to} on {threads} threads against {rpc}");
     loop {
         let tpl = match http(&rpc, "GET", &format!("/template/{to}"), "") {
             Ok(t) => unhex(&t).and_then(|r| bitcheque::block::Block::decode(&r).ok()).ok_or("bad template")?,
-            Err(e) => { eprintln!("template: {e}"); std::thread::sleep(std::time::Duration::from_secs(5)); continue; }
+            Err(e) => { eprintln!("template: {}", clean(&e)); std::thread::sleep(std::time::Duration::from_secs(5)); continue; }
         };
+        // the node builds the template, so check it pays us and asks for real work: a node (or anyone between) could
+        // otherwise have our work pay someone else
+        if !matches!(tpl.txs.first(), Some(bitcheque::tx::Tx::Coinbase { payee, .. }) if *payee == to) { return Err("the node's template pays someone else: use another node".into()); }
+        if U256::from_compact(tpl.header.bits) > min { return Err("the node's template asks for less work than any block may have: use another node".into()); }
         let (stop, hashes, found) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)), Arc::new(Mutex::new(None)));
         let workers: Vec<_> = (0..threads).map(|i| {
             let (mut b, stop, hashes, found) = (tpl.clone(), stop.clone(), hashes.clone(), found.clone());
@@ -206,10 +224,11 @@ fn mine(opt: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         if let Some(b) = block {
             match http(&rpc, "POST", "/block", &hex(&b.encode())) {
                 Ok(_) => eprintln!("mined a block on {} with {} transactions ({:.1} MH/s)", hex(&tpl.header.prev[..4]), b.txs.len() - 1, rate / 1e6),
-                Err(e) => eprintln!("block refused: {e}"),
+                Err(e) => eprintln!("block refused: {}", clean(&e)),
             }
         }
     }
 }
 
 fn http(addr: &str, method: &str, path: &str, body: &str) -> Result<String, String> { bitcheque::net::http(addr, method, path, body) }
+fn clean(s: &str) -> String { bitcheque::net::clean(s) }

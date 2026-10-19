@@ -82,7 +82,8 @@ fn queued_cheque_does_not_block_the_next() {
 /// A passed it on in reply to GET_ADDR), and dials B on its own.
 #[test]
 fn peers_find_each_other_through_gossip() {
-    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, launch_blocks: 0, ..Params::mainnet() };
+    // a devnet: gossip passes loopback addresses only there (elsewhere only public IPs; see below)
+    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, launch_blocks: 0, magic: Params::local().magic, ..Params::mainnet() };
     let g = Chain::genesis(&p, bitcheque::net::now() - 100_000, b"gossip test");
     let mk = || Node::new(Store::open(p.clone(), &g, None).unwrap());
     let (a, b, c) = (mk(), mk(), mk());
@@ -96,6 +97,23 @@ fn peers_find_each_other_through_gossip() {
     c.maintain(vec![], Duration::from_millis(200));
     wait(|| c.peer_count() == 2 && b.peer_count() == 2); // C dialled B; B now sees A and C
     assert!(bitcheque::net::valid_addr("seed1.bitcheque.example:8731") && !bitcheque::net::valid_addr("no port") && !bitcheque::net::valid_addr("x:99999"));
+}
+
+/// On a public network, gossip may not plant private, loopback or named hosts in the address book.
+#[test]
+fn gossip_takes_only_public_addresses() {
+    use std::io::Write;
+    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, launch_blocks: 0, ..Params::mainnet() };
+    let g = Chain::genesis(&p, bitcheque::net::now() - 100_000, b"gossip test");
+    let a = Node::new(Store::open(p.clone(), &g, None).unwrap());
+    let at = a.listen("127.0.0.1:0").unwrap();
+    let frame = |kind: u8, payload: &[u8]| [&p.magic[..], &[kind], &(payload.len() as u32).to_le_bytes(), payload].concat();
+    let mut s = std::net::TcpStream::connect(at).unwrap();
+    s.write_all(&frame(0, &[&0u32.to_le_bytes()[..], &[0u8; 32]].concat())).unwrap();
+    s.write_all(&frame(4, b"10.1.2.3:8730\n127.0.0.1:8730\n192.168.1.1:8730\nsome.host.example:8730\n8.8.4.4:8730")).unwrap();
+    wait(|| !a.known_addrs().is_empty());
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(a.known_addrs(), vec!["8.8.4.4:8730".to_string()]);
 }
 
 /// A node that follows an upstream over its HTTP RPC (as nodes follow the edge nodes, which speak no TCP): it pulls

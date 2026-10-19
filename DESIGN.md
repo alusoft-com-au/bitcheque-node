@@ -94,18 +94,20 @@ outputs.
 | `RegisterBook { salt, m, n256, book_size, root, first batch, PoW nonce }` | nobody; self-verifying | anti-spam proof of work only (§8 item 2) | creates the account, assigns its number, registers the first batch (cheques 0–15) |
 | `RegisterBatch { account, batch, PoW nonce }` | nobody; self-verifying | the same proof of work as `RegisterBook` | makes the next 16 cheques of a book spendable (printing more, §10.10) |
 | `ChequePiece { account, cheque, column, shares }` | the paper | encoded in the cheque (fee tier) | one column of a cheque; a cheque is 18 pieces (§10.12) |
-| `Renew { account, start }` | nobody | 10,000 base units from the account balance | resets a batch's expiry (§10.11) |
+| `Renew { account, start }` | nobody | 10,000 base units from the account balance | resets a batch's expiry (§10.11); valid only in the batch's last 43,200 blocks, so it costs its owner at most one fee per lifetime |
 | Coinbase `{ height, number, message }` | — | — | credits the block reward plus fees to a final account number (or 0, nobody), 100 blocks later |
 
 Registration transactions carry no signature because nothing in them can be
 falsified: every hash must match the committed root through a Merkle path.
 A third party can only register your true hashes, which helps you. A
 `RegisterBook` or `RegisterBatch` is paid only by proof of work over its txid (no coins
-needed), so every 16 cheques of node state cost the same work however they arrive: initial target 2^228 (≈ 2^28 hashes), at most 200 per block, the
-target adjusting every 20,160 blocks (§8 item 2). A PoW account that has
+needed), so every 16 cheques of node state cost the same work however they arrive: initial target 2^228 (≈ 2^28 hashes), at most 16 per block (about what fits), the
+target adjusting every 1,440 blocks (§8 item 2). A PoW account that has
 received no coins after 43,200 blocks (~30 days) is deleted and its number
 quarantined for 525,600 blocks (~a year) before reuse; once funded it is
-permanent. A batch is a power-of-two count of cheques aligned to its start,
+permanent (a zero-coin cheque does not count as funding; a block reward does). An account
+deleted after using cheques leaves a record of its last cheque number, so a replay of its
+registration brings it back with those cheques still used. A batch is a power-of-two count of cheques aligned to its start,
 at most 16, and a book holds at most 256 cheques. Duplicates (an existing account, an overlapping batch) are
 rejected.
 
@@ -279,10 +281,10 @@ every 10 s when the mempool has changed.
    SHA-256 tries over the txid, using a midstate so each try costs a few
    blocks), a minute or two in a browser running the WebAssembly wallet on
    all cores; per-call JavaScript is far too slow, so wallets use WASM or
-   native code. The target adjusts every 20,160 blocks (two weeks) toward a
-   quarter of the cap of 200 PoW registrations per block (§2.2): a window
-   at the cap makes the work four times harder, a window with no
-   registrations four times easier, never easier than the initial target.
+   native code. The target adjusts every 1,440 blocks (a day) toward one
+   registration a block on average (the cap is 16 per block, §2.2): four
+   times the demand or more makes the work four times harder, a window with
+   no registrations four times easier, never easier than the initial target.
    Open: whether the level is right with real demand.
 3. **`FEE_UNIT`** adjustment rule and whether tiers scale with a
    fee-market signal.
@@ -779,7 +781,7 @@ is unspendable, as in Bitcoin.
 | Proof-of-work | SHA-256d over the 112-byte header | AuxPoW (merge-mining) not implemented, §8 item 1 |
 | Header | version 4 B, prev 32 B, tx root 32 B, state root 32 B, time 4 B, bits 4 B, nonce 4 B | 112 B |
 | Block limit | 1,000,000 bytes (encoded block) | §6 |
-| Registration PoW | target 2^228 initially, adjusting every 20,160 blocks; at most 200 PoW registrations per block | §8 item 2 |
+| Registration PoW | target 2^228 initially, adjusting every 1,440 blocks; at most 16 PoW registrations per block | §8 item 2 |
 | Unfunded PoW account | deleted after 43,200 blocks (~30 days); number quarantined 525,600 blocks (~a year) | §2.2 |
 | Batch lifetime | 2,100,000 blocks (~4 years); `Renew` costs 10,000 base units, `RegisterBatch` the registration proof of work | §10.11 |
 | Piece lifetime | 10,000 blocks (~a week) | §10.12 |
@@ -812,7 +814,7 @@ The first blocks have no accounts, so three rules make block 1 possible:
   miner falls back to 0 until its configured number is final.)
 - A coinbase may name number 0, which burns the reward. The genesis
   coinbase does.
-- Registration PoW in the first 20,160 blocks uses the fixed 2^228 target
+- Registration PoW in the first 1,440 blocks uses the fixed 2^228 target
   before the first adjustment, so early registrations cannot be priced out
   by a single burst.
 
@@ -883,7 +885,7 @@ lines. Module map: `sha256` (own FIPS 180-4, with midstate), `u256`,
 `state` (§2.1, §10.11, §10.12, Merkle state root with account proofs),
 `block` (§1, §12, LWMA, stall relief, per-account history and totals for
 the RPC), `store` (blocks left in the data file and read by offset, state
-snapshots every 1,000 blocks, most-work chain selection, reorg by replay
+snapshots every 1,000 blocks (the latest two kept), most-work chain selection among forks at most 100 blocks deep (`max_reorg`), reorg by replay
 from the latest snapshot), `net` (§7 discovery, connection caps,
 misbehaviour strikes, mempool, mining; no transport encryption yet), `rpc`
 (plain-text HTTP, 120 requests per minute per address), `wallet` (§4.2

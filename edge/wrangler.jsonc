@@ -7,6 +7,8 @@
   "durable_objects": { "bindings": [{ "name": "NODE", "class_name": "EdgeNode" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["EdgeNode"] }],
   "triggers": { "crons": ["*/30 * * * *"] },
+  // the public's uncached requests: at most 300 a minute per address (peers, with EDGE_SECRET, are not limited)
+  "ratelimits": [{ "name": "RL", "namespace_id": "1001", "simple": { "limit": 300, "period": 60 } }],
   "routes": [
     { "pattern": "node-ap.bitcheque.org", "custom_domain": true },
     { "pattern": "node-us.bitcheque.org", "custom_domain": true },
@@ -16,8 +18,8 @@
   "services": [{ "binding": "NODE_OC", "service": "bitcheque-node-oc" }, { "binding": "NODE_SA", "service": "bitcheque-node-sa" }],
   // NET 0 = the public research network. UPSTREAMS: the peers outside this Worker (node RPC URLs); SERVICES: which
   // binding reaches each of their hosts. MINE_REGIONS: regions that mine when the chain is quiet, first choice first
-  // (empty: no backup miner); MINER_TO: the account they pay
+  // (empty: no backup miner); MINER_ID: the account id they pay (its number is looked up each time)
   "vars": { "NET": "0", "UPSTREAMS": "https://node-oc.bitcheque.org,https://node-sa.bitcheque.org",
             "SERVICES": "{\"node-oc.bitcheque.org\":\"NODE_OC\",\"node-sa.bitcheque.org\":\"NODE_SA\"}",
-            "MINE_REGIONS": "ap,us,eu", "MINER_TO": "1" }
+            "MINE_REGIONS": "ap,us,eu", "MINER_ID": "13d94e1e8bad344115c3df7af49b74e524" }
 }

@@ -6,11 +6,12 @@
 //!   GET /proof/<number>   GET /regtarget (4 LE limbs, hex)
 //!   GET  /history/<number>  (newest first, the last block::HISTORY_CAP events: height kind key=value...; a cheque to yourself is listed as receive, then send)
 //!   GET  /stats   (lifetime totals, and the reward schedule: reward of the next block, base, halving interval, next halving, maturity)
-//!   GET  /mempool (count, then one line per waiting transaction in the /summary format, then a cheque line per waiting cheque whose recipient is readable)
+//!   GET  /mempool (count, then one line per waiting transaction in the /summary format (the first MEMPOOL_LIST), then a cheque line per waiting cheque whose recipient is readable)
 //!   GET  /top[/N]  (richest N accounts, default 50: number balance book_size last_cheque unspent pending)
 //!   GET  /template/<number>  (hex: the next block to mine, reward to that number (0 burns it), nonce 0)
 //!   POST /tx  (body: hex-encoded tx, or several, one per line, queued together: one result per line)   POST /block (body: hex-encoded block, mined from a template)
-//!   POST /check (body: one hex tx per line; dry run, nothing stored)
+//!   POST /check (body: one hex tx per line; dry run, nothing stored: one result per line, "ok", "ok <row>" for a
+//!   cheque piece (the row its cell matched), or the reason)
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -27,17 +28,27 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
 }
 
-const RPC_PER_MINUTE: u32 = 120;   // requests one address may make per minute
+const RPC_PER_MINUTE: u32 = 120;   // requests one address (an IPv6 /64) may make per minute
 const CHECK_MAX: usize = 64;       // transactions per /check or per batched /tx
-const BODY_MAX: usize = 20 << 20;  // request body bytes (a large registration is a few MB of hex)
+const BODY_MAX: usize = 8 << 20;   // request body bytes (16 registrations of 16 cheques, with a cheque, are under 2 MB of hex)
+const HEAD_MAX: usize = 16 << 10;  // request line and headers
 const RPC_THREADS: usize = 256;    // requests served at once
+const PER_IP: usize = 8;           // ...of which from one address (an IPv6 /64)
+const DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);   // the whole request must arrive within this
+const MEMPOOL_LIST: usize = 500;   // waiting transactions listed by /mempool
 static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The key an address is limited by: an IPv4 address, or the /64 an IPv6 address is in (one host has a whole /64).
+fn limit_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip { std::net::IpAddr::V6(a) if a.to_ipv4_mapped().is_none() => { let s = a.segments(); std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)) } x => x }
+}
 
 impl Node {
     /// Simple per-address limiter: a fixed one-minute window.
     fn allow(&self, ip: std::net::IpAddr) -> bool {
         let mut l = self.rpc_limit.lock().unwrap();
         let now = std::time::Instant::now();
+        let ip = limit_key(ip);
         let e = l.entry(ip).or_insert((0, now));
         if now.duration_since(e.1).as_secs() >= 60 { *e = (0, now); }
         e.0 += 1;
@@ -48,39 +59,63 @@ impl Node {
         let l = TcpListener::bind(addr)?;
         let local = l.local_addr()?;
         let node = self.clone();
+        let open: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>> = Arc::default();   // connections being served, per address
         std::thread::spawn(move || for mut s in l.incoming().flatten() {
             use std::sync::atomic::Ordering;
-            if ACTIVE.load(Ordering::Relaxed) >= RPC_THREADS { let _ = write!(s, "HTTP/1.0 503 Busy\r\nContent-Length: 0\r\n\r\n"); continue; }
+            let key = s.peer_addr().ok().map(|a| limit_key(a.ip())).filter(|ip| !ip.is_loopback());
+            let busy = ACTIVE.load(Ordering::Relaxed) >= RPC_THREADS || key.is_some_and(|k| open.lock().unwrap().get(&k).copied().unwrap_or(0) >= PER_IP);
+            if busy { let _ = write!(s, "HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"); continue; }
             ACTIVE.fetch_add(1, Ordering::Relaxed);
-            let n = node.clone();
-            std::thread::spawn(move || { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| n.handle(s))); ACTIVE.fetch_sub(1, Ordering::Relaxed); });
+            if let Some(k) = key { *open.lock().unwrap().entry(k).or_default() += 1; }
+            let (n, open) = (node.clone(), open.clone());
+            std::thread::spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| n.handle(s)));
+                ACTIVE.fetch_sub(1, Ordering::Relaxed);
+                if let Some(k) = key { let mut o = open.lock().unwrap(); if let Some(c) = o.get_mut(&k) { *c -= 1; if *c == 0 { o.remove(&k); } } }
+            });
         });
         Ok(local)
     }
     fn handle(&self, mut s: TcpStream) {
-        // the operator's own tools on this machine are never limited
-        if let Ok(a) = s.peer_addr() { if !a.ip().is_loopback() && !self.allow(a.ip()) { let _ = write!(s, "HTTP/1.0 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n"); return; } }
-        let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(10)));   // a client that stops sending frees its thread
+        let reply = |s: &mut TcpStream, status: &str| { let _ = write!(s, "HTTP/1.0 {status}\r\nContent-Length: 0\r\n\r\n"); };
         let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(10)));
+        // the whole request within DEADLINE (a per-read timeout alone lets a client trickle a byte at a time forever)
+        let start = std::time::Instant::now();
+        let read = |s: &mut TcpStream, tmp: &mut [u8]| -> Option<usize> {
+            let left = DEADLINE.checked_sub(start.elapsed()).filter(|d| !d.is_zero())?;
+            s.set_read_timeout(Some(left)).ok()?;
+            match s.read(tmp) { Ok(0) | Err(_) => None, Ok(n) => Some(n) }
+        };
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
         let (head_end, body_len) = loop {
-            match s.read(&mut tmp) { Ok(0) | Err(_) => return, Ok(n) => buf.extend_from_slice(&tmp[..n]) }
-            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let seen = buf.len();
+            let Some(n) = read(&mut s, &mut tmp) else { return };
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(i) = buf[seen.saturating_sub(3)..].windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + seen.saturating_sub(3)) {
                 let head = String::from_utf8_lossy(&buf[..i]).to_string();
-                let len = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
-                if len > BODY_MAX { let _ = write!(s, "HTTP/1.0 413 Too Large\r\nContent-Length: 0\r\n\r\n"); return; }
+                let lens: Vec<&str> = head.lines().filter_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")).map(|(_, v)| v.trim())).collect();
+                let len = match lens.as_slice() { [] => 0, [v] => match v.parse::<usize>() { Ok(n) => n, Err(_) => return reply(&mut s, "400 Bad Request") }, _ => return reply(&mut s, "400 Bad Request") };
+                if len > BODY_MAX { return reply(&mut s, "413 Payload Too Large"); }
                 break (i + 4, len);
             }
-            if buf.len() > 1 << 20 { return; }
+            if buf.len() > HEAD_MAX { return reply(&mut s, "431 Request Header Fields Too Large"); }
         };
-        while buf.len() < head_end + body_len { match s.read(&mut tmp) { Ok(0) | Err(_) => return, Ok(n) => buf.extend_from_slice(&tmp[..n]) } }
         let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-        let body = String::from_utf8_lossy(&buf[head_end..head_end + body_len]).to_string();
+        // the limit is per address; behind a reverse proxy on this machine every request comes from loopback, so the
+        // proxy's X-Forwarded-For names the client. Loopback with no such header is the operator's own tools: not limited.
+        if let Ok(a) = s.peer_addr() {
+            let fwd = head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("x-forwarded-for")).and_then(|(_, v)| v.split(',').next()?.trim().parse::<std::net::IpAddr>().ok()));
+            let who = if a.ip().is_loopback() { fwd } else { Some(a.ip()) };
+            if who.is_some_and(|ip| !self.allow(ip)) { return reply(&mut s, "429 Too Many Requests"); }
+        }
+        while buf.len() < head_end + body_len { let Some(n) = read(&mut s, &mut tmp) else { return }; buf.extend_from_slice(&tmp[..n]); }
+        buf.truncate(head_end + body_len);
+        let body = String::from_utf8_lossy(&buf[head_end..]);
         let mut words = head.split_whitespace();
         let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
-        let (code, text) = match self.route(method, path, &body) { Ok(t) => (200, t), Err(e) => (400, e.to_string()) };
-        let _ = write!(s, "HTTP/1.0 {code} OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{text}", text.len());
+        let (status, text) = match self.route(method, path, &body) { Ok(t) => ("200 OK", t), Err(e) => ("400 Bad Request", e.to_string()) };
+        let _ = write!(s, "HTTP/1.0 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{text}", text.len());
     }
     pub fn route(&self, method: &str, path: &str, body: &str) -> Result<String, &'static str> {
         let seg: Vec<&str> = path.trim_matches('/').split('/').collect();
@@ -95,7 +130,8 @@ impl Node {
             ("POST", ["block"]) => {
                 drop(st);
                 let b = unhex(body).and_then(|raw| crate::block::Block::decode(&raw).ok()).ok_or("bad block")?;
-                self.submit_block(&b, None).map(|_| "accepted".to_string())
+                // "accepted": the main chain moved (pass it on); "side": kept off the main chain (nobody needs it yet)
+                self.submit_block(&b, None).map(|main| if main { "accepted" } else { "side" }.to_string())
             }
             ("GET", ["block", h]) => c.blocks.get(h.parse::<usize>().map_err(|_| "bad height")?).map(|b| hex(&b.encode())).ok_or("no such block"),
             ("GET", ["summary", h]) => {
@@ -176,7 +212,7 @@ impl Node {
             ("GET", ["mempool"]) => {
                 // store before mempool, the same lock order as submit_tx
                 let m = self.mempool.lock().unwrap();
-                let mut out = format!("count {}\n{}", m.len(), m.iter().map(|t| tx_line(t)).collect::<String>());
+                let mut out = format!("count {}\n{}", m.len(), m.iter().take(MEMPOOL_LIST).map(|t| tx_line(t)).collect::<String>());
                 // what each waiting cheque says so far, read from the pieces against the sender's commitments
                 let mut seen: BTreeMap<(Vec<u8>, u16), [Option<u8>; COLS]> = BTreeMap::new();
                 for t in m.iter() { if let Tx::ChequePiece { account, cheque, column, shares } = t {
@@ -225,8 +261,8 @@ impl Node {
             ("GET", ["proof", n]) => {
                 let num: u32 = n.parse().map_err(|_| "bad number")?;
                 let (id, _) = c.state.numbers.get(&num).filter(|_| is_final(c, num)).ok_or("no such number")?;   // not final: as if unknown
-                let (leaf, path) = c.state.account_proof(id).ok_or("no proof")?;
-                Ok(format!("state_root {}\nleaf {}\npath {}", hex(&c.state.root()), hex(&leaf), path.iter().map(|x| hex(x)).collect::<Vec<_>>().join(" ")))
+                let (leaf, path, root) = c.state.account_proof(id).ok_or("no proof")?;
+                Ok(format!("state_root {}\nleaf {}\npath {}", hex(&root), hex(&leaf), path.iter().map(|x| hex(x)).collect::<Vec<_>>().join(" ")))
             }
             ("POST", ["tx"]) => {
                 drop(st);
@@ -248,7 +284,7 @@ impl Node {
                     let raw = unhex(line).ok_or("bad hex")?;
                     txs.push(Tx::decode(&mut R::new(&raw))?);
                 }
-                Ok(self.check_txs(&txs).into_iter().map(|r| match r { Ok(()) => "ok".to_string(), Err(e) => e.to_string() }).collect::<Vec<_>>().join("\n"))
+                Ok(self.check_txs(&txs).into_iter().map(|r| match r { Ok(None) => "ok".to_string(), Ok(Some(row)) => format!("ok {row}"), Err(e) => e.to_string() }).collect::<Vec<_>>().join("\n"))
             }
             _ => Err("unknown route"),
         }

@@ -34,7 +34,7 @@ fn reorg_and_persist() {
 
     // feed B's branch to A: first two are side blocks (equal or less work), the third reorgs
     let mut results = Vec::new();
-    for h in 1..=b.chain.height() as usize { let blk = b.chain.blocks.get(h).unwrap(); results.push(matches!(a.submit_block(&blk, None), Ok(()))); }
+    for h in 1..=b.chain.height() as usize { let blk = b.chain.blocks.get(h).unwrap(); results.push(matches!(a.submit_block(&blk, None), Ok(_))); }
     assert_eq!(results, vec![true, true, true]);
     assert_eq!(a.store.lock().unwrap().chain.tip(), b.chain.tip());
     assert_eq!(a.height(), 3);
@@ -71,7 +71,8 @@ fn proof_and_rpc() {
     mine(&n, 1).unwrap();   // the height-2 reward credited
     // Merkle proof of the miner's account against the state root
     let st = n.store.lock().unwrap();
-    let (leaf, path) = st.chain.state.account_proof(&m.id()).unwrap();
+    let (leaf, path, root) = st.chain.state.account_proof(&m.id()).unwrap();
+    assert_eq!(root, st.chain.state.root());
     assert!(verify_account_proof(&st.chain.state.root(), &leaf, &path, 0));
     assert_eq!(st.chain.state.root(), st.chain.headers.last().unwrap().state_root);
     drop(st);
@@ -92,7 +93,9 @@ fn proof_and_rpc() {
     let pieces = m.sign(1, &Message::new(0, 1000, 2, 1));
     let body2: String = pieces.iter().map(|p| bitcheque::crypto::hex(&p.encode())).collect::<Vec<_>>().join("\n");
     let res = http(format!("POST /check HTTP/1.0\r\nContent-Length: {}\r\n\r\n{}", body2.len(), body2));
-    assert_eq!(res.lines().filter(|l| *l == "ok").count(), 18);
+    // each piece's reply names the row its cell matched: the digits of the cheque as written
+    let digits = Message::new(0, 1000, 2, 1).digits();
+    assert_eq!(res.lines().map(String::from).collect::<Vec<_>>(), digits.iter().map(|d| format!("ok {d}")).collect::<Vec<_>>());
     let mut bad = m.sign(2, &Message::new(0, 1000, 2, 1));
     if let bitcheque::tx::Tx::ChequePiece { shares, .. } = &mut bad[3] { shares[0][0] ^= 1 }
     let body3: String = bad.iter().map(|p| bitcheque::crypto::hex(&p.encode())).collect::<Vec<_>>().join("\n");
@@ -189,13 +192,13 @@ fn host_store_restore_and_reorg() {
     assert_eq!(r.chain.tip(), maker.tip());
     assert_eq!(r.chain.state.root(), maker.state.root(), "state after a restart matches a full replay");
 
-    // a heavier branch from height 150, below the snapshot
+    // a heavier branch from height 160, below the latest snapshot (200): the reorg starts from the one before (100)
     let mut alt = Chain::new(p.clone(), &g).unwrap();
-    for h in 1..=150 { alt.add(&maker.blocks.get(h).unwrap(), now()).unwrap(); }
+    for h in 1..=160 { alt.add(&maker.blocks.get(h).unwrap(), now()).unwrap(); }
     let a = Node::new(r);
     for _ in 0..110 { let b = alt.make_block(alt.headers.last().unwrap().time + 601, 1, vec![]).unwrap(); alt.add(&b, now()).unwrap(); let _ = a.submit_block(&b, None); }
     assert_eq!(a.store.lock().unwrap().chain.tip(), alt.tip(), "reorged onto the heavier branch");
-    for h in [151, 200, 251, 260] { assert_eq!(host_get(h).unwrap(), alt.blocks.get(h).unwrap().encode(), "host block {h} follows the new branch"); }
+    for h in [161, 200, 251, 260] { assert_eq!(host_get(h).unwrap(), alt.blocks.get(h).unwrap().encode(), "host block {h} follows the new branch"); }
 
     // the old snapshot (height 200 of the abandoned branch) must not be trusted with the new headers
     let new_headers: Vec<u8> = (1..=200).flat_map(|h| host_get(h).unwrap()[..112].to_vec()).collect();
