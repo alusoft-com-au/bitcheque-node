@@ -14,7 +14,8 @@ const SNAP_EVERY = 100;          // blocks between state snapshots (a cold start
 const MAX_PER_WAKE = 500;        // blocks fetched in one wake
 const HDR_CHUNK = 1000;          // headers per database row (fewer rows read on a cold start)
 const PART = 1_000_000;          // snapshot bytes per row (rows hold at most 2 MB)
-const QUIET_S = 120;             // the backup miner starts after this long without a block (two block targets)
+const QUIET_S = 50;              // the backup miner mines when no block has come for this long: with nobody else
+                                 // mining it finds one each wake, about one a minute (the block target)
 const MINE_MS = 3000;            // at most this long per wake (the floor is ~2^19 hashes: about a second here)
 const MINE_TRIES = 50_000;       // nonces per call into the wasm, between clock checks
 const POOL_MAX = 5000;           // waiting transactions kept in the database across unloads

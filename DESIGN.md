@@ -773,7 +773,7 @@ about 2^19 hashes a block: under a second for one CPU core), no slow start,
 stall relief on. The difficulty is set by the hash power present: with one
 small miner it sits at the floor, and each block can raise it up to 3× when
 more join. So the chain never stalls for want of miners, the edge nodes
-carry a backup miner: when no block has come for two minutes, one region
+carry a backup miner: when no block has come for 50 seconds, one region
 mines a block at the current target, paying a configured account. It is an
 experimental network that may change or be reset, and at this difficulty
 anyone with modest hash power can rewrite its recent history.
