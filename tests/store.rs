@@ -14,7 +14,7 @@ use bitcheque::u256::U256;
 use bitcheque::wallet::{mine_registration, Book, Domain};
 
 fn params() -> Params { Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, reg_pow_target: U256::MAX.shr(4), launch_blocks: 0, reward_maturity: 1, number_maturity: 1, ..Params::mainnet() } }
-fn miner() -> Book { Book { salt: [1; 16], n256: false, book_size: 16, domains: vec![Domain([7; 32])] } }
+fn miner() -> Book { Book { salt: [1; 16], n256: false, book_size: 256, domains: vec![Domain([7; 32])] } }
 
 #[test]
 fn reorg_and_persist() {

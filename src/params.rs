@@ -30,8 +30,7 @@ pub struct Params {
     pub batch_lifetime: u32,
     pub piece_lifetime: u32,
     pub max_batch: u32,
-    pub max_book_size: u32,
-    pub printed_book_size: u32,
+    pub book_size: u32,
     pub stall_relief: bool,   // a block more than 2 targets late may use a doubled target per 2 targets of silence (testnets)
     pub magic: [u8; 4],
 }
@@ -67,8 +66,7 @@ impl Params {
             batch_lifetime: 2_100_000,     // about four years
             piece_lifetime: 10_000,        // about a week
             max_batch: 16,                 // every registration covers at most 16 cheques and pays its own proof of work
-            max_book_size: 256,            // a book grows 16 cheques at a time, up to 256, on one account number
-            printed_book_size: 11,
+            book_size: 256,                // every book: 256 cheques on one account number, registered 16 at a time
             stall_relief: false,
             magic: [0xBC, 0x4E, 0x51, 0x00],
         }

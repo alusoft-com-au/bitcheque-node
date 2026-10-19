@@ -30,7 +30,7 @@ fn life_of_the_chain() {
 
     // miner: software book, m = 1, 16 cheques, PoW-paid. A number takes rewards only once final (number_maturity
     // blocks deep, as for a cheque's payee), so it mines to nobody until then (§12.2)
-    let miner = Book { salt: [1; 16], n256: false, book_size: 16, domains: vec![Domain([7; 32])] };
+    let miner = Book { salt: [1; 16], n256: false, book_size: 256, domains: vec![Domain([7; 32])] };
     let reg = mine_registration(miner.register(0, 16, Payment::Pow(0)), p.reg_pow_target);
     assert_eq!(net.chain.make_block(net.t + 600, 1, vec![reg.clone()]).err(), Some("coinbase payee not mature"));   // not even in its own block
     assert_eq!(net.chain.make_block(net.t + 600, 2, vec![]).err(), Some("coinbase payee unknown"));
@@ -43,13 +43,13 @@ fn life_of_the_chain() {
     net.mine(1, vec![]).unwrap();                       // height 5: the block-3 reward is credited
     assert_eq!(net.balance(&miner.id()), 50 * COIN);
 
-    // user: printed book, two domains, 11 cheques; honesty check (cheque 0, zero coins, tier 0) in the same block
-    let user = Book { salt: [2; 16], n256: false, book_size: 11, domains: vec![Domain([8; 32]), Domain([9; 32])] };
+    // user: a split book (two seeds), first 16 cheques registered; honesty check (cheque 0, zero coins, tier 0) in the same block
+    let user = Book { salt: [2; 16], n256: false, book_size: 256, domains: vec![Domain([8; 32]), Domain([9; 32])] };
     let mut txs = vec![mine_registration(user.register(0, 16, Payment::Pow(0)), p.reg_pow_target)];
     txs.extend(user.sign(0, &Message::new(0, 0, 0, 0)));
     net.mine(1, txs).unwrap();
     let u = &net.chain.state.accounts[&user.id()];
-    assert_eq!((u.number, u.nonce, u.commits.len()), (2, Some(0), 10));
+    assert_eq!((u.number, u.nonce, u.commits.len()), (2, Some(0), 15));
 
     // miner pays user 1 coin: number 2 is mature two blocks after assignment
     net.mine(1, vec![]).unwrap();
@@ -83,10 +83,13 @@ fn life_of_the_chain() {
     let u = &net.chain.state.accounts[&user.id()];
     assert!(u.open.is_none() && !u.commits.contains_key(&4) && u.nonce == Some(4));
 
-    // sweep: user empties the book to the miner with cheque 10
+    // sweep: user empties the account to the miner with cheque 10; only cheques above it stay spendable
     net.mine(1, user.sign(10, &Message::new(1, 0, 9, 1))).unwrap();
     assert_eq!(net.balance(&user.id()), 0);
-    assert!(net.chain.state.accounts[&user.id()].commits.is_empty());
+    assert_eq!(net.chain.state.accounts[&user.id()].commits.keys().copied().collect::<Vec<u16>>(), (11..16).collect::<Vec<u16>>());
+    // and a book of any size but 256 is refused
+    let small = Book { salt: [6; 16], n256: false, book_size: 12, domains: vec![Domain([6; 32])] };
+    assert_eq!(net.chain.state.clone().apply(&p, &mine_registration(small.register(0, 16, Payment::Pow(0)), p.reg_pow_target)), Err("bad book parameters"));
 }
 
 /// Block 0 of mainnet with the placeholder message and launch time must equal the Python

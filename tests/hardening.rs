@@ -201,7 +201,7 @@ fn a_full_mempool_is_mined_over_several_blocks_not_into_one_oversized_block() {
     let g = Chain::genesis(&p, now() - 100_000, b"hard");
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
     for k in 0..10u8 {
-        let b = Book { salt: [k; 16], n256: false, book_size: 11, domains: vec![Domain([k + 1; 32])] };
+        let b = Book { salt: [k; 16], n256: false, book_size: 256, domains: vec![Domain([k + 1; 32])] };
         let target = node.store.lock().unwrap().chain.state.reg_target;
         node.submit_tx(mine_registration(b.register(0, 16, Payment::Pow(0)), target), None).unwrap();
     }
@@ -225,7 +225,7 @@ fn a_number_is_published_only_once_final_and_the_lookup_code_finds_it() {
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
     let addr = node.serve_rpc("127.0.0.1:0").unwrap();
     let get = |path: &str| { let mut s = TcpStream::connect(addr).unwrap(); s.write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes()).unwrap(); let mut o = String::new(); let _ = s.read_to_string(&mut o); o };
-    let b = Book { salt: [5; 16], n256: false, book_size: 11, domains: vec![Domain([6; 32])] };
+    let b = Book { salt: [5; 16], n256: false, book_size: 256, domains: vec![Domain([6; 32])] };
     let id = bitcheque::crypto::hex(&b.id());
     let target = node.store.lock().unwrap().chain.state.reg_target;
     node.submit_tx(mine_registration(b.register(0, 16, Payment::Pow(0)), target), None).unwrap();
@@ -265,7 +265,7 @@ fn a_cheque_to_yourself_shows_as_both_receive_and_send() {
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
     let addr = node.serve_rpc("127.0.0.1:0").unwrap();
     let get = |path: &str| { let mut s = TcpStream::connect(addr).unwrap(); s.write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes()).unwrap(); let mut o = String::new(); let _ = s.read_to_string(&mut o); o };
-    let b = Book { salt: [7; 16], n256: false, book_size: 12, domains: vec![Domain([8; 32])] };
+    let b = Book { salt: [7; 16], n256: false, book_size: 256, domains: vec![Domain([8; 32])] };
     let target = node.store.lock().unwrap().chain.state.reg_target;
     node.submit_tx(mine_registration(b.register(0, 16, Payment::Pow(0)), target), None).unwrap();
     mine(&node, 0).unwrap();                                // the registration's block: number 1 is not final yet
@@ -288,7 +288,7 @@ fn a_batch_of_transactions_lands_in_one_block() {
     let p = Params { reg_pow_target: bitcheque::u256::U256::MAX.shr(4), ..params() };
     let g = Chain::genesis(&p, now() - 100_000, b"hard");
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
-    let b = Book { salt: [9; 16], n256: false, book_size: 16, domains: vec![Domain([10; 32])] };
+    let b = Book { salt: [9; 16], n256: false, book_size: 256, domains: vec![Domain([10; 32])] };
     let target = node.store.lock().unwrap().chain.state.reg_target;
     let mut txs = vec![mine_registration(b.register(0, 16, Payment::Pow(0)), target)];
     txs.extend(b.sign(0, &Message::new(0, 0, 0, 0)));

@@ -11,9 +11,9 @@ fn main() {
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
     println!("rpc on {}", node.serve_rpc("127.0.0.1:8732").expect("port 8732 busy"));
     let mine = |n: u32| loop { let mut b = node.template(n).expect("template"); b.header.mine(); if node.submit_block(&b, None).is_ok() { println!("block {}", node.height()); break; } };
-    let miner = Book { salt: [1; 16], n256: false, book_size: 64, domains: vec![Domain([7; 32])] };
-    let saver = Book { salt: [2; 16], n256: false, book_size: 11, domains: vec![Domain([8; 32])] };   // one seed
-    let shop = Book { salt: [3; 16], n256: false, book_size: 11, domains: vec![Domain([10; 32])] };  // one seed
+    let miner = Book { salt: [1; 16], n256: false, book_size: 256, domains: vec![Domain([7; 32])] };
+    let saver = Book { salt: [2; 16], n256: false, book_size: 256, domains: vec![Domain([8; 32])] };   // one seed
+    let shop = Book { salt: [3; 16], n256: false, book_size: 256, domains: vec![Domain([10; 32])] };  // one seed
     let submit = |txs: Vec<bitcheque::tx::Tx>| for t in txs { node.submit_tx(t, None).unwrap(); };
 
     submit(miner.registrations(0, 63).into_iter().map(|t| mine_registration(t, p.reg_pow_target)).collect());   // 64 cheques, 16 per batch

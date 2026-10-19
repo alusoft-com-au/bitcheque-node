@@ -192,8 +192,7 @@ impl State {
             Tx::Coinbase { .. } => Err("coinbase out of place"),
             Tx::RegisterBook { salt, m, n256, book_size, root, batch, pay } => {
                 let (m, n) = (*m as usize, if *n256 { 32 } else { 16 });
-                if m == 0 || m > 7 || root.len() != n || *book_size == 0 || *book_size > p.max_book_size { return Err("bad book parameters"); }
-                if book_size.max(&1) <= &p.printed_book_size && *book_size != p.printed_book_size && m > 1 && batch.count < *book_size { return Err("printed books are 11 cheques"); }
+                if m == 0 || m > 7 || root.len() != n || *book_size != p.book_size { return Err("bad book parameters"); }
                 let id = account_id(m as u8, *n256, root);
                 if self.accounts.contains_key(&id) { return Err("account exists"); }
                 let cheques = Self::check_batch(salt, m, n, *book_size, root, batch, p)?;

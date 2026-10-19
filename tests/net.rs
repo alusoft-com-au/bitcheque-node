@@ -19,7 +19,7 @@ fn sync_and_relay() {
     let g = Chain::genesis(&p, bitcheque::net::now() - 100_000, b"net test");
     let a = Node::new(Store::open(p.clone(), &g, None).unwrap());
     let b = Node::new(Store::open(p.clone(), &g, None).unwrap());
-    let miner = Book { salt: [1; 16], n256: false, book_size: 16, domains: vec![Domain([7; 32])] };
+    let miner = Book { salt: [1; 16], n256: false, book_size: 256, domains: vec![Domain([7; 32])] };
     a.submit_tx(mine_registration(miner.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
     for _ in 0..3 { mine(&a, 0).unwrap(); }   // number 1 is not final for 100 blocks: mine to nobody
     assert_eq!(a.height(), 3);
@@ -29,7 +29,7 @@ fn sync_and_relay() {
     wait(|| b.height() == 3);
     assert_eq!(b.store.lock().unwrap().chain.tip(), a.store.lock().unwrap().chain.tip());
 
-    let user = Book { salt: [2; 16], n256: false, book_size: 11, domains: vec![Domain([8; 32]), Domain([9; 32])] };
+    let user = Book { salt: [2; 16], n256: false, book_size: 256, domains: vec![Domain([8; 32]), Domain([9; 32])] };
     b.submit_tx(mine_registration(user.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
     wait(|| a.mempool.lock().unwrap().len() == 1);
     mine(&a, 0).unwrap();
@@ -48,8 +48,8 @@ fn queued_cheque_does_not_block_the_next() {
                      piece_lifetime: 3, reward_base: 50 * COIN, ..Params::mainnet() };
     let g = Chain::genesis(&p, bitcheque::net::now() - 100_000, b"queue test");
     let a = Node::new(Store::open(p.clone(), &g, None).unwrap());
-    let miner = Book { salt: [1; 16], n256: false, book_size: 16, domains: vec![Domain([7; 32])] };
-    let user = Book { salt: [2; 16], n256: false, book_size: 11, domains: vec![Domain([8; 32])] };
+    let miner = Book { salt: [1; 16], n256: false, book_size: 256, domains: vec![Domain([7; 32])] };
+    let user = Book { salt: [2; 16], n256: false, book_size: 256, domains: vec![Domain([8; 32])] };
     a.submit_tx(mine_registration(miner.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
     a.submit_tx(mine_registration(user.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
     // miner is number 1, user number 2 (height 1); both are final at height 3, when the miner's rewards start,
@@ -113,7 +113,7 @@ fn a_follower_pulls_blocks_and_pushes_what_it_accepts() {
     assert_eq!(b.store.lock().unwrap().chain.tip(), a.store.lock().unwrap().chain.tip());
 
     // a registration sent to the follower reaches the upstream; a block mined on the follower does too
-    let user = Book { salt: [3; 16], n256: false, book_size: 16, domains: vec![Domain([4; 32])] };
+    let user = Book { salt: [3; 16], n256: false, book_size: 256, domains: vec![Domain([4; 32])] };
     b.submit_tx(mine_registration(user.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
     wait(|| a.mempool.lock().unwrap().len() == 1);
     mine(&b, 0).unwrap();

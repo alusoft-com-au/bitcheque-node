@@ -14,9 +14,9 @@ A Bitcoin-derived chain with six hard requirements:
 5. **One account type.** Every account is a cheque book (§10). There is no
    device-signed account. Software may drive a cheque book (§5), but the
    signature format is always the cheque.
-6. **Store of value, not everyday transfers.** A printed book moves coins at
-   most ten times. Throughput and convenience are not goals; exchanges and
-   miners use software-driven books (§5).
+6. **Store of value, not everyday transfers.** Every move is a cheque copied
+   by hand, at most 255 per book. Throughput and convenience are not goals;
+   exchanges and miners use software-driven books (§5).
 
 Proof of work (SHA-256d), the header chain, the transaction Merkle tree, the
 mempool and P2P gossip are borrowed from Bitcoin. Block timing, difficulty
@@ -73,7 +73,7 @@ Account {
   number       u32                   chain-assigned, sequential (§10.4)
   balance      u64
   nonce        u16 or none           highest cheque number consumed
-  book_size    u32                   new books: 256, registered 16 at a time (cheque 0 never printed); older books 11 or 12; ≤ 256
+  book_size    u32                   always 256, registered 16 at a time (cheque 0 never printed)
   salt         16 B                  book salt (§3.1)
   funded       bool                  has ever received coins; an unfunded PoW account expires (§2.2)
   batches      map                   registered cheque ranges and their expiry
@@ -318,8 +318,9 @@ every 10 s when the mempool has changed.
   security levels. Hash-based security needs 128-bit secrets, and a human
   cannot evaluate a cryptographic function fast enough. So the secrets are
   *created* for you and *written down* (printed), and the thing you hold is
-  the printed book: 11 cheques, each a word page and a QR page in each of
-  the two parts, plus a cutting template per part (§10.10).
+  the printed book: the cheques printed so far (up to 255), each a word page
+  and a QR page in each of the two parts, plus a cutting template per part
+  (§10.10).
 - **Trust.** A standard book trusts one offline computer once, at printing;
   after that, signing needs no trusted device. The split-key book (§10.6)
   removes the single printing computer: two or more devices each see only
@@ -640,8 +641,8 @@ advance. Consensus does not implement it.
   the same seed. Cheques are registered 16 at a time: `RegisterBook` carries
   the batch holding cheque 0 (≈ 58 KB at m = 1), each later `RegisterBatch`
   the next 16, each with its own proof of work. No cheque is kept back for a
-  sweep: any cheque with amount 0000, exponent 9 sweeps (§10.11). Books
-  registered before this change have 11 or 12 cheques and keep working.
+  sweep: any cheque with amount 0000, exponent 9 sweeps (§10.11). A book of
+  any other size is refused.
 - **Printing more.** On a clean, offline computer, the seed and a cheque
   range (say 16–31) give the two print files and a public registration file
   holding that range's batches; it is registered like the first one. The
@@ -782,7 +783,7 @@ is unspendable, as in Bitcoin.
 | Unfunded PoW account | deleted after 43,200 blocks (~30 days); number quarantined 525,600 blocks (~a year) | §2.2 |
 | Batch lifetime | 2,100,000 blocks (~4 years); `Renew` costs 10,000 base units, `RegisterBatch` the registration proof of work | §10.11 |
 | Piece lifetime | 10,000 blocks (~a week) | §10.12 |
-| Book size | ≤ 256 cheques; batches ≤ 16, aligned powers of two, each paid by proof of work | §2.2, §10.10; a 16-cheque batch (≈ 58 KB) fits any block; `printed_book_size` is still 11 and only refuses a split book (m > 1) of fewer than 11 cheques registered in part |
+| Book size | exactly 256 cheques; batches ≤ 16, aligned powers of two, each paid by proof of work | §2.2, §10.10; a 16-cheque batch (≈ 58 KB) fits any block |
 | `FEE_UNIT` | 1,000 base units (0.00001 coin) initially | adjustment rule: §8 item 3 |
 | Account number 0 | reserved: nobody; coins and fee of a cheque to it go to the block's miner | §2.2 |
 | Account maturity | 100 blocks before a number can receive a cheque | §10.4 |
