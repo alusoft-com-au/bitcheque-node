@@ -15,5 +15,5 @@
   // NET 0 = the public research network. UPSTREAMS: comma-separated node RPC URLs to pull blocks from.
   // MINE_REGIONS: regions that mine when the chain is quiet, first choice first (empty: no backup miner);
   // MINER_TO: the account they pay
-  "vars": { "NET": "0", "UPSTREAMS": "", "MINE_REGIONS": "ap,us,eu", "MINER_TO": "1" }
+  "vars": { "NET": "0", "UPSTREAMS": "", "MINE_REGIONS": "ap,us,eu", "MINER_TO": "2" }
 }
