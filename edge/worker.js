@@ -189,6 +189,7 @@ export default {
     if (url.pathname === '/peers') return text(String(Object.keys(REGIONS).length - 1 + (env.UPSTREAMS || '').split(',').filter(s => s.trim()).length));
     const stub = env.NODE.get(env.NODE.idFromName(region), { locationHint: REGIONS[region] });
     const inner = new URL(url.pathname + `?region=${region}`, 'https://edge');
+    if (req.method === 'HEAD') { const r = await stub.fetch(inner); return new Response(null, r); }   // headers only
     if (req.method !== 'GET') return stub.fetch(inner, { method: req.method, body: await req.text() });
     if (NOT_CACHED.has(url.pathname.split('/')[1])) return stub.fetch(inner);
     const cache = caches.default, key = new Request(url.origin + url.pathname);
