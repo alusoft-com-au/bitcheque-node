@@ -3,7 +3,8 @@
 // and send mined blocks to POST /block; transactions arrive at POST /tx. Whatever one region accepts it
 // passes straight to the others (and to any upstream nodes); each also wakes every minute and pulls what
 // it missed (GET /height, GET /block/<n>). Blocks live in its SQLite database. Cost: it sleeps between
-// wakes (no duration billed).
+// wakes (no duration billed). One region (MINE_REGION) is also a backup miner: when no block has come for
+// QUIET_S, it mines for up to MINE_MS at the current target, paying account MINER_TO (0 = nobody).
 import { DurableObject } from 'cloudflare:workers';
 import WASM from './bitcheque_edge.wasm';
 
@@ -13,6 +14,10 @@ const SNAP_EVERY = 100;          // blocks between state snapshots (a cold start
 const MAX_PER_WAKE = 500;        // blocks fetched in one wake
 const HDR_CHUNK = 1000;          // headers per database row (fewer rows read on a cold start)
 const PART = 1_000_000;          // snapshot bytes per row (rows hold at most 2 MB)
+const QUIET_S = 120;             // the backup miner starts after this long without a block (two block targets)
+const MINE_MS = 3000;            // at most this long per wake (the floor is ~2^19 hashes: about a second here)
+const MINE_TRIES = 50_000;       // nonces per call into the wasm, between clock checks
+const NOT_CACHED = new Set(['tip', 'template']);   // miners need these fresh
 const CACHE_S = 15;              // seconds the front worker caches a GET reply (status pages poll every 10 s)
 // the RPC's first path segments: anything else is refused here, without waking a Durable Object
 const ROUTES = new Set(['height', 'peers', 'addrs', 'tip', 'block', 'summary', 'account', 'id', 'lookup', 'proof', 'regtarget', 'history', 'stats', 'mempool', 'top', 'template', 'tx', 'check', 'edge']);
@@ -120,8 +125,27 @@ export class EdgeNode extends DurableObject {
     this.meta('last_sync', JSON.stringify({ at: new Date().toISOString(), height: x.height(), fetched, log }));
     return fetched;
   }
+  // ---- the backup miner: so the chain never stalls for want of miners. Only MINE_REGION, only after QUIET_S
+  // without a block; real miners keep the tip fresh, so it stays idle while anyone else is mining ----
+  backup() {
+    const x = this.x;
+    if (!this.env.MINE_REGION || this.meta('region') !== this.env.MINE_REGION) return;
+    this.now(); if (x.quiet() < QUIET_S) return;
+    let payee = +(this.env.MINER_TO || 0), start = (Math.random() * 2 ** 32) >>> 0;
+    const end = Date.now() + MINE_MS, note = o => this.meta('last_mined', JSON.stringify({ at: new Date().toISOString(), height: x.height(), payee, ...o }));
+    while (Date.now() < end) {
+      this.now();
+      const r = x.mine(payee, start, MINE_TRIES); start = (start + MINE_TRIES) >>> 0;
+      if (r === 1) { const body = this.out(x.io_len()); note({ found: true });
+        this.ctx.waitUntil(Promise.allSettled(this.upstreams().map(up => this.call(up, '/block', { method: 'POST', body })))); return; }
+      if (r === 2) { const why = this.out(x.io_len());
+        if (payee && /payee/.test(why)) { payee = 0; continue; }   // the account does not exist yet: mine to nobody
+        note({ error: why }); return; }
+    }
+    note({ found: false });
+  }
   // every minute; straight away again while catching up
-  async alarm() { let n = 0; try { n = await this.sync(); } finally { await this.ctx.storage.setAlarm(Date.now() + (n >= MAX_PER_WAKE ? 1000 : SYNC_MS)); } }
+  async alarm() { let n = 0; try { n = await this.sync(); if (n < MAX_PER_WAKE) this.backup(); } finally { await this.ctx.storage.setAlarm(Date.now() + (n >= MAX_PER_WAKE ? 1000 : SYNC_MS)); } }
 
   async fetch(req) {
     const url = new URL(req.url);
@@ -129,7 +153,7 @@ export class EdgeNode extends DurableObject {
     if (region && region !== this.region) { this.region = region; if (this.meta('region') !== region) this.meta('region', region); }
     if (!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now() + 1000);
     await this.node();
-    if (url.pathname === '/edge') return text(`region ${this.meta('region')}\nheight ${this.x.height()}\nupstreams ${this.upstreams().join(' ')}\nlast_sync ${this.meta('last_sync') ?? 'never'}\n`);
+    if (url.pathname === '/edge') return text(`region ${this.meta('region')}\nheight ${this.x.height()}\nupstreams ${this.upstreams().join(' ')}\nlast_sync ${this.meta('last_sync') ?? 'never'}\nlast_mined ${this.meta('last_mined') ?? 'never'}\n`);
     const body = req.method === 'POST' ? await req.text() : '';
     const [code, reply] = this.rpc(req.method, url.pathname, body);
     // a new transaction or a newly mined block goes on to the other regions and upstream nodes at once
@@ -154,6 +178,7 @@ export default {
     const stub = env.NODE.get(env.NODE.idFromName(region), { locationHint: REGIONS[region] });
     const inner = new URL(url.pathname + `?region=${region}`, 'https://edge');
     if (req.method !== 'GET') return stub.fetch(inner, { method: req.method, body: await req.text() });
+    if (NOT_CACHED.has(url.pathname.split('/')[1])) return stub.fetch(inner);
     const cache = caches.default, key = new Request(url.origin + url.pathname);
     const hit = await cache.match(key);
     if (hit) return hit;

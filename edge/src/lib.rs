@@ -1,5 +1,6 @@
 //! Edge node: the node's own Store, mempool and RPC routes, compiled to WebAssembly and driven by a
-//! Cloudflare Durable Object (edge/worker.js). It has no sockets and no miner: the host fetches
+//! Cloudflare Durable Object (edge/worker.js). It has no sockets and mines only as a backup (`mine`,
+//! when the chain has gone quiet and the host is configured to): the host fetches
 //! blocks from other nodes' RPC and feeds them in, stores what was accepted, and answers RPC
 //! requests through the same `route` the node serves. Inputs go in through `io`, as in wallet-wasm.
 //! Blocks live with the host (`host_get`/`host_put`, by height) and state snapshots go to `host_snap`,
@@ -85,4 +86,28 @@ pub extern "C" fn rpc() -> usize {
     let (line, body) = req.split_once('\n').unwrap_or((&req, ""));
     let (method, path) = line.split_once(' ').unwrap_or((line, "/"));
     match node().route(method, path, body) { Ok(t) => out(&format!("200\n{t}")), Err(e) => out(&format!("400\n{e}")) }
+}
+
+/// Seconds since the tip block's timestamp: how long the chain has been quiet.
+#[no_mangle]
+pub extern "C" fn quiet() -> u32 {
+    let t = node().store.lock().unwrap().chain.headers.last().map_or(0, |h| h.time);
+    bitcheque::net::now().saturating_sub(t)
+}
+
+/// The backup miner, for when nobody else is mining: build a template paying `payee` and try nonces
+/// `start .. start + tries`. Each call takes a fresh template (the tip or the time may have moved), and every
+/// try is an independent chance, so the host just moves `start` on. 1 = a block was found and accepted, with
+/// its hex in io for the host to pass on; 0 = none in this range; 2 = no template (reason in io).
+#[no_mangle]
+pub extern "C" fn mine(payee: u32, start: u32, tries: u32) -> u32 {
+    let n = node();
+    let mut b = match n.template(payee) { Ok(b) => b, Err(e) => { out(e); return 2 } };
+    for k in 0..tries {
+        b.header.nonce = start.wrapping_add(k);
+        if b.header.meets_target() {
+            return match n.submit_block(&b, None) { Ok(()) => { out(&bitcheque::crypto::hex(&b.encode())); 1 } Err(e) => { out(e); 2 } };
+        }
+    }
+    0
 }

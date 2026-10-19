@@ -12,6 +12,7 @@
     { "pattern": "node-us.bitcheque.org", "custom_domain": true },
     { "pattern": "node-eu.bitcheque.org", "custom_domain": true }
   ],
-  // NET 0 = the public research network. UPSTREAMS: comma-separated node RPC URLs to pull blocks from
-  "vars": { "NET": "0", "UPSTREAMS": "" }
+  // NET 0 = the public research network. UPSTREAMS: comma-separated node RPC URLs to pull blocks from.
+  // MINE_REGION: the region that mines when the chain is quiet (empty: no backup miner); MINER_TO: the account it pays
+  "vars": { "NET": "0", "UPSTREAMS": "", "MINE_REGION": "ap", "MINER_TO": "1" }
 }

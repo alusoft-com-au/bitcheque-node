@@ -768,9 +768,15 @@ is unspendable, as in Bitcoin.
 | Network magic | `0xBC 0x4E 0x51 0x00` mainnet, `…0x01` research network, `…0x02` local | non-consensus |
 
 The public research network uses the mainnet parameters except: initial
-target ≈ 2^240 (`0x1F00FFFF`), easiest later target `0x1D5E3FA0` (about a
-minute per block for one CPU core), no slow start, stall relief on. It is
-an experimental network that may change or be reset.
+target ≈ 2^240 (`0x1F00FFFF`), easiest later target 2^237 (`0x1E200000`,
+about 2^19 hashes a block: under a second for one CPU core), no slow start,
+stall relief on. The difficulty is set by the hash power present: with one
+small miner it sits at the floor, and each block can raise it up to 3× when
+more join. So the chain never stalls for want of miners, the edge nodes
+carry a backup miner: when no block has come for two minutes, one region
+mines a block at the current target, paying a configured account. It is an
+experimental network that may change or be reset, and at this difficulty
+anyone with modest hash power can rewrite its recent history.
 
 ### 12.2 Bootstrap rules
 

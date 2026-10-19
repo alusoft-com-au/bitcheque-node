@@ -70,9 +70,10 @@ impl Params {
     }
     pub fn testnet() -> Params {
         // no slow start and stall relief: a public test network should hand out coins at once and never get stranded
-        // from block 1 the easiest target is about one minute per block for one CPU core (measured: 0x1D07F421 took
-        // 711 s a block on the seed machine, so this target is 11.85 times easier)
-        Params { initial_bits: 0x1F00_FFFF, min_bits: 0x1D5E_3FA0, slow_start_blocks: 1, stall_relief: true, magic: [0xBC, 0x4E, 0x51, 0x01], ..Params::mainnet() }
+        // the easiest target is about 2^19 hashes a block: under a second for any computer, and about a second for
+        // the edge node's backup miner (WebAssembly, ~0.8 MH/s), which mines only when nobody else has for two
+        // minutes. Real miners joining raise it within a few blocks (LWMA, up to 3x per block).
+        Params { initial_bits: 0x1F00_FFFF, min_bits: 0x1E20_0000, slow_start_blocks: 1, stall_relief: true, magic: [0xBC, 0x4E, 0x51, 0x01], ..Params::mainnet() }
     }
     /// Private network for running several nodes on one machine: 1-minute blocks, short maturities, easy work.
     pub fn local() -> Params {
