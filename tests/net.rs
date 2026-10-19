@@ -21,7 +21,7 @@ fn sync_and_relay() {
     let b = Node::new(Store::open(p.clone(), &g, None).unwrap());
     let miner = Book { salt: [1; 16], n256: false, book_size: 16, domains: vec![Domain([7; 32])] };
     a.submit_tx(mine_registration(miner.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
-    for _ in 0..3 { mine(&a, 1).unwrap(); }
+    for _ in 0..3 { mine(&a, 0).unwrap(); }   // number 1 is not final for 100 blocks: mine to nobody
     assert_eq!(a.height(), 3);
 
     let addr = a.listen("127.0.0.1:0").unwrap();
@@ -32,7 +32,7 @@ fn sync_and_relay() {
     let user = Book { salt: [2; 16], n256: false, book_size: 11, domains: vec![Domain([8; 32]), Domain([9; 32])] };
     b.submit_tx(mine_registration(user.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
     wait(|| a.mempool.lock().unwrap().len() == 1);
-    mine(&a, 1).unwrap();
+    mine(&a, 0).unwrap();
     wait(|| b.height() == 4);
     assert!(b.store.lock().unwrap().chain.state.accounts.contains_key(&user.id()));
     assert!(b.mempool.lock().unwrap().is_empty());
@@ -52,7 +52,9 @@ fn queued_cheque_does_not_block_the_next() {
     let user = Book { salt: [2; 16], n256: false, book_size: 11, domains: vec![Domain([8; 32])] };
     a.submit_tx(mine_registration(miner.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
     a.submit_tx(mine_registration(user.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
-    for _ in 0..4 { mine(&a, 1).unwrap(); } // miner is number 1, user number 2; rewards matured, numbers mature
+    // miner is number 1, user number 2 (height 1); both are final at height 3, when the miner's rewards start,
+    // and the height-3 reward is credited at height 5
+    for k in 0..5 { mine(&a, if k < 2 { 0 } else { 1 }).unwrap(); }
     let balance = |b: &Book| a.store.lock().unwrap().chain.state.accounts[&b.id()].balance;
     assert!(balance(&miner) >= 50 * COIN);
 

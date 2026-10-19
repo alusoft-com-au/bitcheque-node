@@ -127,7 +127,7 @@ impl Node {
             }
             ("GET", ["account", n]) => {
                 let num: u32 = n.parse().map_err(|_| "bad number")?;
-                let (id, _) = c.state.numbers.get(&num).ok_or("no such number")?;
+                let (id, _) = c.state.numbers.get(&num).filter(|_| is_final(c, num)).ok_or("no such number")?;   // not final: as if unknown
                 Ok(account_text(c, id))
             }
             ("GET", ["id", h]) => {
@@ -153,8 +153,9 @@ impl Node {
             }
             ("GET", ["history", n]) => {
                 let num: u32 = n.parse().map_err(|_| "bad number")?;
-                let (id, _) = c.state.numbers.get(&num).ok_or("no such number")?;
-                let number_of = |id: &[u8]| c.state.accounts.get(id).map_or_else(|| hex(id), |a| a.number.to_string());
+                let (id, _) = c.state.numbers.get(&num).filter(|_| is_final(c, num)).ok_or("no such number")?;   // not final: as if unknown
+                // a sender whose number is not final yet shows as its account id
+                let number_of = |id: &[u8]| c.state.accounts.get(id).filter(|a| is_final(c, a.number)).map_or_else(|| hex(id), |a| a.number.to_string());
                 let own = c.state.accounts.get(id).map(|a| a.number);
                 let lines: Vec<String> = c.history.get(id).map(|h| h.iter().rev().flat_map(|e| match &e.event {
                     Event::Register { number, .. } => vec![format!("{} register number={number}", e.height)],
@@ -217,7 +218,7 @@ impl Node {
             ("GET", ["regtarget"]) => Ok(c.state.reg_target.0.iter().map(|l| format!("{l:016x}")).collect::<Vec<_>>().join(" ")),
             ("GET", ["proof", n]) => {
                 let num: u32 = n.parse().map_err(|_| "bad number")?;
-                let (id, _) = c.state.numbers.get(&num).ok_or("no such number")?;
+                let (id, _) = c.state.numbers.get(&num).filter(|_| is_final(c, num)).ok_or("no such number")?;   // not final: as if unknown
                 let (leaf, path) = c.state.account_proof(id).ok_or("no proof")?;
                 Ok(format!("state_root {}\nleaf {}\npath {}", hex(&c.state.root()), hex(&leaf), path.iter().map(|x| hex(x)).collect::<Vec<_>>().join(" ")))
             }

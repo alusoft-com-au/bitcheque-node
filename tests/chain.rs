@@ -28,13 +28,19 @@ fn life_of_the_chain() {
     let g = Chain::genesis(&p, 1000, b"test");
     let mut net = Net { chain: Chain::new(p.clone(), &g).unwrap(), t: 1000 };
 
-    // miner: software book, m = 1, 16 cheques, PoW-paid, paid by its own block's coinbase (§12.2)
+    // miner: software book, m = 1, 16 cheques, PoW-paid. A number takes rewards only once final (number_maturity
+    // blocks deep, as for a cheque's payee), so it mines to nobody until then (§12.2)
     let miner = Book { salt: [1; 16], n256: false, book_size: 16, domains: vec![Domain([7; 32])] };
     let reg = mine_registration(miner.register(0, 16, Payment::Pow(0)), p.reg_pow_target);
-    assert!(net.mine(1, vec![reg]).is_ok());
+    assert_eq!(net.chain.make_block(net.t + 600, 1, vec![reg.clone()]).err(), Some("coinbase payee not mature"));   // not even in its own block
+    assert_eq!(net.chain.make_block(net.t + 600, 2, vec![]).err(), Some("coinbase payee unknown"));
+    assert!(net.mine(0, vec![reg]).is_ok());           // height 1: number 1 assigned
     assert_eq!(net.chain.state.accounts[&miner.id()].number, 1);
+    assert_eq!(net.chain.make_block(net.t + 600, 1, vec![]).err(), Some("coinbase payee not mature"));
+    net.mine(0, vec![]).unwrap();                       // height 2
+    net.mine(1, vec![]).unwrap();                       // height 3: number 1 is final, its first reward
     net.mine(1, vec![]).unwrap();
-    net.mine(1, vec![]).unwrap(); // height 3: block-1 reward credited
+    net.mine(1, vec![]).unwrap();                       // height 5: the block-3 reward is credited
     assert_eq!(net.balance(&miner.id()), 50 * COIN);
 
     // user: printed book, two domains, 11 cheques; honesty check (cheque 0, zero coins, tier 0) in the same block
@@ -174,7 +180,7 @@ fn a_book_grows_a_batch_at_a_time() {
     assert_eq!(first.len(), 1);
     let mut txs = vec![mine_registration(first[0].clone(), p.reg_pow_target)];
     txs.extend(book.sign(0, &Message::new(0, 0, 0, 0)));
-    net.mine(1, txs).unwrap();
+    net.mine(0, txs).unwrap();
     let number = net.chain.state.accounts[&book.id()].number;
     assert_eq!(net.chain.state.accounts[&book.id()].commits.len(), 15);
 
@@ -184,7 +190,7 @@ fn a_book_grows_a_batch_at_a_time() {
     let mut unpaid = more[0].clone();
     while U256::from_le_bytes(&unpaid.txid()) < p.reg_pow_target { if let Tx::RegisterBatch { pay: Payment::Pow(n), .. } = &mut unpaid { *n += 1 } }
     assert_eq!(net.chain.state.clone().apply(&p, &unpaid), Err("registration pow insufficient"));
-    net.mine(1, more.iter().map(|t| mine_registration(t.clone(), p.reg_pow_target)).collect()).unwrap();
+    net.mine(0, more.iter().map(|t| mine_registration(t.clone(), p.reg_pow_target)).collect()).unwrap();
     let a = &net.chain.state.accounts[&book.id()];
     assert_eq!((a.number, a.commits.len()), (number, 15 + 32));
 
@@ -195,7 +201,7 @@ fn a_book_grows_a_batch_at_a_time() {
     assert_eq!(net.chain.state.clone().apply(&p, &mine_registration(big, p.reg_pow_target)), Err("batch not aligned"));
 
     // a cheque from a later batch spends like any other, and the last batch ends at cheque 255
-    net.mine(1, book.sign(40, &Message::new(0, 0, 0, 0))).unwrap();
+    net.mine(0, book.sign(40, &Message::new(0, 0, 0, 0))).unwrap();
     assert_eq!(net.chain.state.accounts[&book.id()].nonce, Some(40));
     let last = book.registrations(240, 300);
     assert_eq!(last.len(), 1);

@@ -308,11 +308,14 @@ impl State {
         }
     }
 
-    /// Coinbase (§12.2): payee must exist by the end of the block or be 0 (burn).
+    /// Coinbase (§12.2): payee must be 0 (burn) or a final number, number_maturity blocks deep, the same rule as a
+    /// cheque's payee. Until then a reorg may give the number to another account, so a miner paying itself must mine to
+    /// 0 (or another final number) for its first number_maturity blocks.
     pub fn apply_coinbase(&mut self, p: &Params, height: u32, payee: u32, fees: u64) -> Res<()> {
         let reward = p.block_reward(height) + fees;
         if payee == 0 { return Ok(()); }
-        if !self.numbers.contains_key(&payee) { return Err("coinbase payee unknown"); }
+        let &(_, assigned) = self.numbers.get(&payee).ok_or("coinbase payee unknown")?;
+        if assigned + p.number_maturity > height { return Err("coinbase payee not mature"); }
         self.pending.entry(height + p.reward_maturity).or_default().push((payee, reward));
         self.log.push(Event::Reward { number: payee, amount: reward });
         Ok(())

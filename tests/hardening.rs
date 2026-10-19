@@ -235,7 +235,16 @@ fn a_number_is_published_only_once_final_and_the_lookup_code_finds_it() {
     assert!(young.contains(&format!("id {id}")) && young.contains("mature false"), "{young}");
     assert!(!young.contains("\nnumber "), "a young number is not shown: {young}");
     assert!(!get("/summary/1").contains("number="), "nor in the block");
+    // asking for it by number gives exactly what an unknown number gives, so new numbers cannot be probed for
+    for path in ["/account/1", "/history/1", "/proof/1"] {
+        assert_eq!(get(path).split("\r\n\r\n").nth(1), get(&path.replace('1', "77")).split("\r\n\r\n").nth(1), "{path}");
+        assert!(get(path).contains("no such number"), "{path}");
+    }
+    // and a block cannot pay it yet
+    assert_eq!(node.template(1).err(), Some("coinbase payee not mature"));
     for _ in 0..3 { mine(&node, 0).unwrap(); }
+    assert!(get("/account/1").contains(&format!("id {id}")) && get("/history/1").contains("register number=1"), "final: open to all");
+    assert!(node.template(1).is_ok(), "and it can take a block reward");
     let fin = get(&format!("/lookup/{}", code.to_uppercase()));
     assert!(fin.contains("\nnumber 1\n") && fin.contains("mature true"), "{fin}");
     assert!(get("/summary/1").contains("number=1"), "final: shown in the block too");
@@ -255,6 +264,7 @@ fn a_cheque_to_yourself_shows_as_both_receive_and_send() {
     let b = Book { salt: [7; 16], n256: false, book_size: 12, domains: vec![Domain([8; 32])] };
     let target = node.store.lock().unwrap().chain.state.reg_target;
     node.submit_tx(mine_registration(b.register(0, 16, Payment::Pow(0)), target), None).unwrap();
+    mine(&node, 0).unwrap();                                // the registration's block: number 1 is not final yet
     for _ in 0..4 { mine(&node, 1).unwrap(); }              // account 1 mines its own rewards
     for t in b.sign(1, &Message::new(1, 1000, 5, 1)) { node.submit_tx(t, None).unwrap(); }   // 1 coin to itself
     mine(&node, 1).unwrap();

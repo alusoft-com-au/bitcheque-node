@@ -26,7 +26,7 @@ fn reorg_and_persist() {
     // branch A: 2 blocks with a registration; branch B: 3 blocks, no txs
     let a = Node::new(Store::open(p.clone(), &g, Some(&path)).unwrap());
     a.submit_tx(mine_registration(miner().register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
-    mine(&a, 1).unwrap();
+    mine(&a, 0).unwrap();   // number 1 is final from the next block (number_maturity 1)
     mine(&a, 1).unwrap();
     let mut b = Store::open(p.clone(), &g, None).unwrap();
     let mut bc = Chain::new(p.clone(), &g).unwrap();
@@ -66,8 +66,9 @@ fn proof_and_rpc() {
     let n = Node::new(Store::open(p.clone(), &g, None).unwrap());
     let m = miner();
     n.submit_tx(mine_registration(m.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
+    mine(&n, 0).unwrap();   // number 1 assigned; final from the next block
     mine(&n, 1).unwrap();
-    mine(&n, 1).unwrap(); // reward credited
+    mine(&n, 1).unwrap();   // the height-2 reward credited
     // Merkle proof of the miner's account against the state root
     let st = n.store.lock().unwrap();
     let (leaf, path) = st.chain.state.account_proof(&m.id()).unwrap();
@@ -77,7 +78,7 @@ fn proof_and_rpc() {
 
     let addr = n.serve_rpc("127.0.0.1:0").unwrap();
     let http = |req: String| { let mut s = TcpStream::connect(addr).unwrap(); s.write_all(req.as_bytes()).unwrap(); let mut r = String::new(); s.read_to_string(&mut r).unwrap(); r.split("\r\n\r\n").nth(1).unwrap().to_string() };
-    assert_eq!(http("GET /height HTTP/1.0\r\n\r\n".into()), "2");
+    assert_eq!(http("GET /height HTTP/1.0\r\n\r\n".into()), "3");
     assert!(http("GET /account/1 HTTP/1.0\r\n\r\n".into()).contains(&format!("balance {}", p.reward_base)));
     let tx = m.sign(0, &Message::new(0, 1000, 2, 1)); // cheque to number 0
     let body = bitcheque::crypto::hex(&tx[0].encode());

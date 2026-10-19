@@ -10,14 +10,15 @@ fn main() {
     let g = Chain::genesis(&p, now() - 3600, b"Bitcheque local demo");
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
     println!("rpc on {}", node.serve_rpc("127.0.0.1:8732").expect("port 8732 busy"));
-    let mine = |n: u32| loop { let Ok(mut b) = node.template(n) else { continue }; b.header.mine(); if node.submit_block(&b, None).is_ok() { println!("block {}", node.height()); break; } };
+    let mine = |n: u32| loop { let mut b = node.template(n).expect("template"); b.header.mine(); if node.submit_block(&b, None).is_ok() { println!("block {}", node.height()); break; } };
     let miner = Book { salt: [1; 16], n256: false, book_size: 64, domains: vec![Domain([7; 32])] };
     let saver = Book { salt: [2; 16], n256: false, book_size: 11, domains: vec![Domain([8; 32])] };   // one seed
     let shop = Book { salt: [3; 16], n256: false, book_size: 11, domains: vec![Domain([10; 32])] };  // one seed
     let submit = |txs: Vec<bitcheque::tx::Tx>| for t in txs { node.submit_tx(t, None).unwrap(); };
 
-    submit(vec![mine_registration(miner.register(0, 64, Payment::Pow(0)), p.reg_pow_target)]);
-    mine(0); mine(1); mine(1); mine(1);                                   // number 1, reward matures
+    submit(miner.registrations(0, 63).into_iter().map(|t| mine_registration(t, p.reg_pow_target)).collect());   // 64 cheques, 16 per batch
+    mine(0); mine(0);                                                     // number 1 is final from block 3: until then, mine to nobody
+    mine(1); mine(1); mine(1);                                            // the block-3 reward matures
     submit(vec![mine_registration(saver.register(0, 16, Payment::Pow(0)), p.reg_pow_target)]);
     mine(1);
     submit(saver.sign(0, &Message::new(1, 0, 0, 0)));                     // honesty check (zero coins, any number)

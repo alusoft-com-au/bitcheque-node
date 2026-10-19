@@ -21,8 +21,9 @@ const QUIET_S = 50;              // the backup miner mines when no block has com
                                  // mining it finds one each wake, about one a minute (the block target)
 const MINE_MS = 3000;            // at most this long per wake (the floor is ~2^19 hashes: about a second here)
 const MINE_TRIES = 50_000;       // nonces per call into the wasm, between clock checks
-const CHAIN_VERSION = '4';        // bump to reset the network: each region forgets its chain and starts from block 0
+const CHAIN_VERSION = '5';        // bump to reset the network: each region forgets its chain and starts from block 0
 const FALLBACK_S = 120;          // each further region in MINE_REGIONS waits this much longer (if the first is down)
+const RERELAY_MAX = 50;          // waiting transactions offered again to each other region per wake
 const POOL_MAX = 1000;           // waiting transactions kept in the database across unloads (all offered again on load)
 const FRESH = new Set(['height', 'tip', 'template']);   // miners and the status page need these nearly fresh
 const FRESH_S = 2;               // ...but a short cache still collapses a flood of them into one request per colo
@@ -44,6 +45,7 @@ export class EdgeNode extends DurableObject {
                    CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
                    CREATE TABLE IF NOT EXISTS pool (id INTEGER PRIMARY KEY AUTOINCREMENT, tx TEXT NOT NULL UNIQUE)`);
     this.x = null;
+    this.relayed = Promise.resolve();   // forwards go out one after another, in the order they were accepted
     if (this.meta('chain_version') !== CHAIN_VERSION) {   // a network reset: start again from block 0
       this.sql.exec('DELETE FROM blocks; DELETE FROM headers; DELETE FROM snap; DELETE FROM pool');
       this.sql.exec('DELETE FROM meta WHERE k != ?', 'region');   // keep the region: an alarm may wake it before any request
@@ -148,6 +150,7 @@ export class EdgeNode extends DurableObject {
       } catch (e) { log.push({ up, ok: false, error: String(e.message || e) }); }
     }
     this.meta('last_sync', JSON.stringify({ at: new Date().toISOString(), height: x.height(), fetched, log }));
+    await this.rerelay();
     return fetched;
   }
   // ---- the backup miner: so the chain never stalls for want of miners. Only the regions in MINE_REGIONS, only
@@ -171,6 +174,20 @@ export class EdgeNode extends DurableObject {
     }
     note({ found: false });
   }
+  // offer every waiting transaction to the other regions again, oldest first: one lost on the way (or refused
+  // there because it overtook the transaction it depends on) gets through within a minute. They answer
+  // "already in mempool" for the rest; a peer header stops them passing it on.
+  async rerelay() {
+    // first against our own chain: a row the chain now refuses (mined, or no longer valid) is dropped, not re-sent
+    const live = [];
+    for (const r of this.sql.exec('SELECT id, tx FROM pool ORDER BY id').toArray()) {
+      const [code, why] = this.rpc('POST', '/tx', r.tx);
+      if (why.trim().split('\n').some(x => x === 'ok' || x === 'already in mempool')) live.push(r.tx);
+      else this.sql.exec('DELETE FROM pool WHERE id = ?', r.id);
+    }
+    for (const up of this.upstreams().filter(u => u.startsWith('do:')))
+      for (const tx of live.slice(0, RERELAY_MAX)) { try { await this.call(up, '/tx', { method: 'POST', body: tx }); } catch (_) {} }
+  }
   // every minute; straight away again while catching up
   async alarm() { let n = 0; try { n = await this.sync(); if (n < MAX_PER_WAKE) this.backup(); } finally { await this.ctx.storage.setAlarm(Date.now() + (n >= MAX_PER_WAKE ? 1000 : SYNC_MS)); } }
 
@@ -193,7 +210,7 @@ export class EdgeNode extends DurableObject {
     // a new transaction or a newly mined block goes on to the other regions and upstream nodes at once
     // (not back to the region that sent it); polling every minute is only the safety net
     if (req.method === 'POST' && (url.pathname === '/tx' || url.pathname === '/block') && code === 200 && !req.headers.get('X-Edge-Peer'))
-      this.ctx.waitUntil(Promise.allSettled(this.upstreams().map(up => this.call(up, url.pathname, { method: 'POST', body }))));
+      this.ctx.waitUntil(this.relayed = this.relayed.then(() => Promise.allSettled(this.upstreams().map(up => this.call(up, url.pathname, { method: 'POST', body })))));
     if (req.method === 'POST' && url.pathname === '/block') this.trim();
     return text(reply, code);
   }

@@ -95,7 +95,7 @@ outputs.
 | `RegisterBatch { account, batch, PoW nonce }` | nobody; self-verifying | the same proof of work as `RegisterBook` | makes the next 16 cheques of a book spendable (printing more, §10.10) |
 | `ChequePiece { account, cheque, column, shares }` | the paper | encoded in the cheque (fee tier) | one column of a cheque; a cheque is 18 pieces (§10.12) |
 | `Renew { account, start }` | nobody | 10,000 base units from the account balance | resets a batch's expiry (§10.11) |
-| Coinbase `{ height, number, message }` | — | — | credits the block reward plus fees to an account number, 100 blocks later |
+| Coinbase `{ height, number, message }` | — | — | credits the block reward plus fees to a final account number (or 0, nobody), 100 blocks later |
 
 Registration transactions carry no signature because nothing in them can be
 falsified: every hash must match the committed root through a Merkle path.
@@ -425,12 +425,17 @@ otherwise the next value of a global counter (starting at 1). The mapping
 `number → AccountId` is node state and is committed under `state_root`.
 
 - Numbers cannot be chosen, so there is nothing to squat or spoof.
-- **Maturity:** a number may be a cheque's recipient only once its assigning
-  block is 100 deep (about 100 minutes), so a reorg cannot redirect a
-  transfer; earlier the cheque fails with "payee number not mature".
+- **Maturity:** a number may be a cheque's recipient, or a block reward's,
+  only once its assigning block is 100 deep (about 100 minutes), so a reorg
+  cannot redirect a transfer or a reward to whoever holds the number on
+  another branch; earlier the cheque fails with "payee number not mature"
+  and the block with "coinbase payee not mature".
 - **Publication (node policy, not consensus):** no RPC output prints a
-  number until it is final (100 blocks deep): `/account`, `/id` and
-  `/lookup` omit the number line, `/top` leaves the account out, block
+  number until it is final (100 blocks deep): `/id` and `/lookup` omit the
+  number line, `/account/<n>`, `/history/<n>` and `/proof/<n>` answer a
+  number that is not final exactly as an unknown one ("no such number"), so
+  new numbers cannot be probed for, a sender not yet final appears in a
+  history as its account id, `/top` leaves the account out, block
   summaries show a registration's number and a cheque's sender only once
   final, and the mempool lists a waiting cheque only when its recipient is
   final. So a provisional number is never seen, shared or written on a
@@ -782,10 +787,12 @@ anyone with modest hash power can rewrite its recent history.
 
 The first blocks have no accounts, so three rules make block 1 possible:
 
-- A coinbase names an account number that exists by the end of its own
-  block (a miner may register a software book and name it in the same
-  block). The 100-block maturity of §10.4 applies to cheque recipients, not
-  to the coinbase; the reward itself matures 100 blocks later.
+- A coinbase names a final account number (100 blocks deep, §10.4), as a
+  cheque's recipient does, or number 0. A new miner therefore mines to 0
+  (or to another final number) for its first 100 blocks; a reorg can never
+  hand its rewards to whoever holds the number on another branch. The
+  reward itself then matures 100 blocks later. (The edge nodes' backup
+  miner falls back to 0 until its configured number is final.)
 - A coinbase may name number 0, which burns the reward. The genesis
   coinbase does.
 - Registration PoW in the first 20,160 blocks uses the fixed 2^228 target
