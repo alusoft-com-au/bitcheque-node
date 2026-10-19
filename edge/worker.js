@@ -17,6 +17,7 @@ const PART = 1_000_000;          // snapshot bytes per row (rows hold at most 2 
 const QUIET_S = 120;             // the backup miner starts after this long without a block (two block targets)
 const MINE_MS = 3000;            // at most this long per wake (the floor is ~2^19 hashes: about a second here)
 const MINE_TRIES = 50_000;       // nonces per call into the wasm, between clock checks
+const POOL_MAX = 5000;           // waiting transactions kept in the database across unloads
 const NOT_CACHED = new Set(['tip', 'template']);   // miners need these fresh
 const CACHE_S = 15;              // seconds the front worker caches a GET reply (status pages poll every 10 s)
 // the RPC's first path segments: anything else is refused here, without waking a Durable Object
@@ -33,7 +34,8 @@ export class EdgeNode extends DurableObject {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS blocks (h INTEGER PRIMARY KEY, data BLOB NOT NULL);
                    CREATE TABLE IF NOT EXISTS headers (chunk INTEGER PRIMARY KEY, data BLOB NOT NULL);
                    CREATE TABLE IF NOT EXISTS snap (part INTEGER PRIMARY KEY, data BLOB NOT NULL);
-                   CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)`);
+                   CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+                   CREATE TABLE IF NOT EXISTS pool (id INTEGER PRIMARY KEY AUTOINCREMENT, tx TEXT NOT NULL UNIQUE)`);
     this.x = null;
   }
   meta(k, v) { if (v === undefined) return this.sql.exec('SELECT v FROM meta WHERE k = ?', k).toArray()[0]?.v; this.sql.exec('INSERT OR REPLACE INTO meta VALUES (?, ?)', k, String(v)); }
@@ -65,6 +67,12 @@ export class EdgeNode extends DurableObject {
     if (!x.open(+(this.env.NET ?? 0), SNAP_EVERY)) throw new Error('edge node failed to start');
     for (const r of this.sql.exec('SELECT data FROM blocks WHERE h > ? ORDER BY h', x.height())) { this.put(new Uint8Array(r.data)); this.now(); if (x.add_block() !== 1) break; }
     this.trim();
+    // the mempool: Cloudflare unloads an idle object between wakes, so waiting transactions are kept in the database
+    // and offered again, oldest first. One the chain now refuses (mined, or no longer valid) is dropped.
+    for (const r of this.sql.exec('SELECT id, tx FROM pool ORDER BY id').toArray()) {
+      const [code, why] = this.rpc('POST', '/tx', r.tx);
+      if (code !== 200 && why.trim() !== 'already in mempool') this.sql.exec('DELETE FROM pool WHERE id = ?', r.id);
+    }
     return x;
   }
   header(h, b) {   // keep block h's header in its chunk row
@@ -156,6 +164,10 @@ export class EdgeNode extends DurableObject {
     if (url.pathname === '/edge') return text(`region ${this.meta('region')}\nheight ${this.x.height()}\nupstreams ${this.upstreams().join(' ')}\nlast_sync ${this.meta('last_sync') ?? 'never'}\nlast_mined ${this.meta('last_mined') ?? 'never'}\n`);
     const body = req.method === 'POST' ? await req.text() : '';
     const [code, reply] = this.rpc(req.method, url.pathname, body);
+    if (req.method === 'POST' && url.pathname === '/tx' && code === 200) {
+      this.sql.exec('INSERT OR IGNORE INTO pool (tx) VALUES (?)', body.trim());
+      this.sql.exec('DELETE FROM pool WHERE id <= (SELECT MAX(id) FROM pool) - ?', POOL_MAX);
+    }
     // a new transaction or a newly mined block goes on to the other regions and upstream nodes at once
     // (not back to the region that sent it); polling every minute is only the safety net
     if (req.method === 'POST' && (url.pathname === '/tx' || url.pathname === '/block') && code === 200 && !req.headers.get('X-Edge-Peer'))
