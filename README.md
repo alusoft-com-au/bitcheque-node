@@ -8,6 +8,10 @@ hand-copied cheques printed once, offline, from a hash-based cheque book. Rust, 
 - `tests/`: `cargo test`.
 - `wallet-wasm/`: the same Rust book and registration code compiled to WebAssembly for the website:
   `cd wallet-wasm && cargo build --release --target wasm32-unknown-unknown`.
+- `edge/`: the edge node, the node's chain, mempool and RPC compiled to WebAssembly and run by Cloudflare
+  Durable Objects in three regions (`node-ap`, `node-us`, `node-eu`.bitcheque.org). No sockets and no miner:
+  each wakes every minute, pulls new blocks from upstream nodes' RPC, keeps them in SQLite, and forwards
+  posted transactions upstream. `edge/build.sh`, then `npx wrangler deploy` in `edge/`.
 
 The official website lives in [bitcheque-website](https://github.com/alusoft-com-au/bitcheque-website).
 

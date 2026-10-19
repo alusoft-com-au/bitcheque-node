@@ -19,6 +19,11 @@ impl Header {
         b[108..].copy_from_slice(&self.nonce.to_le_bytes());
         b
     }
+    pub fn decode(b: &[u8; 112]) -> Header {
+        let g = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        Header { version: g(0), prev: b[4..36].try_into().unwrap(), tx_root: b[36..68].try_into().unwrap(),
+                 state_root: b[68..100].try_into().unwrap(), time: g(100), bits: g(104), nonce: g(108) }
+    }
     pub fn hash(&self) -> [u8; 32] { sha256d(&self.encode()) }
     pub fn meets_target(&self) -> bool { U256::from_le_bytes(&self.hash()) < U256::from_compact(self.bits) }
     /// Search nonces until the header meets its target.
@@ -37,9 +42,7 @@ impl Block {
     }
     pub fn decode(b: &[u8]) -> Result<Block, &'static str> {
         if b.len() < 116 { return Err("truncated"); }
-        let g = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
-        let header = Header { version: g(0), prev: b[4..36].try_into().unwrap(), tx_root: b[36..68].try_into().unwrap(),
-                              state_root: b[68..100].try_into().unwrap(), time: g(100), bits: g(104), nonce: g(108) };
+        let header = Header::decode(b[..112].try_into().unwrap());
         let mut r = R::new(b); r.i = 112;
         let n = r.u32()?; let mut txs = Vec::new();
         for _ in 0..n { let e = r.bytes()?; txs.push(Tx::decode(&mut R::new(&e))?); }
@@ -83,9 +86,13 @@ pub fn next_bits(p: &Params, headers: &[Header]) -> u32 {
 
 /// Main-chain blocks: in memory (tests, no --data) or left in the data file and read back by offset,
 /// so a node's memory does not grow with the chain. `at[h]` is the (offset, length) of block h.
-pub enum Blocks { Mem(Vec<Block>), File { path: std::path::PathBuf, genesis: Block, at: Vec<(u64, u32)> } }
+pub enum Blocks { Mem(Vec<Block>), File { path: std::path::PathBuf, genesis: Block, at: Vec<(u64, u32)> }, Host { genesis: Block, n: usize, io: HostBlocks } }
+/// Block storage kept by a host, by height (the edge node keeps blocks in a Durable Object's database):
+/// `get` the encoded block at a height, `put` one there, replacing what was there.
+#[derive(Clone, Copy)]
+pub struct HostBlocks { pub get: fn(usize) -> Option<Vec<u8>>, pub put: fn(usize, &[u8]) }
 impl Blocks {
-    pub fn len(&self) -> usize { match self { Blocks::Mem(v) => v.len(), Blocks::File { at, .. } => at.len() } }
+    pub fn len(&self) -> usize { match self { Blocks::Mem(v) => v.len(), Blocks::File { at, .. } => at.len(), Blocks::Host { n, .. } => *n } }
     pub fn get(&self, h: usize) -> Option<Block> {
         match self {
             Blocks::Mem(v) => v.get(h).cloned(),
@@ -99,6 +106,7 @@ impl Blocks {
                 f.read_exact(&mut buf).ok()?;
                 Block::decode(&buf).ok()
             }
+            Blocks::Host { genesis, n, io } => if h == 0 { Some(genesis.clone()) } else if h < *n { Block::decode(&(io.get)(h)?).ok() } else { None },
         }
     }
     /// Encoded blocks `from..from+n` (fewer at the tip), opening the file once.
@@ -118,6 +126,7 @@ impl Blocks {
                 }
                 out
             }
+            Blocks::Host { genesis, n, io } => (from..(from + n).min(*n)).map_while(|h| if h == 0 { Some(genesis.encode()) } else { (io.get)(h) }).collect(),
         }
     }
     /// A copy holding only blocks `from..from+n` (block 0 stays at index 0), so a peer's request
@@ -128,16 +137,27 @@ impl Blocks {
         match self {
             Blocks::Mem(v) => (Blocks::Mem([&v[..1], &v[from..end]].concat()), 1),
             Blocks::File { path, genesis, at } => (Blocks::File { path: path.clone(), genesis: genesis.clone(), at: [&at[..1], &at[from..end]].concat() }, 1),
+            Blocks::Host { genesis, io, .. } => (Blocks::Host { genesis: genesis.clone(), n: end, io: *io }, from),
         }
     }
     pub fn loc(&self, h: usize) -> Option<(u64, u32)> { if let Blocks::File { at, .. } = self { at.get(h).copied() } else { None } }
     pub fn push(&mut self, b: &Block, loc: Option<(u64, u32)>) {
-        match self { Blocks::Mem(v) => v.push(b.clone()), Blocks::File { at, .. } => at.push(loc.expect("a file-backed chain needs the block's location")) }
+        match self {
+            Blocks::Mem(v) => v.push(b.clone()),
+            Blocks::File { at, .. } => at.push(loc.expect("a file-backed chain needs the block's location")),
+            Blocks::Host { n, io, .. } => { (io.put)(*n, &b.encode()); *n += 1 }
+        }
     }
-    pub fn truncate(&mut self, n: usize) { match self { Blocks::Mem(v) => v.truncate(n), Blocks::File { at, .. } => at.truncate(n) } }
+    pub fn truncate(&mut self, k: usize) { match self { Blocks::Mem(v) => v.truncate(k), Blocks::File { at, .. } => at.truncate(k), Blocks::Host { n, .. } => *n = (*n).min(k) } }
     /// The same kind of store holding only block 0.
-    pub fn empty_like(&self) -> Blocks {
-        match self { Blocks::Mem(v) => Blocks::Mem(vec![v[0].clone()]), Blocks::File { path, genesis, .. } => Blocks::File { path: path.clone(), genesis: genesis.clone(), at: vec![(0, 0)] } }
+    pub fn empty_like(&self) -> Blocks { self.prefix(1) }
+    /// The first `k` blocks (genesis included), sharing the same storage: nothing is read or written.
+    pub fn prefix(&self, k: usize) -> Blocks {
+        match self {
+            Blocks::Mem(v) => Blocks::Mem(v[..k.min(v.len())].to_vec()),
+            Blocks::File { path, genesis, at } => Blocks::File { path: path.clone(), genesis: genesis.clone(), at: at[..k.min(at.len())].to_vec() },
+            Blocks::Host { genesis, n, io } => Blocks::Host { genesis: genesis.clone(), n: k.min(*n), io: *io },
+        }
     }
 }
 

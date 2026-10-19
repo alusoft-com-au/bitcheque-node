@@ -93,3 +93,9 @@ impl Params {
         }
     }
 }
+
+// genesis blocks (Chain::genesis(params, time, GENESIS_MESSAGE)); shared by the node and the edge node
+pub const GENESIS_MESSAGE: &[u8] = b"Bitcheque genesis. Message text and launch timestamp to be set (DESIGN.md 12.4).";
+pub const LAUNCH_TIME: u32 = 1_798_761_600; // placeholder: 2027-01-01 00:00 UTC (no block may precede it, §12.2)
+pub const TESTNET_TIME: u32 = 1792245600; // launch of the public research network, 2026-10-17 14:00 UTC
+pub const LOCAL_TIME: u32 = 1_790_000_000; // local devnet genesis, fixed so it never moves with the research network

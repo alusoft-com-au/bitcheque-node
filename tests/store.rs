@@ -141,3 +141,63 @@ fn snapshot_restart_and_reorg() {
     assert_eq!(a.store.lock().unwrap().chain.state.root(), alt.state.root(), "state rebuilt from the snapshot matches");
     let _ = std::fs::remove_file(&path); let _ = std::fs::remove_file(&snap);
 }
+
+// host-backed store (the edge node): blocks and snapshots live with the host, here in thread-locals
+thread_local! {
+    static DB: std::cell::RefCell<std::collections::HashMap<usize, Vec<u8>>> = Default::default();
+    static SNAP: std::cell::RefCell<Option<Vec<u8>>> = Default::default();
+}
+fn host_get(h: usize) -> Option<Vec<u8>> { DB.with(|d| d.borrow().get(&h).cloned()) }
+fn host_put(h: usize, b: &[u8]) { DB.with(|d| { d.borrow_mut().insert(h, b.to_vec()); }) }
+fn host_snap(b: &[u8]) { SNAP.with(|s| *s.borrow_mut() = Some(b.to_vec())) }
+fn host_io() -> bitcheque::block::HostBlocks { bitcheque::block::HostBlocks { get: host_get, put: host_put } }
+/// Snapshot height and the stored headers up to it, as the edge node's host hands them over.
+fn host_restore(snap: &[u8]) -> (u32, Vec<u8>) {
+    let sh = u32::from_le_bytes(snap[4..8].try_into().unwrap());
+    (sh, (1..=sh as usize).flat_map(|h| host_get(h).unwrap()[..112].to_vec()).collect())
+}
+
+/// The edge node's store: blocks kept by the host, a restart from the host's snapshot and headers,
+/// a reorg below the snapshot rewriting the host's blocks, and a snapshot of an abandoned branch refused.
+#[test]
+fn host_store_restore_and_reorg() {
+    let p = params();
+    let t0 = now() - 10_000_000;
+    let g = Chain::genesis(&p, t0, b"host test");
+    let mut maker = Chain::new(p.clone(), &g).unwrap();
+    let blk = |maker: &mut Chain| { let b = maker.make_block(maker.headers.last().unwrap().time + 600, 1, vec![]).unwrap(); maker.add(&b, now()).unwrap(); b };
+    let mut st = Store::open_host(p.clone(), &g, host_io(), None, &[], 100, host_snap).unwrap();
+    let reg = mine_registration(miner().register(0, 16, Payment::Pow(0)), p.reg_pow_target);
+    let b1 = maker.make_block(t0 + 600, 0, vec![reg]).unwrap(); maker.add(&b1, now()).unwrap(); st.accept(&b1, now()).unwrap();
+    for _ in 1..251 { let b = blk(&mut maker); st.accept(&b, now()).unwrap(); }
+    assert_eq!(st.chain.height(), 251);
+    assert_eq!(st.chain.blocks.get(7).unwrap(), maker.blocks.get(7).unwrap(), "blocks are read back from the host");
+    let snap = SNAP.with(|s| s.borrow().clone()).expect("snapshot handed to the host");
+
+    // restart: snapshot + headers, then the blocks stored above the snapshot
+    let (sh, headers) = host_restore(&snap);
+    assert_eq!(sh, 200);
+    let mut r = Store::open_host(p.clone(), &g, host_io(), Some(&snap), &headers, 100, host_snap).unwrap();
+    assert_eq!(r.chain.height(), 200, "restored at the snapshot, without replaying");
+    for h in 201..=251 { r.accept(&host_get(h).map(|b| bitcheque::block::Block::decode(&b).unwrap()).unwrap(), now()).unwrap(); }
+    assert_eq!(r.chain.tip(), maker.tip());
+    assert_eq!(r.chain.state.root(), maker.state.root(), "state after a restart matches a full replay");
+
+    // a heavier branch from height 150, below the snapshot
+    let mut alt = Chain::new(p.clone(), &g).unwrap();
+    for h in 1..=150 { alt.add(&maker.blocks.get(h).unwrap(), now()).unwrap(); }
+    let a = Node::new(r);
+    for _ in 0..110 { let b = alt.make_block(alt.headers.last().unwrap().time + 601, 1, vec![]).unwrap(); alt.add(&b, now()).unwrap(); let _ = a.submit_block(&b, None); }
+    assert_eq!(a.store.lock().unwrap().chain.tip(), alt.tip(), "reorged onto the heavier branch");
+    for h in [151, 200, 251, 260] { assert_eq!(host_get(h).unwrap(), alt.blocks.get(h).unwrap().encode(), "host block {h} follows the new branch"); }
+
+    // the old snapshot (height 200 of the abandoned branch) must not be trusted with the new headers
+    let new_headers: Vec<u8> = (1..=200).flat_map(|h| host_get(h).unwrap()[..112].to_vec()).collect();
+    let stale = Store::open_host(p.clone(), &g, host_io(), Some(&snap), &new_headers, 100, host_snap).unwrap();
+    assert_eq!(stale.chain.height(), 0, "a snapshot of another branch is ignored: replay from genesis");
+    // the new branch's own snapshot restores
+    let fresh = SNAP.with(|s| s.borrow().clone()).unwrap();
+    let (sh2, h2) = host_restore(&fresh);
+    let ok = Store::open_host(p.clone(), &g, host_io(), Some(&fresh), &h2, 100, host_snap).unwrap();
+    assert_eq!((ok.chain.height(), ok.chain.tip()), (sh2, alt.hashes[sh2 as usize]));
+}

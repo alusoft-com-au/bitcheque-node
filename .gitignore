@@ -5,3 +5,6 @@ __pycache__/
 *.dat.peers
 *.snap
 *.log
+/edge/target/
+/edge/bitcheque_edge.wasm
+.wrangler/

@@ -80,7 +80,7 @@ impl Node {
         let (code, text) = match self.route(method, path, &body) { Ok(t) => (200, t), Err(e) => (400, e.to_string()) };
         let _ = write!(s, "HTTP/1.0 {code} OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{text}", text.len());
     }
-    fn route(&self, method: &str, path: &str, body: &str) -> Result<String, &'static str> {
+    pub fn route(&self, method: &str, path: &str, body: &str) -> Result<String, &'static str> {
         let seg: Vec<&str> = path.trim_matches('/').split('/').collect();
         let st = self.store.lock().unwrap();
         let c = &st.chain;

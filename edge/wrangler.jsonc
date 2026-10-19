@@ -1,0 +1,17 @@
+// The edge nodes: ./build.sh, then npx wrangler deploy (or wrangler dev with NET=1 and a devnet upstream).
+{
+  "$schema": "https://unpkg.com/wrangler@4/config-schema.json",
+  "name": "bitcheque-node",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-12",
+  "durable_objects": { "bindings": [{ "name": "NODE", "class_name": "EdgeNode" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["EdgeNode"] }],
+  "triggers": { "crons": ["*/30 * * * *"] },
+  "routes": [
+    { "pattern": "node-ap.bitcheque.org", "custom_domain": true },
+    { "pattern": "node-us.bitcheque.org", "custom_domain": true },
+    { "pattern": "node-eu.bitcheque.org", "custom_domain": true }
+  ],
+  // NET 0 = the public research network. UPSTREAMS: comma-separated node RPC URLs to pull blocks from
+  "vars": { "NET": "0", "UPSTREAMS": "" }
+}

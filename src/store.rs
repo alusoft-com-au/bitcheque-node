@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use crate::block::{next_bits, relieved_bits, Block, Blocks, Chain, Header};
+use crate::block::{next_bits, relieved_bits, Block, Blocks, Chain, Header, HostBlocks};
 use crate::params::Params;
 use crate::state::State;
 use crate::tx::{Tx, R, W};
@@ -31,6 +31,7 @@ pub struct Store {
     path: Option<PathBuf>,
     genesis: Block,
     snap: Option<Snap>,
+    host_snap: Option<(u32, fn(&[u8]))>, // a host-backed store: snapshot every so many blocks, handed to this
 }
 
 /// Work of one block as u128: 2^128 / (target>>128 + 1). Deterministic, monotone in difficulty.
@@ -59,7 +60,7 @@ impl Store {
     pub fn open(p: Params, genesis: &Block, path: Option<&Path>) -> std::io::Result<Store> {
         let chain = Chain::new(p, genesis).map_err(std::io::Error::other)?;
         let mut s = Store { chain, side: HashMap::new(), side_order: VecDeque::new(), index: HashMap::new(), file: None, file_len: 0,
-                            path: path.map(Path::to_path_buf), genesis: genesis.clone(), snap: None };
+                            path: path.map(Path::to_path_buf), genesis: genesis.clone(), snap: None, host_snap: None };
         s.index.insert(genesis.header.hash(), 0);
         if let Some(path) = path {
             s.chain.blocks = Blocks::File { path: path.to_path_buf(), genesis: genesis.clone(), at: vec![(0, 0)] };
@@ -100,6 +101,32 @@ impl Store {
             }
             s.file = Some(OpenOptions::new().create(true).append(true).open(path)?);
         }
+        Ok(s)
+    }
+    /// A store whose blocks a host keeps (see `HostBlocks`). `snap` and `headers` (block 1 onwards,
+    /// 112 bytes each) restore the chain at the snapshot's height when they agree with each other; the
+    /// host then feeds in the blocks it stored after that. New snapshots go to `sink` every `every` blocks.
+    pub fn open_host(p: Params, genesis: &Block, io: HostBlocks, snap: Option<&[u8]>, headers: &[u8], every: u32, sink: fn(&[u8])) -> Result<Store, &'static str> {
+        let mut s = Store::open(p, genesis, None).map_err(|_| "genesis")?;
+        s.chain.blocks = Blocks::Host { genesis: genesis.clone(), n: 1, io };
+        s.host_snap = Some((every.max(1), sink));
+        let Some(snap) = snap.and_then(decode_snap) else { return Ok(s) };
+        let k = snap.height as usize;
+        if snap.height == 0 || headers.len() < k * 112 { return Ok(s); }
+        let mut hs = Vec::with_capacity(k);
+        let mut prev = genesis.header.hash();
+        for c in headers[..k * 112].chunks(112) {
+            let h = Header::decode(c.try_into().unwrap());
+            if h.prev != prev { return Ok(s); }
+            prev = h.hash(); hs.push(h);
+        }
+        // the snapshot must be of this very chain: its tip, and the state root that block committed to
+        if prev != snap.tip || hs[k - 1].state_root != snap.state.root() || snap.state.height != snap.height { return Ok(s); }
+        for (i, h) in hs.into_iter().enumerate() { s.index.insert(h.hash(), i as u32 + 1); s.chain.hashes.push(h.hash()); s.chain.headers.push(h); }
+        s.chain.blocks = Blocks::Host { genesis: genesis.clone(), n: k + 1, io };
+        s.chain.state = snap.state.clone();
+        s.chain.decode_index(&mut R::new(&snap.index))?;
+        s.snap = Some(snap);
         Ok(s)
     }
     pub fn accept(&mut self, b: &Block, now: u32) -> Result<Accepted, &'static str> { self.accept_inner(b, now, None) }
@@ -184,8 +211,8 @@ impl Store {
         c.blocks = self.chain.blocks.empty_like();
         let mut from = 1u32;
         if let Some(snap) = &self.snap { if snap.height <= fork && self.chain.hashes.get(snap.height as usize) == Some(&snap.tip) {
-            for h in 1..=snap.height as usize { c.headers.push(self.chain.headers[h].clone()); c.hashes.push(self.chain.hashes[h]); c.blocks.push(&self.genesis, self.chain.blocks.loc(h).or(Some((0, 0)))); }
-            if let Blocks::Mem(v) = &mut c.blocks { v.truncate(1); for h in 1..=snap.height as usize { v.push(self.chain.blocks.get(h).ok_or("block missing")?); } }
+            for h in 1..=snap.height as usize { c.headers.push(self.chain.headers[h].clone()); c.hashes.push(self.chain.hashes[h]); }
+            c.blocks = self.chain.blocks.prefix(snap.height as usize + 1);
             c.state = snap.state.clone(); let _ = c.decode_index(&mut R::new(&snap.index));
             from = snap.height + 1;
         } }
@@ -206,6 +233,8 @@ impl Store {
         if self.snap.as_ref().is_some_and(|sn| sn.height > fork) {
             self.snap = None;
             if let Some(p) = self.snap_path() { let _ = std::fs::remove_file(p); }
+            // a host restarts from its snapshot each time it wakes: replace it now, not at the next multiple
+            if self.host_snap.is_some() { self.take_snapshot(); }
         }
         Ok(abandoned)
     }
@@ -214,22 +243,30 @@ impl Store {
     fn snap_path(&self) -> Option<PathBuf> { self.path.as_ref().map(|p| p.with_extension("snap")) }
     fn maybe_snapshot(&mut self) {
         let h = self.chain.height();
-        if h == 0 || h % SNAP_EVERY != 0 { return; }
-        let Some(path) = self.snap_path() else { return };
+        let every = self.host_snap.map_or(SNAP_EVERY, |(e, _)| e);
+        if h != 0 && h % every == 0 { self.take_snapshot(); }
+    }
+    fn take_snapshot(&mut self) {
+        let h = self.chain.height();
+        let path = self.snap_path();
+        if path.is_none() && self.host_snap.is_none() { return; }
         let snap = Snap { height: h, tip: self.chain.tip(), state: self.chain.state.clone(), index: self.chain.encode_index() };
         let mut w = W(Vec::new());
         w.0.extend_from_slice(SNAP_MAGIC); w.u32(snap.height); w.0.extend_from_slice(&snap.tip); w.bytes(&snap.state.encode()); w.bytes(&snap.index);
-        let tmp = path.with_extension("snap.tmp");
-        if std::fs::write(&tmp, &w.0).and_then(|_| std::fs::rename(&tmp, &path)).is_ok() { self.snap = Some(snap); }
+        if let Some(path) = path {
+            let tmp = path.with_extension("snap.tmp");
+            if std::fs::write(&tmp, &w.0).and_then(|_| std::fs::rename(&tmp, &path)).is_ok() { self.snap = Some(snap); }
+        } else if let Some((_, sink)) = self.host_snap { sink(&w.0); self.snap = Some(snap); }
     }
-    fn read_snapshot(&self) -> Option<Snap> {
-        let raw = std::fs::read(self.snap_path()?).ok()?;
-        if raw.len() < 40 || &raw[..4] != SNAP_MAGIC { return None; }
-        let mut r = R::new(&raw[4..]);
-        let height = r.u32().ok()?;
-        let tip: [u8; 32] = r.take(32).ok()?.try_into().ok()?;
-        let state = State::decode(&mut R::new(&r.bytes().ok()?)).ok()?;
-        let index = r.bytes().ok()?;
-        Some(Snap { height, tip, state, index })
-    }
+    fn read_snapshot(&self) -> Option<Snap> { decode_snap(&std::fs::read(self.snap_path()?).ok()?) }
+}
+
+fn decode_snap(raw: &[u8]) -> Option<Snap> {
+    if raw.len() < 40 || &raw[..4] != SNAP_MAGIC { return None; }
+    let mut r = R::new(&raw[4..]);
+    let height = r.u32().ok()?;
+    let tip: [u8; 32] = r.take(32).ok()?.try_into().ok()?;
+    let state = State::decode(&mut R::new(&r.bytes().ok()?)).ok()?;
+    let index = r.bytes().ok()?;
+    Some(Snap { height, tip, state, index })
 }

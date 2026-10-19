@@ -4,13 +4,9 @@
 //!   --listen defaults to 0.0.0.0:8730 (mainnet) or 0.0.0.0:8731 (testnet); --advertise is the address others can reach you on.
 //! bitcheque wallet new | info|register|send|sweep --seed HEX --rpc ADDR [--size CHEQUES] [--to NUMBER --amount COINS [--fee TIER]]
 //! bitcheque wallet pieces --seed HEX [--size CHEQUES] --cheque N --digits D18   (raw pieces as hex, no checks: for tests)
-use bitcheque::{block::Chain, crypto::{hex, sha256}, message::Message, net::Node, params::{Params, COIN}, rpc::unhex, store::Store,
+use bitcheque::{block::Chain, crypto::{hex, sha256}, message::Message, net::Node, params::{Params, COIN, GENESIS_MESSAGE as MESSAGE, LAUNCH_TIME, LOCAL_TIME, TESTNET_TIME}, rpc::unhex, store::Store,
                 tx::Payment, u256::U256, wallet::{mine_registration, Book, Domain}};
 
-const MESSAGE: &[u8] = b"Bitcheque genesis. Message text and launch timestamp to be set (DESIGN.md 12.4).";
-const LAUNCH_TIME: u32 = 1_798_761_600; // placeholder: 2027-01-01 00:00 UTC (no block may precede it, §12.2)
-const TESTNET_TIME: u32 = 1792245600; // launch of the public research network, 2026-10-17 14:00 UTC
-const LOCAL_TIME: u32 = 1_790_000_000; // local devnet genesis, fixed so it never moves with the research network
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

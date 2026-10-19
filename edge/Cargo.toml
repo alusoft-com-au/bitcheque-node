@@ -1,0 +1,18 @@
+[package]
+name = "bitcheque-edge"
+version = "0.1.0"
+edition = "2021"
+description = "Edge node: the node's chain, mempool and RPC compiled to WebAssembly for a Cloudflare Durable Object. No networking, no mining. No dependencies."
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+bitcheque = { path = ".." }
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"

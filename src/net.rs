@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use crate::block::Block;
 use crate::state::State;
 use crate::store::{Accepted, Store};
@@ -56,7 +56,13 @@ pub fn valid_addr(a: &str) -> bool {
     a.len() <= 128 && a.rsplit_once(':').map_or(false, |(h, p)| !h.is_empty() && p.parse::<u16>().is_ok()) && a.chars().all(|c| c.is_ascii_graphic())
 }
 
-pub fn now() -> u32 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32 }
+#[cfg(not(target_arch = "wasm32"))]
+pub fn now() -> u32 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32 }
+/// WebAssembly has no system clock: the host (the edge node) sets the time before each call.
+#[cfg(target_arch = "wasm32")]
+pub static NOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(target_arch = "wasm32")]
+pub fn now() -> u32 { NOW.load(Ordering::Relaxed) }
 
 /// One connection. Messages to it go through a bounded queue drained by its own writer thread,
 /// so no other thread ever blocks on a slow or silent peer (Bitcoin Core's per-peer send buffer).
