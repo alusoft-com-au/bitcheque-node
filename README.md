@@ -11,7 +11,8 @@ hand-copied cheques printed offline from a hash-based cheque book (up to 256 che
 - `edge/`: the edge node, the node's chain, mempool and RPC compiled to WebAssembly and run by Cloudflare
   Durable Objects in three regions (`node-ap`, `node-us`, `node-eu`.bitcheque.org). No sockets and no miner:
   each wakes every minute, pulls new blocks from upstream nodes' RPC, keeps them in SQLite, and forwards
-  posted transactions upstream. `edge/build.sh`, then `npx wrangler deploy` in `edge/`.
+  posted transactions upstream. Each keeps only the last 2,000 block headers in memory (older blocks stay in
+  SQLite), so memory stays flat however long the chain grows. `edge/build.sh`, then `npx wrangler deploy` in `edge/`.
 
 The official website lives in [bitcheque-website](https://github.com/alusoft-com-au/bitcheque-website); the offline
 page for printing more cheques of a book in [bitcheque-print](https://github.com/alusoft-com-au/bitcheque-print).

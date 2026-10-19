@@ -262,3 +262,28 @@ fn a_cheque_to_yourself_shows_as_both_receive_and_send() {
     assert!(h.contains(" receive from=1 cheque=1 amount=100000000"), "{h}");
     assert!(h.contains(" send cheque=1 to=1 amount=100000000"), "{h}");
 }
+
+/// A registration and its cheque 0 posted in one /tx request are queued together and land in the same block,
+/// with one result per line; the same body again reports each one as already queued.
+#[test]
+fn a_batch_of_transactions_lands_in_one_block() {
+    use bitcheque::crypto::hex;
+    use bitcheque::message::Message;
+    use bitcheque::tx::Payment;
+    use bitcheque::wallet::{mine_registration, Book, Domain};
+    let p = Params { reg_pow_target: bitcheque::u256::U256::MAX.shr(4), ..params() };
+    let g = Chain::genesis(&p, now() - 100_000, b"hard");
+    let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
+    let b = Book { salt: [9; 16], n256: false, book_size: 16, domains: vec![Domain([10; 32])] };
+    let target = node.store.lock().unwrap().chain.state.reg_target;
+    let mut txs = vec![mine_registration(b.register(0, 16, Payment::Pow(0)), target)];
+    txs.extend(b.sign(0, &Message::new(0, 0, 0, 0)));
+    let body = txs.iter().map(|t| hex(&t.encode())).collect::<Vec<_>>().join("\n");
+    let reply = node.route("POST", "/tx", &body).unwrap();
+    assert_eq!(reply.lines().filter(|l| *l == "ok").count(), 19, "{reply}");
+    let again = node.route("POST", "/tx", &body).unwrap();
+    assert!(again.lines().all(|l| l == "already in mempool"), "{again}");
+    let block = mine(&node, 0).unwrap();
+    assert_eq!(block.txs.len(), 1 + 19);   // coinbase, the registration and all 18 pieces of cheque 0
+    assert_eq!(node.store.lock().unwrap().chain.state.accounts[&b.id()].nonce, Some(0));
+}

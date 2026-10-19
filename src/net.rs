@@ -405,20 +405,27 @@ impl Node {
     }
     /// Validate against the tip state plus the current mempool, add, relay. A failed apply leaves
     /// the state untouched, so the cached state stays right either way.
-    pub fn submit_tx(&self, t: Tx, from: Option<u64>) -> Result<(), &'static str> {
-        let raw = t.encode();
+    pub fn submit_tx(&self, t: Tx, from: Option<u64>) -> Result<(), &'static str> { self.submit_txs(vec![t], from).remove(0) }
+    /// Several transactions, in order, checked and queued under one lock: a block template sees either none of
+    /// them or every one that was accepted, so a cheque's 18 pieces (or a registration and its cheque 0) sent
+    /// together land in the same block. One result per transaction; the accepted ones are relayed.
+    pub fn submit_txs(&self, txs: Vec<Tx>, from: Option<u64>) -> Vec<Result<(), &'static str>> {
+        let (mut out, mut accepted) = (Vec::with_capacity(txs.len()), Vec::new());
         {
             let s = self.store.lock().unwrap(); let c = &s.chain;
             let mut m = self.mempool.lock().unwrap();
-            if self.mempool_bytes.load(Ordering::Relaxed) + raw.len() > MEMPOOL_BYTES { return Err("mempool full"); }
-            if m.contains(&t) { return Err("already in mempool"); }
             let mut next = self.next.lock().unwrap();
-            Self::next_state(c, &m, &mut next).apply(&c.params, &t)?;
-            m.push(t);
-            self.mempool_bytes.fetch_add(raw.len(), Ordering::Relaxed);
+            for t in txs {
+                let raw = t.encode();
+                let r = if self.mempool_bytes.load(Ordering::Relaxed) + raw.len() > MEMPOOL_BYTES { Err("mempool full") }
+                        else if m.contains(&t) { Err("already in mempool") }
+                        else { Self::next_state(c, &m, &mut next).apply(&c.params, &t).map(|_| ()) };
+                if r.is_ok() { m.push(t); self.mempool_bytes.fetch_add(raw.len(), Ordering::Relaxed); accepted.push(raw); }
+                out.push(r);
+            }
         }
-        self.relay(TX, &raw, from);
-        Ok(())
+        for raw in accepted { self.relay(TX, &raw, from); }
+        out
     }
     /// Dry run: apply `txs` in order on a copy of the next block's state (after the mempool).
     /// Nothing is stored or relayed. Returns one result per transaction.

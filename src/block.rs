@@ -189,8 +189,10 @@ pub fn relieved_bits(p: &Params, headers: &[Header], time: u32) -> u32 {
     t.to_compact()
 }
 
+/// `headers`/`hashes` hold heights `base ..= height()`. A node keeps them all (`keep` None, `base` 0); the edge node
+/// keeps only the most recent `keep` (a Durable Object has 128 MB, and the rules look back 60 blocks at most).
 pub struct Chain { pub params: Params, pub blocks: Blocks, pub headers: Vec<Header>, pub hashes: Vec<[u8; 32]>, pub state: State,
-                   pub history: HashMap<AccountId, VecDeque<Entry>>, pub totals: Totals }
+                   pub history: HashMap<AccountId, VecDeque<Entry>>, pub totals: Totals, pub base: u32, pub keep: Option<usize> }
 
 impl Chain {
     /// History and totals as bytes, for a state snapshot.
@@ -232,9 +234,19 @@ impl Chain {
     pub fn new(p: Params, genesis: &Block) -> Result<Chain, &'static str> {
         if !genesis.header.meets_target() || genesis.header.bits != p.initial_bits { return Err("bad genesis"); }
         let state = State::new(&p);
-        Ok(Chain { params: p, blocks: Blocks::Mem(vec![genesis.clone()]), headers: vec![genesis.header.clone()], hashes: vec![genesis.header.hash()], state, history: HashMap::new(), totals: Totals::default() })
+        Ok(Chain { params: p, blocks: Blocks::Mem(vec![genesis.clone()]), headers: vec![genesis.header.clone()], hashes: vec![genesis.header.hash()], state, history: HashMap::new(), totals: Totals::default(), base: 0, keep: None })
     }
-    pub fn height(&self) -> u32 { self.headers.len() as u32 - 1 }
+    pub fn height(&self) -> u32 { self.base + self.headers.len() as u32 - 1 }
+    /// The header and hash at height `h`, while it is in memory.
+    pub fn header_at(&self, h: u32) -> Option<&Header> { h.checked_sub(self.base).and_then(|i| self.headers.get(i as usize)) }
+    pub fn hash_at(&self, h: u32) -> Option<[u8; 32]> { h.checked_sub(self.base).and_then(|i| self.hashes.get(i as usize)).copied() }
+    /// Headers from height `h` to the tip (from the oldest in memory if `h` is below it).
+    pub fn headers_from(&self, h: u32) -> &[Header] { &self.headers[(h.saturating_sub(self.base) as usize).min(self.headers.len())..] }
+    fn push_header(&mut self, h: Header) {
+        self.hashes.push(h.hash()); self.headers.push(h);
+        // drop the oldest in chunks, so the window is trimmed once every so often rather than on every block
+        if let Some(k) = self.keep { if self.headers.len() > k + k / 4 { let d = self.headers.len() - k; self.headers.drain(..d); self.hashes.drain(..d); self.base += d as u32; } }
+    }
     pub fn tip(&self) -> [u8; 32] { *self.hashes.last().unwrap() }
     pub fn median_time(&self) -> u32 {
         let mut t: Vec<u32> = self.headers.iter().rev().take(11).map(|h| h.time).collect();
@@ -285,8 +297,7 @@ impl Chain {
         }
         self.state = s;
         self.blocks.push(b, loc);
-        self.headers.push(b.header.clone());
-        self.hashes.push(b.header.hash());
+        self.push_header(b.header.clone());
         Ok(())
     }
     /// Assemble, finalize and mine the next block (miner side).

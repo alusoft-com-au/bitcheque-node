@@ -16,6 +16,9 @@ use crate::u256::U256;
 pub enum Accepted { Extended, Reorged(Vec<Tx>), Side, Known }
 
 pub const SNAP_EVERY: u32 = 1000;   // blocks between state snapshots
+/// Headers a host-backed store keeps in memory: enough for the rules (60 blocks back) and for reorgs up to about
+/// a day and a half deep, and well above the host's snapshot interval; memory stays flat however long the chain.
+pub const HOST_KEEP: usize = 2000;
 const SIDE_CAP: usize = 2000;       // side blocks kept in memory (older ones stay in the file)
 const SNAP_MAGIC: &[u8; 4] = b"BCS1";
 
@@ -25,7 +28,7 @@ pub struct Store {
     pub chain: Chain,
     pub side: HashMap<[u8; 32], (Block, Option<(u64, u32)>)>,
     side_order: VecDeque<[u8; 32]>,
-    index: HashMap<[u8; 32], u32>, // main-chain hash -> height
+    index: HashMap<[u8; 32], u32>, // main-chain hash -> height (with a header window, only heights still in it)
     file: Option<File>,
     file_len: u64,
     path: Option<PathBuf>,
@@ -103,26 +106,28 @@ impl Store {
         }
         Ok(s)
     }
-    /// A store whose blocks a host keeps (see `HostBlocks`). `snap` and `headers` (block 1 onwards,
-    /// 112 bytes each) restore the chain at the snapshot's height when they agree with each other; the
-    /// host then feeds in the blocks it stored after that. New snapshots go to `sink` every `every` blocks.
+    /// A store whose blocks a host keeps (see `HostBlocks`). `snap` and `headers` (112 bytes each, the
+    /// most recent ones up to the snapshot's height: block 1 onwards, or just the last HOST_KEEP) restore the
+    /// chain at the snapshot's height when they agree with each other; the host then feeds in the blocks it
+    /// stored after that. New snapshots go to `sink` every `every` blocks. Only HOST_KEEP headers stay in memory.
     pub fn open_host(p: Params, genesis: &Block, io: HostBlocks, snap: Option<&[u8]>, headers: &[u8], every: u32, sink: fn(&[u8])) -> Result<Store, &'static str> {
         let mut s = Store::open(p, genesis, None).map_err(|_| "genesis")?;
         s.chain.blocks = Blocks::Host { genesis: genesis.clone(), n: 1, io };
+        s.chain.keep = Some(HOST_KEEP);
         s.host_snap = Some((every.max(1), sink));
         let Some(snap) = snap.and_then(decode_snap) else { return Ok(s) };
         let k = snap.height as usize;
-        if snap.height == 0 || headers.len() < k * 112 { return Ok(s); }
-        let mut hs = Vec::with_capacity(k);
-        let mut prev = genesis.header.hash();
-        for c in headers[..k * 112].chunks(112) {
-            let h = Header::decode(c.try_into().unwrap());
-            if h.prev != prev { return Ok(s); }
-            prev = h.hash(); hs.push(h);
-        }
-        // the snapshot must be of this very chain: its tip, and the state root that block committed to
-        if prev != snap.tip || hs[k - 1].state_root != snap.state.root() || snap.state.height != snap.height { return Ok(s); }
-        for (i, h) in hs.into_iter().enumerate() { s.index.insert(h.hash(), i as u32 + 1); s.chain.hashes.push(h.hash()); s.chain.headers.push(h); }
+        let n = (headers.len() / 112).min(k);
+        if snap.height == 0 || n == 0 || headers.len() != n * 112 { return Ok(s); }
+        // the headers must link up, end at the snapshot's tip, and that block must commit to the snapshot's state.
+        // All of them back to block 1 also link to genesis; a tail is trusted to (it is the host's own record).
+        let hs: Vec<Header> = headers.chunks(112).map(|c| Header::decode(c.try_into().unwrap())).collect();
+        let mut prev = if n == k { genesis.header.hash() } else { hs[0].prev };
+        for h in &hs { if h.prev != prev { return Ok(s); } prev = h.hash(); }
+        if prev != snap.tip || hs[n - 1].state_root != snap.state.root() || snap.state.height != snap.height { return Ok(s); }
+        let first = (k - n + 1) as u32;
+        if n < k { s.chain.headers.clear(); s.chain.hashes.clear(); s.index.clear(); s.chain.base = first; }
+        for (i, h) in hs.into_iter().enumerate() { s.index.insert(h.hash(), first + i as u32); s.chain.hashes.push(h.hash()); s.chain.headers.push(h); }
         s.chain.blocks = Blocks::Host { genesis: genesis.clone(), n: k + 1, io };
         s.chain.state = snap.state.clone();
         s.chain.decode_index(&mut R::new(&snap.index))?;
@@ -143,14 +148,16 @@ impl Store {
         let r = if b.header.prev == self.chain.tip() {
             if let Err(e) = self.chain.add_at(b, now, loc) { if fresh { self.unpersist(loc); } return Err(e); }
             self.index.insert(h, self.chain.height());
+            self.prune_index();
             self.maybe_snapshot();
             Accepted::Extended
         } else {
             self.remember_side(h, b.clone(), loc);
             let branch = self.branch(h);
             let Some(&fork) = branch.first().and_then(|x| self.index.get(&x.0.header.prev)) else { return Err("branch root unknown") };
+            if fork < self.chain.base { return Err("reorg too deep"); }
             let new_work: u128 = branch.iter().map(|x| work(x.0.header.bits)).sum();
-            let old_work: u128 = self.chain.headers[fork as usize + 1..].iter().map(|x| work(x.bits)).sum();
+            let old_work: u128 = self.chain.headers_from(fork + 1).iter().map(|x| work(x.bits)).sum();
             if new_work > old_work { Accepted::Reorged(self.reorg(fork, branch, now)?) } else { Accepted::Side }
         };
         Ok(r)
@@ -182,9 +189,10 @@ impl Store {
         let mut prev = h.prev;
         while let Some((b, _)) = self.side.get(&prev) { anc.push(b.header.clone()); prev = b.header.prev; }
         let Some(&fork) = self.index.get(&prev) else { return Err("branch root unknown") };
+        if fork < self.chain.base { return Err("reorg too deep"); }
         let need = p.lwma_window + 11;
-        let from = (fork as usize + 1).saturating_sub(need.saturating_sub(anc.len()));
-        let mut ctx: Vec<Header> = self.chain.headers[from..=fork as usize].to_vec();
+        let from = ((fork as usize + 1).saturating_sub(need.saturating_sub(anc.len())) as u32).max(self.chain.base);
+        let mut ctx: Vec<Header> = self.chain.headers_from(from).iter().take((fork + 1).saturating_sub(from) as usize).cloned().collect();
         ctx.extend(anc.into_iter().rev());
         let mut t: Vec<u32> = ctx.iter().rev().take(11).map(|x| x.time).collect();
         t.sort_unstable();
@@ -209,9 +217,12 @@ impl Store {
     fn reorg(&mut self, fork: u32, branch: Vec<(Block, Option<(u64, u32)>)>, now: u32) -> Result<Vec<Tx>, &'static str> {
         let mut c = Chain::new(self.chain.params.clone(), &self.genesis)?;
         c.blocks = self.chain.blocks.empty_like();
+        c.keep = self.chain.keep;
         let mut from = 1u32;
-        if let Some(snap) = &self.snap { if snap.height <= fork && self.chain.hashes.get(snap.height as usize) == Some(&snap.tip) {
-            for h in 1..=snap.height as usize { c.headers.push(self.chain.headers[h].clone()); c.hashes.push(self.chain.hashes[h]); }
+        // start from the snapshot when it is below the fork and its header is still in memory; otherwise replay from block 1
+        if let Some(snap) = &self.snap { if snap.height <= fork && self.chain.hash_at(snap.height) == Some(snap.tip) {
+            let n = (snap.height - self.chain.base) as usize + 1;
+            c.headers = self.chain.headers[..n].to_vec(); c.hashes = self.chain.hashes[..n].to_vec(); c.base = self.chain.base;
             c.blocks = self.chain.blocks.prefix(snap.height as usize + 1);
             c.state = snap.state.clone(); let _ = c.decode_index(&mut R::new(&snap.index));
             from = snap.height + 1;
@@ -229,6 +240,7 @@ impl Store {
         }
         for (k, (b, _)) in branch.iter().enumerate() { let h = b.header.hash(); self.side.remove(&h); self.index.insert(h, fork + 1 + k as u32); }
         self.chain = c;
+        self.prune_index();
         // the snapshot was of a block we just abandoned: forget it (the next one is taken as usual)
         if self.snap.as_ref().is_some_and(|sn| sn.height > fork) {
             self.snap = None;
@@ -237,6 +249,12 @@ impl Store {
             if self.host_snap.is_some() { self.take_snapshot(); }
         }
         Ok(abandoned)
+    }
+
+    /// With a header window, forget the hashes of main-chain blocks that left it.
+    fn prune_index(&mut self) {
+        let base = self.chain.base;
+        if base > 0 && self.index.len() > self.chain.headers.len() + 64 { self.index.retain(|_, h| *h >= base); }
     }
 
     // ---- snapshots ----

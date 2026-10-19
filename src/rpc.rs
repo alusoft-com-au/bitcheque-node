@@ -8,7 +8,7 @@
 //!   GET  /mempool (count, then one line per waiting transaction in the /summary format, then a cheque line per waiting cheque whose recipient is readable)
 //!   GET  /top[/N]  (richest N accounts, default 50: number balance book_size last_cheque unspent)
 //!   GET  /template/<number>  (hex: the next block to mine, reward to that number (0 burns it), nonce 0)
-//!   POST /tx  (body: hex-encoded tx)   POST /block (body: hex-encoded block, mined from a template)
+//!   POST /tx  (body: hex-encoded tx, or several, one per line, queued together: one result per line)   POST /block (body: hex-encoded block, mined from a template)
 //!   POST /check (body: one hex tx per line; dry run, nothing stored)
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -27,7 +27,7 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
 }
 
 const RPC_PER_MINUTE: u32 = 120;   // requests one address may make per minute
-const CHECK_MAX: usize = 64;       // transactions per /check
+const CHECK_MAX: usize = 64;       // transactions per /check or per batched /tx
 const BODY_MAX: usize = 20 << 20;  // request body bytes (a large registration is a few MB of hex)
 const RPC_THREADS: usize = 256;    // requests served at once
 static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -101,7 +101,7 @@ impl Node {
                 let i: usize = h.parse().map_err(|_| "bad height")?;
                 let b = c.blocks.get(i).ok_or("no such block")?;
                 let mut out = format!("height {i}\nhash {}\nprev {}\ntime {}\nbits {:#010x}\nnonce {}\nstate_root {}\ntxs {}\n",
-                    hex(&c.hashes[i]), hex(&b.header.prev), b.header.time, b.header.bits, b.header.nonce, hex(&b.header.state_root), b.txs.len());
+                    hex(&b.header.hash()), hex(&b.header.prev), b.header.time, b.header.bits, b.header.nonce, hex(&b.header.state_root), b.txs.len());
                 for t in &b.txs {
                     if let Tx::Coinbase { payee, .. } = t {
                         // the subsidy is fixed by height; the full amount (subsidy + fees) comes from the payee's recent history
@@ -223,9 +223,15 @@ impl Node {
             }
             ("POST", ["tx"]) => {
                 drop(st);
-                let raw = unhex(body).ok_or("bad hex")?;
-                let t = Tx::decode(&mut R::new(&raw))?;
-                self.submit_tx(t, None).map(|_| "ok".to_string())
+                // one transaction (reply "ok" or an error), or several, one per line, queued together so they land
+                // in the same block (reply: one "ok" or reason per line)
+                let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                if lines.len() > CHECK_MAX { return Err("too many transactions in one request"); }
+                let mut txs = Vec::with_capacity(lines.len());
+                for line in &lines { txs.push(Tx::decode(&mut R::new(&unhex(line).ok_or("bad hex")?))?); }
+                if txs.len() == 1 { return self.submit_tx(txs.remove(0), None).map(|_| "ok".to_string()); }
+                if txs.is_empty() { return Err("no transaction"); }
+                Ok(self.submit_txs(txs, None).into_iter().map(|r| r.map_or_else(|e| e.to_string(), |_| "ok".to_string())).collect::<Vec<_>>().join("\n"))
             }
             ("POST", ["check"]) => {
                 drop(st);

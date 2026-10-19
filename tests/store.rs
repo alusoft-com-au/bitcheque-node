@@ -203,3 +203,42 @@ fn host_store_restore_and_reorg() {
     let ok = Store::open_host(p.clone(), &g, host_io(), Some(&fresh), &h2, 100, host_snap).unwrap();
     assert_eq!((ok.chain.height(), ok.chain.tip()), (sh2, alt.hashes[sh2 as usize]));
 }
+
+/// The edge node keeps only the last HOST_KEEP headers in memory: the window slides as the chain grows, a restart
+/// needs only that tail, a shallow reorg still works, and a reorg below the window is refused.
+#[test]
+fn host_store_keeps_a_header_window() {
+    use bitcheque::store::HOST_KEEP;
+    DB.with(|d| d.borrow_mut().clear()); SNAP.with(|s| *s.borrow_mut() = None);
+    let p = params();
+    let t0 = now() - 10_000_000;
+    let g = Chain::genesis(&p, t0, b"window test");
+    let mut maker = Chain::new(p.clone(), &g).unwrap();
+    let mut st = Store::open_host(p.clone(), &g, host_io(), None, &[], 100, host_snap).unwrap();
+    let total = HOST_KEEP as u32 + 700;
+    for _ in 0..total { let b = maker.make_block(maker.headers.last().unwrap().time + 600, 0, vec![]).unwrap(); maker.add(&b, now()).unwrap(); st.accept(&b, now()).unwrap(); }
+    assert_eq!((st.chain.height(), st.chain.tip()), (total, maker.tip()));
+    assert!(st.chain.headers.len() <= HOST_KEEP + HOST_KEEP / 4 && st.chain.base > 0, "only a window of headers in memory");
+    assert_eq!(st.chain.hash_at(total - 10), Some(maker.hashes[(total - 10) as usize]));
+    assert_eq!(st.chain.hash_at(5), None);
+    assert_eq!(st.chain.blocks.get(5).unwrap(), maker.blocks.get(5).unwrap(), "old blocks still come from the host");
+
+    // restart from the snapshot with just the last HOST_KEEP headers
+    let snap = SNAP.with(|s| s.borrow().clone()).unwrap();
+    let sh = u32::from_le_bytes(snap[4..8].try_into().unwrap());
+    let tail: Vec<u8> = (sh as usize + 1 - HOST_KEEP..=sh as usize).flat_map(|h| host_get(h).unwrap()[..112].to_vec()).collect();
+    let mut r = Store::open_host(p.clone(), &g, host_io(), Some(&snap), &tail, 100, host_snap).unwrap();
+    assert_eq!((r.chain.height(), r.chain.headers.len()), (sh, HOST_KEEP), "restored from a tail of headers");
+    for h in sh + 1..=total { r.accept(&bitcheque::block::Block::decode(&host_get(h as usize).unwrap()).unwrap(), now()).unwrap(); }
+    assert_eq!((r.chain.tip(), r.chain.state.root()), (maker.tip(), maker.state.root()));
+
+    // a heavier branch forking 30 blocks back reorgs; one forking below the window is refused
+    let fork_at = |h: u32| { let mut c = Chain::new(p.clone(), &g).unwrap(); for k in 1..=h { c.add(&maker.blocks.get(k as usize).unwrap(), now()).unwrap(); } c };
+    let mut alt = fork_at(total - 30);
+    for _ in 0..40 { let b = alt.make_block(alt.headers.last().unwrap().time + 601, 0, vec![]).unwrap(); alt.add(&b, now()).unwrap(); let _ = r.accept(&b, now()); }
+    assert_eq!(r.chain.tip(), alt.tip(), "a shallow reorg inside the window");
+    let mut deep = fork_at(10);
+    let b = deep.make_block(deep.headers.last().unwrap().time + 601, 0, vec![]).unwrap(); deep.add(&b, now()).unwrap();
+    assert!(r.accept(&b, now()).is_err(), "a branch from below the window is refused");
+    assert_eq!(r.chain.tip(), alt.tip());
+}

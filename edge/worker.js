@@ -15,12 +15,13 @@ const SYNC_MS = 60_000;          // between wakes
 const SNAP_EVERY = 100;          // blocks between state snapshots (a cold start replays fewer than this)
 const MAX_PER_WAKE = 500;        // blocks fetched in one wake
 const HDR_CHUNK = 1000;          // headers per database row (fewer rows read on a cold start)
+const HDR_KEEP = 2000;           // headers handed to the node on a cold start (it keeps this many: store::HOST_KEEP)
 const PART = 1_000_000;          // snapshot bytes per row (rows hold at most 2 MB)
 const QUIET_S = 50;              // the backup miner mines when no block has come for this long: with nobody else
                                  // mining it finds one each wake, about one a minute (the block target)
 const MINE_MS = 3000;            // at most this long per wake (the floor is ~2^19 hashes: about a second here)
 const MINE_TRIES = 50_000;       // nonces per call into the wasm, between clock checks
-const CHAIN_VERSION = '3';        // bump to reset the network: each region forgets its chain and starts from block 0
+const CHAIN_VERSION = '4';        // bump to reset the network: each region forgets its chain and starts from block 0
 const FALLBACK_S = 120;          // each further region in MINE_REGIONS waits this much longer (if the first is down)
 const POOL_MAX = 1000;           // waiting transactions kept in the database across unloads (all offered again on load)
 const FRESH = new Set(['height', 'tip', 'template']);   // miners and the status page need these nearly fresh
@@ -71,7 +72,7 @@ export class EdgeNode extends DurableObject {
     const parts = this.sql.exec('SELECT data FROM snap ORDER BY part').toArray().map(r => new Uint8Array(r.data));
     const snap = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)); parts.reduce((o, p) => (snap.set(p, o), o + p.length), 0);
     const sh = snap.length >= 8 ? new DataView(snap.buffer).getUint32(4, true) : 0;
-    const hdr = this.headers(sh);
+    const hdr = this.headers(sh, HDR_KEEP);
     const io = new Uint8Array(4 + snap.length + hdr.length);
     new DataView(io.buffer).setUint32(0, snap.length, true); io.set(snap, 4); io.set(hdr, 4 + snap.length);
     this.put(io);
@@ -80,9 +81,12 @@ export class EdgeNode extends DurableObject {
     this.trim();
     // the mempool: Cloudflare unloads an idle object between wakes, so waiting transactions are kept in the database
     // and offered again, oldest first. One the chain now refuses (mined, or no longer valid) is dropped.
+    // A row may hold a batch (one transaction per line, sent together so they share a block): it is offered again
+    // as a batch, and kept while any of it is still accepted.
     for (const r of this.sql.exec('SELECT id, tx FROM pool ORDER BY id').toArray()) {
       const [code, why] = this.rpc('POST', '/tx', r.tx);
-      if (code !== 200 && why.trim() !== 'already in mempool') this.sql.exec('DELETE FROM pool WHERE id = ?', r.id);
+      const live = why.trim().split('\n').some(x => x === 'ok' || x === 'already in mempool');
+      if (!(code === 200 && live) && why.trim() !== 'already in mempool') this.sql.exec('DELETE FROM pool WHERE id = ?', r.id);
     }
     return x;
   }
@@ -93,11 +97,13 @@ export class EdgeNode extends DurableObject {
     if (old) row.set(new Uint8Array(old.data)); row.set(b, at);
     this.sql.exec('INSERT OR REPLACE INTO headers VALUES (?, ?)', c, row);
   }
-  headers(k) {     // the headers of blocks 1..k, concatenated
-    const out = new Uint8Array(k * 112);
-    for (const r of this.sql.exec('SELECT chunk, data FROM headers WHERE chunk <= ? ORDER BY chunk', Math.floor((k - 1) / HDR_CHUNK))) {
-      const d = new Uint8Array(r.data), at = r.chunk * HDR_CHUNK * 112;
-      out.set(d.subarray(0, Math.min(d.length, out.length - at)), at);
+  headers(k, n) {  // the headers of the last n blocks up to k (blocks max(1, k-n+1) ..= k), concatenated
+    if (k < 1) return new Uint8Array(0);
+    const from = Math.max(1, k - n + 1), out = new Uint8Array((k - from + 1) * 112);
+    for (const r of this.sql.exec('SELECT chunk, data FROM headers WHERE chunk >= ? AND chunk <= ? ORDER BY chunk', Math.floor((from - 1) / HDR_CHUNK), Math.floor((k - 1) / HDR_CHUNK))) {
+      const d = new Uint8Array(r.data), at = (r.chunk * HDR_CHUNK - (from - 1)) * 112;   // where this row starts, relative to block `from`
+      const src = Math.max(0, -at), dst = Math.max(0, at), len = Math.min(d.length - src, out.length - dst);
+      if (len > 0) out.set(d.subarray(src, src + len), dst);
     }
     return out;
   }
@@ -178,7 +184,10 @@ export class EdgeNode extends DurableObject {
     const body = req.method === 'POST' ? await req.text() : '';
     const [code, reply] = this.rpc(req.method, url.pathname, body);
     if (req.method === 'POST' && url.pathname === '/tx' && code === 200) {
-      this.sql.exec('INSERT OR IGNORE INTO pool (tx) VALUES (?)', body.trim());
+      // keep what was accepted (for a batch, the lines whose result is "ok"), together, as one row
+      const lines = body.trim().split(/\s*\n\s*/), res = reply.trim().split('\n');
+      const ok = lines.length === 1 ? lines : lines.filter((_, i) => res[i] === 'ok');
+      if (ok.length) this.sql.exec('INSERT OR IGNORE INTO pool (tx) VALUES (?)', ok.join('\n'));
       this.sql.exec('DELETE FROM pool WHERE id <= (SELECT MAX(id) FROM pool) - ?', POOL_MAX);
     }
     // a new transaction or a newly mined block goes on to the other regions and upstream nodes at once

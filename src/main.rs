@@ -67,7 +67,12 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
         Ok(http(&rpc, "GET", &format!("/id/{id}"), "")?.lines().filter_map(|l| l.split_once(' ').map(|(k, v)| (k.to_string(), v.to_string()))).collect())
     };
     let field = |a: &[(String, String)], k: &str| a.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
-    let post = |t: &bitcheque::tx::Tx| http(&rpc, "POST", "/tx", &hex(&t.encode()));
+    // everything a command sends goes in one request, so it all lands in the same block (a registration with its
+    // cheque 0, or a cheque's 18 pieces). A batch already on the chain is refused as a duplicate, which is fine.
+    let post_all = |txs: &[bitcheque::tx::Tx]| -> Result<(), String> {
+        let reply = http(&rpc, "POST", "/tx", &txs.iter().map(|t| hex(&t.encode())).collect::<Vec<_>>().join("\n"))?;
+        match reply.lines().find(|l| !matches!(l.trim(), "ok" | "already in mempool" | "batch overlaps")) { None => Ok(()), Some(e) => Err(format!("node refused: {e}")) }
+    };
     if cmd == "pieces" {
         let cheque: u16 = opt("--cheque").ok_or("--cheque N needed")?.parse().map_err(|_| "bad --cheque")?;
         let d = opt("--digits").ok_or("--digits needed")?;
@@ -92,8 +97,9 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
             let limbs: Vec<u64> = http(&rpc, "GET", "/regtarget", "")?.split_whitespace().map(|w| u64::from_str_radix(w, 16).unwrap_or(0)).collect();
             let target = U256(limbs.try_into().map_err(|_| "bad regtarget")?);
             let regs = book.registrations(first, first + cheques - 1);
-            for reg in &regs { post(&mine_registration(reg.clone(), target))?; } // each batch of 16 pays its own proof of work
-            if cmd == "register" { for piece in book.sign(0, &Message::new(0, 0, 0, 0)) { post(&piece)?; } } // honesty check: cheque 0, zero coins, to nobody
+            let mut txs: Vec<_> = regs.iter().map(|reg| mine_registration(reg.clone(), target)).collect(); // each batch of 16 pays its own proof of work
+            if cmd == "register" { txs.extend(book.sign(0, &Message::new(0, 0, 0, 0))); } // honesty check: cheque 0, zero coins, to nobody
+            post_all(&txs)?;
             let last = ((first / BATCH + regs.len() as u32) * BATCH).min(size) - 1;
             println!("id {id}\ncheques {first}-{last} registered{}", if cmd == "register" { ", honesty check (cheque 0) sent" } else { "" });
         }
@@ -129,7 +135,7 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
             if cmd == "send" && cheque as u32 == size - 1 && opt("--last").is_none() {
                 return Err(format!("cheque {cheque} is the last one in this book: keep it for `wallet sweep --to <new book>`, or pass --last to spend it anyway"));
             }
-            for piece in &pieces { post(piece)?; }
+            post_all(&pieces)?;
             if cmd == "sweep" { println!("cheque {cheque} sent: {} sweeps the whole balance to {to}, fee tier {tier}", msg.display()); }
             else { println!("cheque {cheque} sent: {} to {to}, {} coins, fee tier {tier}", msg.display(), msg.amount().unwrap_or(0) as f64 / COIN as f64); }
         }
