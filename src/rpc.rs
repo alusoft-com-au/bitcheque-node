@@ -7,7 +7,7 @@
 //!   GET  /history/<number>  (newest first, the last block::HISTORY_CAP events: height kind key=value...; a cheque to yourself is listed as receive, then send)
 //!   GET  /stats   (lifetime totals, and the reward schedule: reward of the next block, base, halving interval, next halving, maturity)
 //!   GET  /mempool (count, then one line per waiting transaction in the /summary format, then a cheque line per waiting cheque whose recipient is readable)
-//!   GET  /top[/N]  (richest N accounts, default 50: number balance book_size last_cheque unspent)
+//!   GET  /top[/N]  (richest N accounts, default 50: number balance book_size last_cheque unspent pending)
 //!   GET  /template/<number>  (hex: the next block to mine, reward to that number (0 burns it), nonce 0)
 //!   POST /tx  (body: hex-encoded tx, or several, one per line, queued together: one result per line)   POST /block (body: hex-encoded block, mined from a template)
 //!   POST /check (body: one hex tx per line; dry run, nothing stored)
@@ -207,7 +207,9 @@ impl Node {
                 let minted: u64 = (1..=c.height()).map(|h| c.params.block_reward(h)).sum();
                 let max_supply = c.params.max_supply();
                 let head = format!("height {}\naccounts {}\ntotal {total}\npending {pending}\nminted {minted}\nmax_supply {max_supply}\n", c.height(), v.len());
-                let rows: Vec<String> = v.iter().filter(|a| is_final(c, a.number)).take(200).map(|a| format!("{} {} {} {} {}\n", a.number, a.balance, a.book_size, a.nonce.map_or(-1, |x| x as i64), a.commits.len())).collect();
+                let mut pend: BTreeMap<u32, u64> = BTreeMap::new();   // rewards not yet spendable, per number (at most reward_maturity entries)
+                for (n, amt) in c.state.pending.values().flatten() { *pend.entry(*n).or_default() += amt; }
+                let rows: Vec<String> = v.iter().filter(|a| is_final(c, a.number)).take(200).map(|a| format!("{} {} {} {} {} {}\n", a.number, a.balance, a.book_size, a.nonce.map_or(-1, |x| x as i64), a.commits.len(), pend.get(&a.number).copied().unwrap_or(0))).collect();
                 let out = head.clone() + &rows[..n.min(rows.len())].concat();
                 *self.top_cache.lock().unwrap() = Some((c.height(), head, rows));
                 Ok(out)
@@ -255,6 +257,8 @@ impl Node {
 
 /// A number is published only once it is final (number_maturity blocks deep): until then a replaced
 /// block could still hand it to another book, so nobody should see it, share it or write it down.
+/// Block rewards credited to `n` but not yet spendable (they join the balance reward_maturity blocks after their block).
+fn pending_of(c: &crate::block::Chain, n: u32) -> u64 { c.state.pending.values().flatten().filter(|(p, _)| *p == n).map(|(_, amt)| amt).sum() }
 fn is_final(c: &crate::block::Chain, n: u32) -> bool { c.state.numbers.get(&n).is_some_and(|(_, at)| at + c.params.number_maturity <= c.height()) }
 
 fn account_text(c: &crate::block::Chain, id: &[u8]) -> String {
@@ -263,8 +267,8 @@ fn account_text(c: &crate::block::Chain, id: &[u8]) -> String {
     let ready_at = c.state.numbers.get(&a.number).map_or(0, |(_, at)| at + c.params.number_maturity);
     let mature = ready_at <= c.height();
     let number = if mature { format!("number {}\n", a.number) } else { String::new() };
-    format!("id {}\n{number}balance {}\nnonce {}\nbook_size {}\nunspent {}\nfunded {}\nmature {}\nready_at {}\nopen {}", hex(id), a.balance,
-            a.nonce.map_or("none".into(), |x| x.to_string()), a.book_size, a.commits.keys().map(|k| k.to_string()).collect::<Vec<_>>().join(","),
+    format!("id {}\n{number}balance {}\npending {}\nnonce {}\nbook_size {}\nunspent {}\nfunded {}\nmature {}\nready_at {}\nopen {}", hex(id), a.balance,
+            pending_of(c, a.number), a.nonce.map_or("none".into(), |x| x.to_string()), a.book_size, a.commits.keys().map(|k| k.to_string()).collect::<Vec<_>>().join(","),
             a.funded, mature, ready_at, a.open.as_ref().map_or("none".into(), |o| o.n.to_string()))
 }
 

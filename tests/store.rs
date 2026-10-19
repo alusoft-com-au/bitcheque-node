@@ -80,6 +80,9 @@ fn proof_and_rpc() {
     let http = |req: String| { let mut s = TcpStream::connect(addr).unwrap(); s.write_all(req.as_bytes()).unwrap(); let mut r = String::new(); s.read_to_string(&mut r).unwrap(); r.split("\r\n\r\n").nth(1).unwrap().to_string() };
     assert_eq!(http("GET /height HTTP/1.0\r\n\r\n".into()), "3");
     assert!(http("GET /account/1 HTTP/1.0\r\n\r\n".into()).contains(&format!("balance {}", p.reward_base)));
+    // the height-3 reward is not spendable yet (reward_maturity 1): it shows as pending, here and in /top
+    assert!(http("GET /account/1 HTTP/1.0\r\n\r\n".into()).contains(&format!("\npending {}\n", p.reward_base)));
+    assert!(http("GET /top HTTP/1.0\r\n\r\n".into()).lines().any(|l| l.starts_with("1 ") && l.ends_with(&format!(" {}", p.reward_base))));
     let tx = m.sign(0, &Message::new(0, 1000, 2, 1)); // cheque to number 0
     let body = bitcheque::crypto::hex(&tx[0].encode());
     assert_eq!(http(format!("POST /tx HTTP/1.0\r\nContent-Length: {}\r\n\r\n{}", body.len(), body)), "ok");
