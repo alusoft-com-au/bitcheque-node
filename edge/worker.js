@@ -18,7 +18,7 @@ const QUIET_S = 120;             // the backup miner starts after this long with
 const MINE_MS = 3000;            // at most this long per wake (the floor is ~2^19 hashes: about a second here)
 const MINE_TRIES = 50_000;       // nonces per call into the wasm, between clock checks
 const POOL_MAX = 5000;           // waiting transactions kept in the database across unloads
-const NOT_CACHED = new Set(['tip', 'template']);   // miners need these fresh
+const NOT_CACHED = new Set(['height', 'tip', 'template']);   // miners and the status page need these fresh
 const CACHE_S = 15;              // seconds the front worker caches a GET reply (status pages poll every 10 s)
 // the RPC's first path segments: anything else is refused here, without waking a Durable Object
 const ROUTES = new Set(['height', 'peers', 'addrs', 'tip', 'block', 'summary', 'account', 'id', 'lookup', 'proof', 'regtarget', 'history', 'stats', 'mempool', 'top', 'template', 'tx', 'check', 'edge']);
