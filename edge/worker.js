@@ -128,6 +128,8 @@ export class EdgeNode extends DurableObject {
     if (!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now() + 1000);
     await this.node();
     if (url.pathname === '/edge') return text(`region ${this.meta('region')}\nheight ${this.x.height()}\nupstreams ${this.upstreams().join(' ')}\nlast_sync ${this.meta('last_sync') ?? 'never'}\n`);
+    // an edge node has no TCP peers: its peers are the other regions and upstream nodes it syncs with
+    if (url.pathname === '/peers') return text(String(this.upstreams().length));
     const body = req.method === 'POST' ? await req.text() : '';
     const [code, reply] = this.rpc(req.method, url.pathname, body);
     // a new transaction or a newly mined block goes on to the other regions and upstream nodes at once
