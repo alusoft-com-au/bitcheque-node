@@ -13,7 +13,9 @@ const SNAP_EVERY = 100;          // blocks between state snapshots (a cold start
 const MAX_PER_WAKE = 500;        // blocks fetched in one wake
 const HDR_CHUNK = 1000;          // headers per database row (fewer rows read on a cold start)
 const PART = 1_000_000;          // snapshot bytes per row (rows hold at most 2 MB)
-const CACHE_S = 5;               // seconds the front worker caches a GET reply
+const CACHE_S = 15;              // seconds the front worker caches a GET reply (status pages poll every 10 s)
+// the RPC's first path segments: anything else is refused here, without waking a Durable Object
+const ROUTES = new Set(['height', 'peers', 'addrs', 'tip', 'block', 'summary', 'account', 'id', 'lookup', 'proof', 'regtarget', 'history', 'stats', 'mempool', 'top', 'template', 'tx', 'check', 'edge']);
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
 const enc = new TextEncoder(), dec = new TextDecoder();
 const text = (body, status = 200, extra = {}) => new Response(body, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8', ...CORS, ...extra } });
@@ -128,8 +130,6 @@ export class EdgeNode extends DurableObject {
     if (!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now() + 1000);
     await this.node();
     if (url.pathname === '/edge') return text(`region ${this.meta('region')}\nheight ${this.x.height()}\nupstreams ${this.upstreams().join(' ')}\nlast_sync ${this.meta('last_sync') ?? 'never'}\n`);
-    // an edge node has no TCP peers: its peers are the other regions and upstream nodes it syncs with
-    if (url.pathname === '/peers') return text(String(this.upstreams().length));
     const body = req.method === 'POST' ? await req.text() : '';
     const [code, reply] = this.rpc(req.method, url.pathname, body);
     // a new transaction or a newly mined block goes on to the other regions and upstream nodes at once
@@ -148,6 +148,9 @@ export default {
     const region = local ? url.searchParams.get('node') || 'ap' : url.hostname.match(/^node-([a-z]+)\./)?.[1];
     if (!REGIONS[region]) return text('unknown node', 404);
     if (req.method === 'OPTIONS') return new Response(null, { headers: CORS });
+    if (!ROUTES.has(url.pathname.split('/')[1])) return text('unknown route', 404);
+    // an edge node has no TCP peers: its peers are the other regions and the upstream nodes it syncs with
+    if (url.pathname === '/peers') return text(String(Object.keys(REGIONS).length - 1 + (env.UPSTREAMS || '').split(',').filter(s => s.trim()).length));
     const stub = env.NODE.get(env.NODE.idFromName(region), { locationHint: REGIONS[region] });
     const inner = new URL(url.pathname + `?region=${region}`, 'https://edge');
     if (req.method !== 'GET') return stub.fetch(inner, { method: req.method, body: await req.text() });
