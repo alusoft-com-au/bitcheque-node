@@ -1,7 +1,7 @@
 # Bitcheque node
 
 Bitcheque is an experimental proof-of-work blockchain (SHA-256d, 60-second blocks) where coins move with
-hand-copied cheques printed once, offline, from a hash-based cheque book. Rust, no dependencies.
+hand-copied cheques printed offline from a hash-based cheque book (up to 256 cheques, printed as needed). Rust, no dependencies.
 
 - `DESIGN.md`: every rule and parameter, and why.
 - `src/`: the node, wallet and RPC (`cargo build --release`, binary `target/release/bitcheque`).
@@ -13,6 +13,7 @@ hand-copied cheques printed once, offline, from a hash-based cheque book. Rust, 
   each wakes every minute, pulls new blocks from upstream nodes' RPC, keeps them in SQLite, and forwards
   posted transactions upstream. `edge/build.sh`, then `npx wrangler deploy` in `edge/`.
 
-The official website lives in [bitcheque-website](https://github.com/alusoft-com-au/bitcheque-website).
+The official website lives in [bitcheque-website](https://github.com/alusoft-com-au/bitcheque-website); the offline
+page for printing more cheques of a book in [bitcheque-print](https://github.com/alusoft-com-au/bitcheque-print).
 
 This is an experimental research network that may change or be reset. MIT licence.

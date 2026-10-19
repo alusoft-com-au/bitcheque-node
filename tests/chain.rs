@@ -162,3 +162,42 @@ fn registration_target_tightens_and_loosens() {
     s.begin_block(&p, 3 * p.reg_pow_window);
     assert_eq!(s.reg_target, p.reg_pow_target, "never easier than the genesis target");
 }
+
+/// A 256-cheque book registers 16 cheques at a time, each batch paying its own proof of work, on one account number.
+#[test]
+fn a_book_grows_a_batch_at_a_time() {
+    let p = params();
+    let g = Chain::genesis(&p, 1000, b"test");
+    let mut net = Net { chain: Chain::new(p.clone(), &g).unwrap(), t: 1000 };
+    let book = Book { salt: [3; 16], n256: false, book_size: bitcheque::wallet::BOOK_SIZE, domains: vec![Domain([4; 32])] };
+    let first = book.registrations(0, 11);
+    assert_eq!(first.len(), 1);
+    let mut txs = vec![mine_registration(first[0].clone(), p.reg_pow_target)];
+    txs.extend(book.sign(0, &Message::new(0, 0, 0, 0)));
+    net.mine(1, txs).unwrap();
+    let number = net.chain.state.accounts[&book.id()].number;
+    assert_eq!(net.chain.state.accounts[&book.id()].commits.len(), 15);
+
+    // cheques 16-40 need two more batches (16-31, 32-47); unpaid work is refused
+    let more = book.registrations(16, 40);
+    assert_eq!(more.len(), 2);
+    let mut unpaid = more[0].clone();
+    while U256::from_le_bytes(&unpaid.txid()) < p.reg_pow_target { if let Tx::RegisterBatch { pay: Payment::Pow(n), .. } = &mut unpaid { *n += 1 } }
+    assert_eq!(net.chain.state.clone().apply(&p, &unpaid), Err("registration pow insufficient"));
+    net.mine(1, more.iter().map(|t| mine_registration(t.clone(), p.reg_pow_target)).collect()).unwrap();
+    let a = &net.chain.state.accounts[&book.id()];
+    assert_eq!((a.number, a.commits.len()), (number, 15 + 32));
+
+    // the same batch twice, and a batch past the 16-cheque limit, are refused
+    assert_eq!(net.chain.state.clone().apply(&p, &mine_registration(more[0].clone(), p.reg_pow_target)), Err("batch overlaps"));
+    let mut big = book.registrations(64, 64).remove(0);
+    if let Tx::RegisterBatch { batch, .. } = &mut big { batch.count = 32; }
+    assert_eq!(net.chain.state.clone().apply(&p, &mine_registration(big, p.reg_pow_target)), Err("batch not aligned"));
+
+    // a cheque from a later batch spends like any other, and the last batch ends at cheque 255
+    net.mine(1, book.sign(40, &Message::new(0, 0, 0, 0))).unwrap();
+    assert_eq!(net.chain.state.accounts[&book.id()].nonce, Some(40));
+    let last = book.registrations(240, 300);
+    assert_eq!(last.len(), 1);
+    if let Tx::RegisterBatch { batch, .. } = &last[0] { assert_eq!((batch.start, batch.cheques.len()), (240, 16)); } else { panic!() }
+}

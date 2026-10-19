@@ -3,10 +3,10 @@
 //! bitcheque mine --rpc ADDR --to NUMBER [--threads N]   (mines against any node's RPC, e.g. node-ap.bitcheque.org:80; 0 burns the reward)
 //!   With no --peer a node dials the compiled-in seeds, then keeps about 8 connections from the addresses peers share.
 //!   --listen defaults to 0.0.0.0:8730 (mainnet) or 0.0.0.0:8731 (testnet); --advertise is the address others can reach you on.
-//! bitcheque wallet new | info|register|send|sweep --seed HEX --rpc ADDR [--size CHEQUES] [--to NUMBER --amount COINS [--fee TIER]]
-//! bitcheque wallet pieces --seed HEX [--size CHEQUES] --cheque N --digits D18   (raw pieces as hex, no checks: for tests)
+//! bitcheque wallet new | info|register|more|send|sweep --seed HEX --rpc ADDR [--cheques N] [--to NUMBER --amount COINS [--fee TIER]]
+//! bitcheque wallet pieces --seed HEX --cheque N --digits D18   (raw pieces as hex, no checks: for tests)
 use bitcheque::{block::Chain, crypto::{hex, sha256}, message::Message, net::Node, params::{Params, COIN, GENESIS_MESSAGE as MESSAGE, LAUNCH_TIME, LOCAL_TIME, TESTNET_TIME}, rpc::unhex, store::Store,
-                tx::Payment, u256::U256, wallet::{mine_registration, Book, Domain}};
+                u256::U256, wallet::{mine_registration, Book, Domain, BATCH, BOOK_SIZE}};
 
 
 fn main() {
@@ -39,12 +39,13 @@ fn main() {
         }
         Some("mine") => if let Err(e) = mine(&opt) { eprintln!("error: {e}"); std::process::exit(1) },
         Some("wallet") => if let Err(e) = wallet(&args, &opt) { eprintln!("error: {e}"); std::process::exit(1) },
-        _ => eprintln!("usage: bitcheque genesis [--mainnet|--local] | bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR]\n       bitcheque mine --rpc ADDR --to NUMBER [--threads N]\n       bitcheque wallet new | info|register|send|sweep --seed HEX --rpc ADDR [--size CHEQUES] [--to NUMBER --amount COINS [--fee TIER]]"),
+        _ => eprintln!("usage: bitcheque genesis [--mainnet|--local] | bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR]\n       bitcheque mine --rpc ADDR --to NUMBER [--threads N]\n       bitcheque wallet new | info|register|more|send|sweep --seed HEX --rpc ADDR [--cheques N] [--to NUMBER --amount COINS [--fee TIER]]"),
     }
 }
 
-/// A software wallet for one book from one seed: 11 cheques like a printed book, or up to 1,024 with --size
-/// (miners and other busy accounts). The book salt is derived from the seed, so seed + size recreate the book. Talks to a node's RPC; keeps no files.
+/// A software wallet for one book from one seed: the same 256-cheque book the website prints, so a seed works in both.
+/// `register` registers the first cheques (16 by default, `--cheques` for more), `more` the next ones, 16 per proof of work.
+/// The book salt is derived from the seed, so the seed alone recreates the book. Talks to a node's RPC; keeps no files.
 fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     let cmd = args.get(2).map(String::as_str).unwrap_or("");
     if cmd == "new" {
@@ -57,8 +58,9 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
     let rpc = opt("--rpc").unwrap_or_default();
     if rpc.is_empty() && cmd != "pieces" { return Err("--rpc ADDR needed".into()); }
     let salt: [u8; 16] = sha256(&[b"bitcheque/salt".as_slice(), &seed].concat())[..16].try_into().unwrap();
-    let size: u32 = opt("--size").map_or(Ok(11), |v| v.parse()).map_err(|_| "bad --size")?;
-    if !(11..=1024).contains(&size) { return Err("--size must be 11 to 1024".into()); }
+    let size = BOOK_SIZE;
+    let cheques: u32 = opt("--cheques").map_or(Ok(BATCH), |v| v.parse()).map_err(|_| "bad --cheques")?;
+    if !(1..=size).contains(&cheques) { return Err(format!("--cheques must be 1 to {size}")); }
     let book = Book { salt, n256: false, book_size: size, domains: vec![Domain(seed)] };
     let id = hex(&book.id());
     let account = || -> Result<Vec<(String, String)>, String> {
@@ -79,13 +81,21 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
             Ok(a) => { for (k, v) in a { println!("{k} {v}"); } }
             Err(_) => println!("id {id}\nnot registered"),
         },
-        "register" => {
+        "register" | "more" => {
+            // `more` starts after the highest cheque the chain knows (unspent or used), at a batch boundary
+            let first = if cmd == "register" { 0 } else {
+                let a = account()?;
+                let top = field(&a, "unspent").split(',').chain([field(&a, "nonce").as_str()]).filter_map(|x| x.parse::<u32>().ok()).max().ok_or("account has no cheques")?;
+                (top / BATCH + 1) * BATCH
+            };
+            if first >= size { return Err("every cheque of this book is registered already".into()); }
             let limbs: Vec<u64> = http(&rpc, "GET", "/regtarget", "")?.split_whitespace().map(|w| u64::from_str_radix(w, 16).unwrap_or(0)).collect();
             let target = U256(limbs.try_into().map_err(|_| "bad regtarget")?);
-            let reg = mine_registration(book.register(0, size.next_power_of_two(), Payment::Pow(0)), target); // one batch, power-of-two aligned
-            post(&reg)?;
-            for piece in book.sign(0, &Message::new(0, 0, 0, 0)) { post(&piece)?; } // honesty check: cheque 0, zero coins, to nobody
-            println!("id {id}\nregistration and honesty check (cheque 0) sent");
+            let regs = book.registrations(first, first + cheques - 1);
+            for reg in &regs { post(&mine_registration(reg.clone(), target))?; } // each batch of 16 pays its own proof of work
+            if cmd == "register" { for piece in book.sign(0, &Message::new(0, 0, 0, 0)) { post(&piece)?; } } // honesty check: cheque 0, zero coins, to nobody
+            let last = ((first / BATCH + regs.len() as u32) * BATCH).min(size) - 1;
+            println!("id {id}\ncheques {first}-{last} registered{}", if cmd == "register" { ", honesty check (cheque 0) sent" } else { "" });
         }
         "send" | "sweep" => {
             let to: u32 = opt("--to").ok_or("--to NUMBER needed")?.parse().map_err(|_| "bad --to")?;
@@ -123,7 +133,7 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
             if cmd == "sweep" { println!("cheque {cheque} sent: {} sweeps the whole balance to {to}, fee tier {tier}", msg.display()); }
             else { println!("cheque {cheque} sent: {} to {to}, {} coins, fee tier {tier}", msg.display(), msg.amount().unwrap_or(0) as f64 / COIN as f64); }
         }
-        _ => return Err("wallet commands: new, info, register, send, sweep, pieces".into()),
+        _ => return Err("wallet commands: new, info, register, more, send, sweep, pieces".into()),
     }
     Ok(())
 }

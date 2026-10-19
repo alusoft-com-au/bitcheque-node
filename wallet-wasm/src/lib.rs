@@ -5,7 +5,7 @@ use bitcheque::crypto::{hex, sha256};
 use bitcheque::message::Message;
 use bitcheque::tx::Payment;
 use bitcheque::u256::U256;
-use bitcheque::wallet::{Book, Domain};
+use bitcheque::wallet::{Book, Domain, BOOK_SIZE};
 
 mod qr;
 mod qrread;
@@ -25,23 +25,29 @@ pub extern "C" fn io_ptr() -> *const u8 { io().as_ptr() }
 pub extern "C" fn io_len() -> usize { io().len() }
 fn out(s: String) -> usize { let b = io(); *b = s.into_bytes(); b.len() }
 
-/// The standard book for a 32-byte seed: 12 cheques, salt from the seed (as `bitcheque wallet --size 12`).
-/// Cheque 0 is the honesty check sent with the registration and is never printed; cheques 1-11 are printed, 11 being the sweep.
+/// The standard book for a 32-byte seed: 256 cheques, salt from the seed (the same book as `bitcheque wallet`).
+/// Cheque 0 is the honesty check sent with the registration and is never printed. The rest are printed and
+/// registered 16 at a time, whenever the holder wants more.
 fn book(seed: &[u8]) -> Option<Book> {
     let seed: [u8; 32] = seed.try_into().ok()?;
     let salt: [u8; 16] = sha256(&[b"bitcheque/salt".as_slice(), &seed].concat())[..16].try_into().unwrap();
-    Some(Book { salt, n256: false, book_size: 12, domains: vec![Domain(seed)] })
+    Some(Book { salt, n256: false, book_size: BOOK_SIZE, domains: vec![Domain(seed)] })
 }
 
 /// io = seed (32 bytes) -> io = account id (hex). Returns its length, 0 on bad input.
 #[no_mangle]
 pub extern "C" fn account_id() -> usize { book(&io().clone()).map_or(0, |b| out(hex(&b.id()))) }
 
-/// io = seed (32) -> io = the registration with nonce 0, hex. It holds only public hashes, so it can be
-/// carried to an online computer and mined there without the seed.
+/// io = seed (32) || first cheque (2, LE) || last cheque (2, LE) -> io = the registrations covering those cheques,
+/// nonce 0, hex, one per line (16 cheques each; the one holding cheque 0 registers the book). They hold only
+/// public hashes, so they can be carried to an online computer and mined there without the seed.
 #[no_mangle]
-pub extern "C" fn reg_tx() -> usize {
-    book(&io().clone()).map_or(0, |b| out(hex(&b.register(0, 12u32.next_power_of_two(), Payment::Pow(0)).encode())))   // one batch, power-of-two aligned
+pub extern "C" fn reg_txs() -> usize {
+    let i = io().clone();
+    if i.len() != 36 { return 0; }
+    let (first, last) = (u16::from_le_bytes([i[32], i[33]]) as u32, u16::from_le_bytes([i[34], i[35]]) as u32);
+    if first > last || last >= BOOK_SIZE { return 0; }
+    book(&i[..32]).map_or(0, |b| out(b.registrations(first, last).iter().map(|t| hex(&t.encode())).collect::<Vec<_>>().join("\n")))
 }
 
 /// io = registration tx bytes || target (32, little-endian, as /regtarget) -> ready to mine. 1 on success.
@@ -50,7 +56,7 @@ pub extern "C" fn reg_prepare() -> usize {
     let i = io().clone();
     if i.len() < 64 + 8 { return 0; }
     let (enc, t) = i.split_at(i.len() - 32);
-    match bitcheque::tx::Tx::decode(&mut bitcheque::tx::R::new(enc)) { Ok(bitcheque::tx::Tx::RegisterBook { pay: Payment::Pow(_), .. }) => {}, _ => return 0 }
+    match bitcheque::tx::Tx::decode(&mut bitcheque::tx::R::new(enc)) { Ok(bitcheque::tx::Tx::RegisterBook { pay: Payment::Pow(_), .. } | bitcheque::tx::Tx::RegisterBatch { pay: Payment::Pow(_), .. }) => {}, _ => return 0 }
     let enc = enc.to_vec();
     let split = (enc.len() - 8) / 64 * 64;
     let mid = bitcheque::sha256::midstate(&enc[..split]);

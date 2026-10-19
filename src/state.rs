@@ -212,16 +212,21 @@ impl State {
                 self.accounts.insert(id, a);
                 Ok(0)
             }
-            Tx::RegisterBatch { account, batch } => {
+            Tx::RegisterBatch { account, batch, pay } => {
+                // more cheques for an existing book: paid by the same proof of work as a first registration,
+                // so every 16 cheques of state cost the same however they arrive
                 let a = self.accounts.get(account).ok_or("no such account")?;
                 if a.batches.contains_key(&batch.start) || a.batches.iter().any(|(&s, &(c, _))| batch.start < s + c && s < batch.start + batch.count) { return Err("batch overlaps"); }
-                if a.balance < p.renew_fee { return Err("insufficient balance for batch"); }
                 let cheques = Self::check_batch(&a.salt, id_m(account) as usize, id_n(account), a.book_size, &account[1..], batch, p)?;
+                let Payment::Pow(_) = pay;
+                if U256::from_le_bytes(&tx.txid()) >= self.reg_target { return Err("registration pow insufficient"); }
+                if self.reg_block_count >= p.reg_pow_per_block_cap { return Err("registration pow cap reached"); }
+                // ---- mutate ----
+                self.reg_block_count += 1; self.reg_window_count += 1;
                 let a = self.accounts.get_mut(account).unwrap();
-                a.balance -= p.renew_fee;
                 a.batches.insert(batch.start, (batch.count, height + p.batch_lifetime));
                 for (nn, c) in cheques { if a.nonce.map_or(true, |x| nn > x) { a.commits.insert(nn, Commits::new(c)); } }
-                Ok(p.renew_fee)
+                Ok(0)
             }
             Tx::Renew { account, start } => {
                 let a = self.accounts.get_mut(account).ok_or("no such account")?;

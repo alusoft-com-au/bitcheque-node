@@ -30,7 +30,7 @@ fn malformed_account_ids_are_refused_not_fatal() {
     // and one that bypasses the decoder is rejected, not a panic
     assert!(node.submit_tx(t, None).is_err());
     assert!(node.submit_tx(Tx::Renew { account: vec![0x13], start: 0 }, None).is_err());
-    assert!(node.submit_tx(Tx::RegisterBatch { account: vec![], batch: bitcheque::tx::Batch { start: 0, count: 1, cheques: vec![], path: vec![] } }, None).is_err());
+    assert!(node.submit_tx(Tx::RegisterBatch { account: vec![], batch: bitcheque::tx::Batch { start: 0, count: 1, cheques: vec![], path: vec![] }, pay: bitcheque::tx::Payment::Pow(0) }, None).is_err());
     mine(&node, 0).unwrap();   // still alive, locks not poisoned
     assert_eq!(node.height(), 1);
 }

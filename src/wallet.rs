@@ -15,6 +15,10 @@ impl Domain {
     pub fn cell(&self, n: usize, cheque: u16, col: u8, row: u8) -> Bytes { sha256(&[b"bitcheque/cell".as_slice(), &self.key(cheque), &[col, row]].concat())[..n].to_vec() }
 }
 
+/// Cheques per registration (`Params::max_batch`), and the size of every new book: it grows a batch at a time.
+pub const BATCH: u32 = 16;
+pub const BOOK_SIZE: u32 = 256;
+
 pub struct Book { pub salt: [u8; 16], pub n256: bool, pub book_size: u32, pub domains: Vec<Domain> }
 impl Book {
     pub fn n(&self) -> usize { if self.n256 { 32 } else { 16 } }
@@ -35,6 +39,19 @@ impl Book {
     pub fn register(&self, start: u32, count: u32, pay: Payment) -> Tx {
         Tx::RegisterBook { salt: self.salt, m: self.m(), n256: self.n256, book_size: self.book_size, root: self.root(), batch: self.batch(start, count), pay }
     }
+    /// Unmined registrations (nonce 0) covering cheques `first..=last` in batches of `BATCH`: the batch holding
+    /// cheque 0 registers the book, every later one adds to it. Leaves are derived once for all of them.
+    pub fn registrations(&self, first: u32, last: u32) -> Vec<Tx> {
+        let (leaves, n, root, id) = (self.leaves(), self.n(), self.root(), self.id());
+        let last = last.min(self.book_size - 1);
+        (first / BATCH..=last / BATCH).map(|k| {
+            let (start, end) = (k * BATCH, ((k + 1) * BATCH).min(self.book_size));
+            let batch = Batch { start, count: BATCH, cheques: (start..end).map(|i| self.shares(i as u16)).collect(),
+                                path: book::subtree_path(&self.salt, n, start, BATCH, &leaves, self.book_size) };
+            if start == 0 { Tx::RegisterBook { salt: self.salt, m: self.m(), n256: self.n256, book_size: self.book_size, root: root.clone(), batch, pay: Payment::Pow(0) } }
+            else { Tx::RegisterBatch { account: id.clone(), batch, pay: Payment::Pow(0) } }
+        }).collect()
+    }
     /// The 18 pieces of a cheque, payee columns first. Each carries every domain's cell.
     pub fn pieces(&self, cheque: u16, digits: &[u8; COLS]) -> Vec<Tx> {
         let id = self.id();
@@ -44,11 +61,11 @@ impl Book {
     pub fn sign(&self, cheque: u16, msg: &Message) -> Vec<Tx> { self.pieces(cheque, &msg.digits()) }
 }
 
-/// Grind the registration's PoW nonce until its txid is below `target`. The nonce is the last 8 bytes
+/// Grind a registration's (book or batch) PoW nonce until its txid is below `target`. The nonce is the last 8 bytes
 /// of the encoding, so everything before it is hashed once (SHA-256 midstate) and each try costs a few blocks.
 pub fn mine_registration(mut tx: Tx, target: U256) -> Tx {
     let mut enc = tx.encode();
-    if !matches!(tx, Tx::RegisterBook { pay: Payment::Pow(_), .. }) { return tx; }
+    if !matches!(tx, Tx::RegisterBook { .. } | Tx::RegisterBatch { .. }) { return tx; }
     let at = enc.len() - 8;
     let split = at / 64 * 64;
     let mid = crate::sha256::midstate(&enc[..split]);
@@ -59,7 +76,7 @@ pub fn mine_registration(mut tx: Tx, target: U256) -> Tx {
         if U256::from_le_bytes(&id) < target { break; }
         nonce = nonce.wrapping_add(1);
     }
-    if let Tx::RegisterBook { pay: Payment::Pow(n), .. } = &mut tx { *n = nonce }
+    if let Tx::RegisterBook { pay: Payment::Pow(n), .. } | Tx::RegisterBatch { pay: Payment::Pow(n), .. } = &mut tx { *n = nonce }
     debug_assert!(U256::from_le_bytes(&tx.txid()) < target);
     tx
 }

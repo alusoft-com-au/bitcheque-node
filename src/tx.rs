@@ -32,7 +32,7 @@ pub enum Payment { Pow(u64) }   // registrations are paid by proof of work only
 pub enum Tx {
     Coinbase { height: u32, payee: u32, message: Vec<u8> },
     RegisterBook { salt: [u8; 16], m: u8, n256: bool, book_size: u32, root: Bytes, batch: Batch, pay: Payment },
-    RegisterBatch { account: AccountId, batch: Batch },
+    RegisterBatch { account: AccountId, batch: Batch, pay: Payment },
     ChequePiece { account: AccountId, cheque: u16, column: u8, shares: Vec<Bytes> },
     Renew { account: AccountId, start: u32 },
 }
@@ -68,7 +68,7 @@ impl<'a> R<'a> {
     pub fn share(&mut self) -> Result<Vec<u8>, &'static str> { let k = self.u32()? as usize; if k > 32 { return Err("share too long"); } Ok(self.take(k)?.to_vec()) }
     pub fn batch(&mut self, m: usize) -> Result<Batch, &'static str> {
         let start = self.u32()?; let count = self.u32()?; let nch = self.u32()?;
-        if nch > 1024 { return Err("batch too large"); }
+        if nch > 256 { return Err("batch too large"); }
         let mut cheques = Vec::with_capacity(nch as usize);
         for _ in 0..nch {
             let mut ch = Vec::with_capacity(18);
@@ -92,7 +92,10 @@ impl Tx {
                 w.u8(1); w.0.extend_from_slice(salt); w.u8(*m); w.u8(*n256 as u8); w.u32(*book_size); w.bytes(root); w.batch(batch);
                 match pay { Payment::Pow(nonce) => { w.u8(0); w.u64(*nonce) } }
             }
-            Tx::RegisterBatch { account, batch } => { w.u8(2); w.bytes(account); w.batch(batch) }
+            Tx::RegisterBatch { account, batch, pay } => {
+                w.u8(2); w.bytes(account); w.batch(batch);
+                match pay { Payment::Pow(nonce) => { w.u8(0); w.u64(*nonce) } }
+            }
             Tx::ChequePiece { account, cheque, column, shares } => {
                 w.u8(3); w.bytes(account); w.u16(*cheque); w.u8(*column); w.u8(shares.len() as u8); for h in shares { w.bytes(h) }
             }
@@ -111,7 +114,11 @@ impl Tx {
                 let pay = match r.u8()? { 0 => Payment::Pow(r.u64()?), _ => return Err("bad payment") };
                 Tx::RegisterBook { salt, m, n256, book_size, root, batch, pay }
             }
-            2 => { let account = account(r)?; let m = id_m(&account) as usize; Tx::RegisterBatch { account, batch: r.batch(m)? } }
+            2 => {
+                let account = account(r)?; let m = id_m(&account) as usize; let batch = r.batch(m)?;
+                let pay = match r.u8()? { 0 => Payment::Pow(r.u64()?), _ => return Err("bad payment") };
+                Tx::RegisterBatch { account, batch, pay }
+            }
             3 => { let account = account(r)?; let cheque = r.u16()?; let column = r.u8()?; let k = r.u8()?; if k > 7 { return Err("too many shares"); }
                    let mut shares = Vec::new(); for _ in 0..k { shares.push(r.share()?) }
                    Tx::ChequePiece { account, cheque, column, shares } }

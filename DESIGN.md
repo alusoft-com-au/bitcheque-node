@@ -27,10 +27,10 @@ adjustment and the reward schedule are adapted (§1, §12.1).
 ## 0. The standard book
 
 Every account is a cheque book made from **one 24-word seed** (scheme byte
-`0x13`, m = 1). A book has **12 cheques**: cheque 0 is the honesty check,
-sent with the registration and never printed; cheques 1–10 are ordinary
-transfers; cheque 11 is kept for the sweep to a new book (§10.10). The 11
-printed cheques are printed in **two parts, as separate print runs**, on a
+`0x13`, m = 1). A book has **256 cheques** on one account number: cheque 0 is the honesty
+check, sent with the registration and never printed; the holder prints as many
+of the rest as they like now and more later from the same seed, registering
+them 16 at a time (§10.10). The printed cheques are printed in **two parts, as separate print runs**, on a
 clean, offline computer with a USB-only printer that is switched off
 afterwards:
 
@@ -73,7 +73,7 @@ Account {
   number       u32                   chain-assigned, sequential (§10.4)
   balance      u64
   nonce        u16 or none           highest cheque number consumed
-  book_size    u32                   printed books: 12 (cheques 0–11, 0 never printed; older books 11); software books: ≤ 65,536
+  book_size    u32                   new books: 256, registered 16 at a time (cheque 0 never printed); older books 11 or 12; ≤ 256
   salt         16 B                  book salt (§3.1)
   funded       bool                  has ever received coins; an unfunded PoW account expires (§2.2)
   batches      map                   registered cheque ranges and their expiry
@@ -91,8 +91,8 @@ outputs.
 
 | Type | Signed by | Fee | Purpose |
 |---|---|---|---|
-| `RegisterBook { salt, m, n256, book_size, root, first batch, PoW nonce }` | nobody; self-verifying | anti-spam proof of work only (§8 item 2) | creates the account, assigns its number, registers the first batch (a printed book: all 12 cheques) |
-| `RegisterBatch { account, batch }` | nobody; self-verifying | 10,000 base units from the account balance | software books: makes further cheques spendable |
+| `RegisterBook { salt, m, n256, book_size, root, first batch, PoW nonce }` | nobody; self-verifying | anti-spam proof of work only (§8 item 2) | creates the account, assigns its number, registers the first batch (cheques 0–15) |
+| `RegisterBatch { account, batch, PoW nonce }` | nobody; self-verifying | the same proof of work as `RegisterBook` | makes the next 16 cheques of a book spendable (printing more, §10.10) |
 | `ChequePiece { account, cheque, column, shares }` | the paper | encoded in the cheque (fee tier) | one column of a cheque; a cheque is 18 pieces (§10.12) |
 | `Renew { account, start }` | nobody | 10,000 base units from the account balance | resets a batch's expiry (§10.11) |
 | Coinbase `{ height, number, message }` | — | — | credits the block reward plus fees to an account number, 100 blocks later |
@@ -100,13 +100,13 @@ outputs.
 Registration transactions carry no signature because nothing in them can be
 falsified: every hash must match the committed root through a Merkle path.
 A third party can only register your true hashes, which helps you. A
-`RegisterBook` is paid only by proof of work over its txid (no coins
-needed): initial target 2^228 (≈ 2^28 hashes), at most 200 per block, the
+`RegisterBook` or `RegisterBatch` is paid only by proof of work over its txid (no coins
+needed), so every 16 cheques of node state cost the same work however they arrive: initial target 2^228 (≈ 2^28 hashes), at most 200 per block, the
 target adjusting every 20,160 blocks (§8 item 2). A PoW account that has
 received no coins after 43,200 blocks (~30 days) is deleted and its number
 quarantined for 525,600 blocks (~a year) before reuse; once funded it is
 permanent. A batch is a power-of-two count of cheques aligned to its start,
-at most 1,024. Duplicates (an existing account, an overlapping batch) are
+at most 16, and a book holds at most 256 cheques. Duplicates (an existing account, an overlapping batch) are
 rejected.
 
 Fee tier `0` (zero fee) is valid only for zero-amount cheques, so the
@@ -193,8 +193,8 @@ key[N]            = SHA256("bitcheque/key"  || seed_X || N)          per seed X,
 cell[N][col][row] = SHA256("bitcheque/cell" || key[N] || col || row)[..n]
 ```
 
-The seed enters the offline computer once, at printing; a printed book has
-no later printing (§10.10). Account discovery: a restored wallet recomputes
+The seed enters the offline computer at printing, and again whenever the
+holder prints more cheques of the same book (§10.10). Account discovery: a restored wallet recomputes
 the root (and so the account id) from the seed and book size, or reads the
 lookup code from the printed sheets (§10.4).
 
@@ -204,16 +204,16 @@ A wallet that holds a seed can derive cells and submit a cheque without
 paper: the on-chain format is unchanged (18 pieces, ≈ 900 B at m = 1). This
 is how miners, pools and exchanges use the chain:
 
-- `book_size` up to 65,536; `RegisterBook` carries the root and a first
-  batch, later batches come via `RegisterBatch`.
-- Batches are aligned powers of two, up to 1,024 cheques each.
+- The same 256-cheque book as the website's, from the same seed: `RegisterBook`
+  carries the root and the first batch, later batches come via `RegisterBatch`.
+- Batches are 16 cheques (aligned powers of two, at most 16), each with its own proof of work.
 - `m = 1`, as in the standard book: the machine holding the seed is
   trusted, the ordinary hot-wallet position.
 - The command-line wallet (`bitcheque wallet`) drives one book from one
-  seed with one batch: 11 cheques by default (the older printed size),
-  `--size 12` for website books, up to 1,024. It dry-runs every cheque
-  against the node (`/check`) before sending, and refuses to spend the last
-  cheque on anything but `sweep` unless told `--last`.
+  seed: `register` registers the first 16 cheques (`--cheques N` for more),
+  `more` the next ones. It dry-runs every cheque against the node (`/check`)
+  before sending, and refuses to spend cheque 255 on anything but `sweep`
+  unless told `--last`.
 - The one-time nature remains. A software wallet restored from seed must
   start above the chain's consumed number; the first-piece rule (§10.12)
   bounds any mistake to sending more to a chosen recipient.
@@ -230,8 +230,9 @@ simply drives a cheque book.
 - Per cheque: 18 pieces of ≈ 50 B, ≈ 900 B for a standard book (≈ 1.3 KB
   for a split book, m = 2). Verification: each piece is tried row by row,
   m + 1 hashes per row, so at most 18 × 10 × (m + 1) hashes (360 at m = 1).
-- A printed-book registration is ≈ 43 KB (12 cheques at m = 1), so about
-  23 fit in a block, well below the PoW cap of 200.
+- A 16-cheque registration is ≈ 58 KB at m = 1, so about 17 fit in a block,
+  well below the PoW cap of 200. A full 256-cheque book is 16 of them and
+  ≈ 740 KB of node state while unspent.
 - 1 MB block ≈ 1,100 cheques a minute ≈ 18 cheques/s.
 - Light clients: headers + `state_root` proofs for balance, nonce, number.
 
@@ -383,8 +384,8 @@ when the account is created, so a cheque carries only the revealed secrets:
 ```
 RegisterBook   { salt, m, n256, book_size, root, first batch, PoW nonce }   once, PoW only
 RegisterBatch  { account, batch: start, count, per cheque all share hashes,
-                 Merkle path from the batch subtree to the root }        ≈ 3.6 KB × m per cheque,
-                                                                         fee from balance
+                 Merkle path from the batch subtree to the root, PoW nonce }  ≈ 3.6 KB × m per cheque,
+                                                                         PoW only
 ChequePiece × 18 {
   account     scheme 0x03 | m<<4 | n256<<7, root
   cheque      u16            cheque number
@@ -471,10 +472,11 @@ This replaces the name registry of earlier drafts.
 - Lost the book? Regenerate from the 24 words on a clean offline computer;
   the chain tells you which cheque numbers are already used. (The website's
   restore and reprint flows are not working yet.)
-- Used the ten transfers? Make a new book (new account, new registration,
-  new honesty check). Cheque 11 (cheque 10 in an older 11-cheque book) with
-  mantissa `0000`, exponent `9` sweeps the balance to the new book's
-  account number. Several books may be live at once.
+- Running out of printed cheques? Print the next ones from the seed on a
+  clean offline computer and register them: same account number. After
+  cheque 255, or if the seed may be exposed, make a new book; any unused
+  cheque with mantissa `0000`, exponent `9` sweeps the balance to the new
+  book's account number. Several books may be live at once.
 - A written but unbroadcast cheque is a live transfer to that recipient
   only. To void it, confirm any higher-numbered cheque; lower numbers become
   invalid.
@@ -611,14 +613,20 @@ advance. Consensus does not implement it.
 
 ### 10.10 Seeds, derivation and the fixed book
 
-- A printed book is always **12 cheques**: number 0 is the honesty check,
-  sent with the registration and never printed; 1–10 are transfers and 11
-  is kept for the sweep, so the paper holds 11 cheques and ten moves. It is
-  printed once, in one sitting, and registered once with `RegisterBook`,
-  whose single batch (count 16, aligned; 12 cheques present) carries all 12
-  cheques' share hashes (≈ 43 KB at m = 1, ≈ 86 KB at m = 2). Books
-  registered before this change have 11 cheques (0–10, cheque 10 the sweep)
-  and keep working.
+- A book is **256 cheques** on one account number. Number 0 is the honesty
+  check, sent with the registration and never printed. The holder prints as
+  many as they want now (the website offers 15, 31, 63 …) and more later from
+  the same seed. Cheques are registered 16 at a time: `RegisterBook` carries
+  the batch holding cheque 0 (≈ 58 KB at m = 1), each later `RegisterBatch`
+  the next 16, each with its own proof of work. No cheque is kept back for a
+  sweep: any cheque with amount 0000, exponent 9 sweeps (§10.11). Books
+  registered before this change have 11 or 12 cheques and keep working.
+- **Printing more.** On a clean, offline computer, the seed and a cheque
+  range (say 16–31) give the two print files and a public registration file
+  holding that range's batches; it is registered like the first one. The
+  offline page that does this is a single HTML file that runs without a
+  network (the `bitcheque-print` repository). A batch already registered is
+  refused as a duplicate, which the website treats as done.
 - Printed layout: part A (recipient columns) and part B (amount, exponent,
   fee) as separate print runs, ideally on two printers, so neither printer
   sees a whole cheque. Each part holds, for every cheque, a word page and
@@ -634,15 +642,13 @@ advance. Consensus does not implement it.
   number is not shown until final (100 blocks); the lookup code finds it
   (§10.4), and the honesty check is confirmed from the chain.
 - One 24-word seed (from the computer's randomness, or made entirely from
-  dice). Derivation is hierarchical and one-way (§4.2), N = 0..11.
-- The seed enters the offline computer once, at printing. There is no
-  later printing, so there is no key sheet and nothing to type again.
-  Reprinting a lost book (§10.9, §10.11) is the only time the seed is
-  entered again.
-- When the ten transfers are used, make a new book: a new seed, new
-  registration, honesty check, and sweep the balance across with cheque 11
-  (mantissa 0000, exponent 9). Several books may be live at once.
-- Software-driven books (§5) may be larger and are registered in batches.
+  dice). Derivation is hierarchical and one-way (§4.2), N = 0..255.
+- The seed enters an offline computer at printing: the first time, each time
+  more cheques are printed, and to reprint a lost book (§10.9, §10.11).
+  Keep it for as long as the book is in use.
+- When all 255 printable cheques are used, or the seed may be exposed, make
+  a new book and sweep the balance across with any unused cheque (mantissa
+  0000, exponent 9). Several books may be live at once.
 
 ### 10.11 Statelessness of the cheque book, and state expiry
 
@@ -753,9 +759,9 @@ is unspendable, as in Bitcoin.
 | Block limit | 1,000,000 bytes (encoded block) | §6 |
 | Registration PoW | target 2^228 initially, adjusting every 20,160 blocks; at most 200 PoW registrations per block | §8 item 2 |
 | Unfunded PoW account | deleted after 43,200 blocks (~30 days); number quarantined 525,600 blocks (~a year) | §2.2 |
-| Batch lifetime | 2,100,000 blocks (~4 years); `Renew` and `RegisterBatch` cost 10,000 base units | §10.11 |
+| Batch lifetime | 2,100,000 blocks (~4 years); `Renew` costs 10,000 base units, `RegisterBatch` the registration proof of work | §10.11 |
 | Piece lifetime | 10,000 blocks (~a week) | §10.12 |
-| Book size | ≤ 65,536 cheques; batches ≤ 1,024, aligned powers of two | §5; `printed_book_size` is still 11 and only refuses a split book (m > 1) of fewer than 11 cheques registered in part |
+| Book size | ≤ 256 cheques; batches ≤ 16, aligned powers of two, each paid by proof of work | §2.2, §10.10; a 16-cheque batch (≈ 58 KB) fits any block; `printed_book_size` is still 11 and only refuses a split book (m > 1) of fewer than 11 cheques registered in part |
 | `FEE_UNIT` | 1,000 base units (0.00001 coin) initially | adjustment rule: §8 item 3 |
 | Account number 0 | reserved: nobody; coins and fee of a cheque to it go to the block's miner | §2.2 |
 | Account maturity | 100 blocks before a number can receive a cheque | §10.4 |
