@@ -97,3 +97,29 @@ fn peers_find_each_other_through_gossip() {
     wait(|| c.peer_count() == 2 && b.peer_count() == 2); // C dialled B; B now sees A and C
     assert!(bitcheque::net::valid_addr("seed1.bitcheque.example:8731") && !bitcheque::net::valid_addr("no port") && !bitcheque::net::valid_addr("x:99999"));
 }
+
+/// A node that follows an upstream over its HTTP RPC (as nodes follow the edge nodes, which speak no TCP): it pulls
+/// the upstream's blocks, and what it accepts itself (a registration sent to it, a block mined against it) goes up.
+#[test]
+fn a_follower_pulls_blocks_and_pushes_what_it_accepts() {
+    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, reg_pow_target: U256::MAX.shr(4), launch_blocks: 0, ..Params::mainnet() };
+    let g = Chain::genesis(&p, bitcheque::net::now() - 100_000, b"follow test");
+    let a = Node::new(Store::open(p.clone(), &g, None).unwrap());
+    let b = Node::new(Store::open(p.clone(), &g, None).unwrap());
+    let up = a.serve_rpc("127.0.0.1:0").unwrap().to_string();
+    for _ in 0..5 { mine(&a, 0).unwrap(); }
+    b.follow(vec![up], Duration::from_millis(200));
+    wait(|| b.height() == 5);
+    assert_eq!(b.store.lock().unwrap().chain.tip(), a.store.lock().unwrap().chain.tip());
+
+    // a registration sent to the follower reaches the upstream; a block mined on the follower does too
+    let user = Book { salt: [3; 16], n256: false, book_size: 16, domains: vec![Domain([4; 32])] };
+    b.submit_tx(mine_registration(user.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
+    wait(|| a.mempool.lock().unwrap().len() == 1);
+    mine(&b, 0).unwrap();
+    wait(|| a.height() == 6);
+    assert!(a.store.lock().unwrap().chain.state.accounts.contains_key(&user.id()));
+    // and blocks it pulled are not pushed back: the upstream saw only the one block mined on the follower
+    for _ in 0..3 { mine(&a, 0).unwrap(); }
+    wait(|| b.height() == 9);
+}

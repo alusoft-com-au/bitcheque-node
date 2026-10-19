@@ -241,8 +241,23 @@ simply drives a cheque book.
 Planned: a Noise-style handshake with hybrid X25519 + ML-KEM-768,
 upgradeable any time. Transport encryption is not implemented yet.
 
-Peer discovery follows Bitcoin's model (implemented in `net.rs`): seed node names
-compiled into the binary (placeholders until the project has a domain), a
+**Seeds and upstreams.** The research network's seed nodes are the edge
+nodes on Cloudflare (`node-ap`, `node-us`, `node-eu`, `node-oc`.bitcheque.org),
+which cannot speak this TCP protocol: Workers neither open nor accept raw
+connections. So a node also follows *upstreams* over the HTTP RPC: every
+minute it pulls the blocks an upstream has above its own tip (`/height`,
+`/block/<n>`, walking back up to 200 blocks on a fork) and it posts every
+transaction and block it accepts, from its RPC or from its TCP peers, to all
+of them (`POST /tx`, one request per batch, and `POST /block`). With no
+`--upstream` it follows the four seeds; `--no-upstream` turns this off. A
+node following them and talking TCP to others bridges the two. The edge
+nodes do not pull from it, so its own blocks reach them only by that push.
+The RPC is plain HTTP (no TLS dependency): blocks and transactions check
+themselves, so a party in between can withhold them but not forge them.
+
+Peer discovery over TCP follows Bitcoin's model (implemented in `net.rs`): seed node names
+compiled into the binary (none on the research network, whose seeds are the
+edge nodes above; placeholders on mainnet until the project has a domain), a
 `getaddr`/`addr` exchange in which every node shares the addresses it knows
 (50 per reply, 1,000 remembered), an address book saved next to the data file,
 and eight outbound connections kept up from that book. A node told nothing

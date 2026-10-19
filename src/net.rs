@@ -45,11 +45,36 @@ const MEMPOOL_BYTES: usize = 64 << 20; // waiting transactions kept, in encoded 
 pub fn seeds(magic: &[u8; 4]) -> &'static [&'static str] {
     match magic[3] {
         0x00 => &["seed1.bitcheque.example:8730", "seed2.bitcheque.example:8730"],
-        0x01 => &["seed1.bitcheque.example:8731", "seed2.bitcheque.example:8731"],
+        0x01 => &[],   // the research network's seeds are the edge nodes, reached over HTTP (http_seeds)
         0x02 => &["127.0.0.1:18441"],   // --local: the first node of a devnet on this machine
         _ => &[],
     }
 }
+/// The research network's seed nodes: the edge nodes on Cloudflare (bitcheque-node/edge), which speak only the HTTP
+/// RPC, not this TCP protocol. A node follows them as upstreams (`follow`) unless told otherwise.
+pub fn http_seeds(magic: &[u8; 4]) -> &'static [&'static str] {
+    match magic[3] {
+        0x01 => &["node-ap.bitcheque.org:80", "node-us.bitcheque.org:80", "node-eu.bitcheque.org:80", "node-oc.bitcheque.org:80"],
+        _ => &[],
+    }
+}
+/// `from` for blocks pulled from an upstream: relayed to peers, never pushed back up.
+const FROM_UPSTREAM: u64 = u64::MAX - 1;
+const UPSTREAM_BATCH: u32 = 2000;   // blocks pulled from an upstream per round
+
+/// A plain HTTP/1.0 request to a node's RPC at "host:port" (no TLS: blocks and transactions check themselves, so a
+/// party in between can at most withhold them). The reply body, or an error with the status line.
+pub fn http(addr: &str, method: &str, path: &str, body: &str) -> Result<String, String> {
+    let sa = addr.to_socket_addrs().map_err(|e| format!("{addr}: {e}"))?.next().ok_or(format!("{addr}: no address"))?;
+    let mut s = TcpStream::connect_timeout(&sa, Duration::from_secs(10)).map_err(|e| format!("{addr}: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    write!(s, "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
+    let mut out = String::new();
+    s.read_to_string(&mut out).map_err(|e| e.to_string())?;
+    let (head, text) = out.split_once("\r\n\r\n").ok_or("bad reply")?;
+    if head.split_whitespace().nth(1) == Some("200") { Ok(text.to_string()) } else { Err(format!("{path}: {}", text.trim())) }
+}
+
 /// "host:port" with a numeric port and no spaces or control characters.
 pub fn valid_addr(a: &str) -> bool {
     a.len() <= 128 && a.rsplit_once(':').map_or(false, |(h, p)| !h.is_empty() && p.parse::<u16>().is_ok()) && a.chars().all(|c| c.is_ascii_graphic())
@@ -91,6 +116,7 @@ pub struct Node {
     next: Mutex<Option<State>>,        // the tip state with the mempool applied; None = rebuild on next use
     mempool_bytes: AtomicUsize,
     banned: Mutex<HashMap<std::net::IpAddr, Instant>>,
+    upstream: Mutex<Option<std::sync::mpsc::Sender<(&'static str, String)>>>,   // (path, body) to POST to every upstream, in order
 }
 
 /// Queue a message for a peer. Never blocks: false when the peer's queue is full (it is not reading).
@@ -122,7 +148,7 @@ impl Node {
         Arc::new(Node { store: Mutex::new(store), mempool: Mutex::new(Vec::new()), peers: Mutex::new(Vec::new()), next_id: Mutex::new(1), magic,
                         book: Mutex::new(BTreeMap::new()), book_path: Mutex::new(None), advertise: Mutex::new(None),
                         sync: Mutex::new(None), rpc_limit: Mutex::new(std::collections::HashMap::new()), top_cache: Mutex::new(None),
-                        next: Mutex::new(None), mempool_bytes: AtomicUsize::new(0), banned: Mutex::new(HashMap::new()) })
+                        next: Mutex::new(None), mempool_bytes: AtomicUsize::new(0), banned: Mutex::new(HashMap::new()), upstream: Mutex::new(None) })
     }
     pub fn height(&self) -> u32 { self.store.lock().unwrap().chain.height() }
     /// The address other nodes can reach us on; sent in HELLO so peers can pass it around.
@@ -357,6 +383,43 @@ impl Node {
         let peers: Vec<Arc<Peer>> = self.peers.lock().unwrap().clone();
         for p in peers { if Some(p.id) != except { send(&p, &self.magic, kind, payload); } }
     }
+    /// Hand something to the upstreams (POST path body), unless it came from one.
+    fn push_up(&self, path: &'static str, body: String, from: Option<u64>) {
+        if from == Some(FROM_UPSTREAM) { return; }
+        if let Some(q) = self.upstream.lock().unwrap().as_ref() { let _ = q.send((path, body)); }
+    }
+
+    /// Follow upstream nodes over their HTTP RPC (the edge nodes speak no TCP): every `every`, pull new blocks from the
+    /// first that answers; push every transaction and block this node accepts (from its RPC or its peers) to all of
+    /// them, in order. Pulled blocks are relayed to TCP peers too, so this node bridges the two.
+    pub fn follow(self: &Arc<Self>, ups: Vec<String>, every: Duration) {
+        if ups.is_empty() { return; }
+        let (q, rx) = std::sync::mpsc::channel::<(&'static str, String)>();
+        *self.upstream.lock().unwrap() = Some(q);
+        let targets = ups.clone();
+        std::thread::spawn(move || for (path, body) in rx { for up in &targets { if let Err(e) = http(up, "POST", path, &body) { eprintln!("upstream {up}: {e}"); } } });
+        let node = self.clone();
+        std::thread::spawn(move || loop {
+            for up in &ups { match node.pull_from(up) { Ok(()) => break, Err(e) => eprintln!("upstream {up}: {e}") } }
+            std::thread::sleep(every);
+        });
+    }
+    /// Fetch the blocks `up` has above our tip, oldest first; on a fork, walk back (up to 200) to where we agree.
+    fn pull_from(&self, up: &str) -> Result<(), String> {
+        let theirs: u32 = http(up, "GET", "/height", "")?.trim().parse().map_err(|_| "bad height")?;
+        let (mut h, mut back, mut n) = (self.height() + 1, 0, 0);
+        while h <= theirs && n < UPSTREAM_BATCH {
+            let raw = crate::rpc::unhex(http(up, "GET", &format!("/block/{h}"), "")?.trim()).ok_or("bad hex")?;
+            let b = Block::decode(&raw).map_err(|e| format!("block {h}: {e}"))?;
+            n += 1;
+            match self.submit_block(&b, Some(FROM_UPSTREAM)) {
+                Ok(()) | Err("known") => { let mine = self.height(); h = if mine >= h { mine + 1 } else { h + 1 }; }
+                Err("prev unknown") if back < 200 && h > 1 => { back += 1; h -= 1; }
+                Err(e) => return Err(format!("block {h}: {e}")),
+            }
+        }
+        Ok(())
+    }
 
     /// Store the block, extend or reorganize the chain, fix up the mempool, relay.
     pub fn submit_block(&self, b: &Block, from: Option<u64>) -> Result<(), &'static str> {
@@ -381,7 +444,9 @@ impl Node {
             }
         };
         for t in returned { let _ = self.submit_tx(t, Some(u64::MAX)); }
-        self.relay(BLOCK, &b.encode(), from);
+        let raw = b.encode();
+        self.relay(BLOCK, &raw, from);
+        self.push_up("/block", crate::crypto::hex(&raw), from);
         Ok(())
     }
     /// Drop queued transactions the chain can no longer mine (their account moved on, their cheque
@@ -424,6 +489,8 @@ impl Node {
                 out.push(r);
             }
         }
+        // to the upstreams as one request, so a batch lands in one block there too
+        if !accepted.is_empty() { self.push_up("/tx", accepted.iter().map(|r| crate::crypto::hex(r)).collect::<Vec<_>>().join("\n"), from); }
         for raw in accepted { self.relay(TX, &raw, from); }
         out
     }

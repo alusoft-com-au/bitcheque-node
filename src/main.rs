@@ -1,7 +1,9 @@
 //! bitcheque genesis [--mainnet|--local]   (default: the public research network; --testnet is the same)
-//! bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR]...
+//! bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR]... [--upstream HOST:PORT]... [--no-upstream]
 //! bitcheque mine --rpc ADDR --to NUMBER [--threads N]   (mines against any node's RPC, e.g. node-ap.bitcheque.org:80; 0 burns the reward)
 //!   With no --peer a node dials the compiled-in seeds, then keeps about 8 connections from the addresses peers share.
+//!   On the research network it also follows the edge nodes (node-ap/us/eu/oc.bitcheque.org:80, the seeds) over their
+//!   HTTP RPC: pulls their blocks every minute and passes on what it accepts. --upstream picks others, --no-upstream none.
 //!   --listen defaults to 0.0.0.0:8730 (mainnet) or 0.0.0.0:8731 (testnet); --advertise is the address others can reach you on.
 //! bitcheque wallet new | info|register|more|send|sweep --seed HEX --rpc ADDR [--cheques N] [--to NUMBER --amount COINS [--fee TIER]]
 //! bitcheque wallet pieces --seed HEX --cheque N --digits D18   (raw pieces as hex, no checks: for tests)
@@ -25,6 +27,7 @@ fn main() {
         }
         Some("node") => {
             let data = opt("--data");
+            let p_magic = p.magic;
             let store = Store::open(p, &g, data.as_deref().map(std::path::Path::new)).expect("open data file");
             eprintln!("height {}", store.chain.height());
             let node = Node::new(store);
@@ -33,13 +36,19 @@ fn main() {
             let listen = opt("--listen").or(if local { None } else { Some(format!("0.0.0.0:{}", if testnet { 8731 } else { 8730 })) });
             if let Some(a) = listen { eprintln!("listening on {}", node.listen(&a).expect("listen")); }
             if let Some(a) = opt("--rpc") { eprintln!("rpc on {}", node.serve_rpc(&a).expect("rpc")); }
-            node.maintain(args.iter().enumerate().filter(|(_, a)| *a == "--peer").filter_map(|(i, _)| args.get(i + 1).cloned()).collect(), std::time::Duration::from_secs(5));
+            let all = |k: &str| -> Vec<String> { args.iter().enumerate().filter(|(_, a)| *a == k).filter_map(|(i, _)| args.get(i + 1).cloned()).collect() };
+            node.maintain(all("--peer"), std::time::Duration::from_secs(5));
+            // the research network's seeds are the edge nodes, which speak only HTTP: follow them unless told otherwise
+            let mut ups = all("--upstream");
+            if ups.is_empty() && !args.iter().any(|a| a == "--no-upstream") { ups = bitcheque::net::http_seeds(&p_magic).iter().map(|s| s.to_string()).collect(); }
+            if !ups.is_empty() { eprintln!("following {}", ups.join(", ")); }
+            node.follow(ups, std::time::Duration::from_secs(60));
             if opt("--mine").is_some() { eprintln!("--mine is gone: the node no longer mines. Run `bitcheque mine --rpc ADDR --to NUMBER` against its RPC."); }
             loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
         }
         Some("mine") => if let Err(e) = mine(&opt) { eprintln!("error: {e}"); std::process::exit(1) },
         Some("wallet") => if let Err(e) = wallet(&args, &opt) { eprintln!("error: {e}"); std::process::exit(1) },
-        _ => eprintln!("usage: bitcheque genesis [--mainnet|--local] | bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR]\n       bitcheque mine --rpc ADDR --to NUMBER [--threads N]\n       bitcheque wallet new | info|register|more|send|sweep --seed HEX --rpc ADDR [--cheques N] [--to NUMBER --amount COINS [--fee TIER]]"),
+        _ => eprintln!("usage: bitcheque genesis [--mainnet|--local] | bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR] [--upstream HOST:PORT] [--no-upstream]\n       bitcheque mine --rpc ADDR --to NUMBER [--threads N]\n       bitcheque wallet new | info|register|more|send|sweep --seed HEX --rpc ADDR [--cheques N] [--to NUMBER --amount COINS [--fee TIER]]"),
     }
 }
 
@@ -203,12 +212,4 @@ fn mine(opt: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     }
 }
 
-fn http(addr: &str, method: &str, path: &str, body: &str) -> Result<String, String> {
-    use std::io::{Read, Write};
-    let mut s = std::net::TcpStream::connect(addr).map_err(|e| format!("{addr}: {e}"))?;
-    write!(s, "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
-    let mut out = String::new();
-    s.read_to_string(&mut out).map_err(|e| e.to_string())?;
-    let (head, text) = out.split_once("\r\n\r\n").ok_or("bad reply")?;
-    if head.split_whitespace().nth(1) == Some("200") { Ok(text.to_string()) } else { Err(format!("{path}: {text}")) }
-}
+fn http(addr: &str, method: &str, path: &str, body: &str) -> Result<String, String> { bitcheque::net::http(addr, method, path, body) }
