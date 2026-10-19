@@ -1,7 +1,7 @@
 // A fourth node, in Oceania (Sydney), deployed as its own Worker so the three in wrangler.jsonc are not touched:
 //   npx wrangler deploy -c wrangler.oc.jsonc
-// It follows node-ap, node-us and node-eu as upstreams (pulls their blocks every 30 seconds, passes transactions on to
-// them) through a service binding to their Worker, and does not mine.
+// It is one of five nodes in a mesh: it pushes what it accepts to the other four and pulls from them every 30 seconds,
+// reaching them through service bindings to their Workers. It does not mine.
 {
   "$schema": "https://unpkg.com/wrangler@4/config-schema.json",
   "name": "bitcheque-node-oc",
@@ -9,10 +9,11 @@
   "compatibility_date": "2026-10-12",
   "durable_objects": { "bindings": [{ "name": "NODE", "class_name": "EdgeNode" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["EdgeNode"] }],
-  "services": [{ "binding": "UPSTREAM_SVC", "service": "bitcheque-node" }],
+  "services": [{ "binding": "NODE_MAIN", "service": "bitcheque-node" }, { "binding": "NODE_SA", "service": "bitcheque-node-sa" }],
   "triggers": { "crons": ["*/30 * * * *"] },
   "routes": [{ "pattern": "node-oc.bitcheque.org", "custom_domain": true }],
   "vars": { "NET": "0", "REGIONS": "{\"oc\":\"oc\"}",
-            "UPSTREAMS": "https://node-ap.bitcheque.org,https://node-us.bitcheque.org,https://node-eu.bitcheque.org",
+            "UPSTREAMS": "https://node-ap.bitcheque.org,https://node-us.bitcheque.org,https://node-eu.bitcheque.org,https://node-sa.bitcheque.org",
+            "SERVICES": "{\"node-ap.bitcheque.org\":\"NODE_MAIN\",\"node-us.bitcheque.org\":\"NODE_MAIN\",\"node-eu.bitcheque.org\":\"NODE_MAIN\",\"node-sa.bitcheque.org\":\"NODE_SA\"}",
             "MINE_REGIONS": "", "MINER_TO": "0", "SYNC_S": "30" }
 }

@@ -12,8 +12,12 @@
     { "pattern": "node-us.bitcheque.org", "custom_domain": true },
     { "pattern": "node-eu.bitcheque.org", "custom_domain": true }
   ],
-  // NET 0 = the public research network. UPSTREAMS: comma-separated node RPC URLs to pull blocks from.
-  // MINE_REGIONS: regions that mine when the chain is quiet, first choice first (empty: no backup miner);
-  // MINER_TO: the account they pay
-  "vars": { "NET": "0", "UPSTREAMS": "", "MINE_REGIONS": "ap,us,eu", "MINER_TO": "1" }
+  // The five nodes form a mesh: these three reach node-oc and node-sa (their own Workers) through service bindings.
+  "services": [{ "binding": "NODE_OC", "service": "bitcheque-node-oc" }, { "binding": "NODE_SA", "service": "bitcheque-node-sa" }],
+  // NET 0 = the public research network. UPSTREAMS: the peers outside this Worker (node RPC URLs); SERVICES: which
+  // binding reaches each of their hosts. MINE_REGIONS: regions that mine when the chain is quiet, first choice first
+  // (empty: no backup miner); MINER_TO: the account they pay
+  "vars": { "NET": "0", "UPSTREAMS": "https://node-oc.bitcheque.org,https://node-sa.bitcheque.org",
+            "SERVICES": "{\"node-oc.bitcheque.org\":\"NODE_OC\",\"node-sa.bitcheque.org\":\"NODE_SA\"}",
+            "MINE_REGIONS": "ap,us,eu", "MINER_TO": "1" }
 }

@@ -16,8 +16,9 @@ hand-copied cheques printed offline from a hash-based cheque book (up to 256 che
   posted transactions upstream. Each keeps only the last 2,000 block headers in memory (older blocks stay in
   SQLite), so memory stays flat however long the chain grows. `edge/build.sh`, then `npx wrangler deploy` in `edge/`.
   Two more, `node-oc` (Oceania) and `node-sa` (South America), run as their own Workers (`edge/wrangler.oc.jsonc`,
-  `edge/wrangler.sa.jsonc`): they follow the three as upstreams through a service binding every 30 seconds and do not
-  mine; deploy one with `npx wrangler deploy -c wrangler.oc.jsonc`.
+  `edge/wrangler.sa.jsonc`; they wake every 30 seconds and do not mine). All five form a mesh: each pushes what it
+  accepts to the other four (service bindings between the Workers) and pulls from them as a safety net.
+  Deploy one with `npx wrangler deploy -c wrangler.oc.jsonc`.
 
 The official website lives in [bitcheque-website](https://github.com/alusoft-com-au/bitcheque-website); the offline
 page for printing more cheques of a book in [bitcheque-print](https://github.com/alusoft-com-au/bitcheque-print).

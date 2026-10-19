@@ -122,22 +122,30 @@ export class EdgeNode extends DurableObject {
   upstreams() {
     const list = (this.env.UPSTREAMS || '').split(',').map(s => s.trim()).filter(Boolean);
     const me = this.meta('region');
-    return [...list, ...Object.keys(regions(this.env)).filter(r => r !== me).map(r => 'do:' + r)];
+    return [...Object.keys(regions(this.env)).filter(r => r !== me).map(r => 'do:' + r), ...list];
   }
+  // a peer in this Worker ("do:eu"), or another node's RPC ("https://host"), reached through the service binding SERVICES
+  // names for its host (a Worker may not fetch another on its own zone). X-Edge-Peer tells it not to pass this on.
   async call(up, path, init) {
-    const r = up.startsWith('do:')
-      ? await this.env.NODE.get(this.env.NODE.idFromName(up.slice(3))).fetch('https://edge' + path, { ...init, headers: { 'X-Edge-Peer': '1' } })
-      : await (this.env.UPSTREAM_SVC || globalThis).fetch(up.replace(/\/$/, '') + path, { ...init, signal: AbortSignal.timeout(10_000) });   // UPSTREAM_SVC: a service binding to the upstream Worker
+    const peer = { ...init, headers: { 'X-Edge-Peer': '1' } };
+    let r;
+    if (up.startsWith('do:')) r = await this.env.NODE.get(this.env.NODE.idFromName(up.slice(3))).fetch('https://edge' + path, peer);
+    else {
+      const via = this.env[JSON.parse(this.env.SERVICES || '{}')[new URL(up).host]] || this.env.UPSTREAM_SVC || globalThis;
+      r = await via.fetch(up.replace(/\/$/, '') + path, { ...peer, signal: AbortSignal.timeout(10_000) });
+    }
     if (!r.ok) throw new Error(`${up}${path}: ${r.status}`);
     return r.text();
   }
   async sync() {
     const x = await this.node();
     let fetched = 0, log = [];
+    // one source per wake: peers in order, stopping at the first that is not behind us (pushes do the real work;
+    // this catches whatever a push missed)
     for (const up of this.upstreams()) {
-      if (log.some(l => l.ok)) break;   // one source per wake: the first that answers (other regions only if no upstream did)
       try {
         const theirs = +(await this.call(up, '/height'));
+        if (theirs < x.height()) { log.push({ up, ok: true, height: theirs, behind: true }); continue; }
         let h = x.height() + 1, back = 0;
         while (h <= theirs && fetched < MAX_PER_WAKE) {
           const b = unhex(await this.call(up, `/block/${h}`)); fetched++;
@@ -149,6 +157,7 @@ export class EdgeNode extends DurableObject {
         }
         this.trim();
         log.push({ up, ok: true, height: theirs });
+        break;
       } catch (e) { log.push({ up, ok: false, error: String(e.message || e) }); }
     }
     this.meta('last_sync', JSON.stringify({ at: new Date().toISOString(), height: x.height(), fetched, log }));
@@ -189,7 +198,7 @@ export class EdgeNode extends DurableObject {
       if (why.trim().split('\n').some(x => x === 'ok' || x === 'already in mempool')) live.push(r.tx);
       else this.sql.exec('DELETE FROM pool WHERE id = ?', r.id);
     }
-    for (const up of this.upstreams().filter(u => u.startsWith('do:')))
+    for (const up of this.upstreams())
       for (const tx of live.slice(0, RERELAY_MAX)) { try { await this.call(up, '/tx', { method: 'POST', body: tx }); } catch (_) {} }
   }
   // every minute; straight away again while catching up
@@ -234,7 +243,7 @@ export default {
     const stub = env.NODE.get(env.NODE.idFromName(region), { locationHint: R[region] });
     const inner = new URL(url.pathname + `?region=${region}`, 'https://edge');
     if (req.method === 'HEAD') { const r = await stub.fetch(inner); return new Response(null, r); }   // headers only
-    if (req.method !== 'GET') return stub.fetch(inner, { method: req.method, body: await req.text() });
+    if (req.method !== 'GET') return stub.fetch(inner, { method: req.method, body: await req.text(), headers: req.headers.get('X-Edge-Peer') ? { 'X-Edge-Peer': '1' } : {} });   // a peer's forward is not passed on again
     const fresh = FRESH.has(url.pathname.split('/')[1]), cache = caches.default, key = new Request(url.origin + url.pathname);
     const hit = await cache.match(key);
     if (hit) return hit;
