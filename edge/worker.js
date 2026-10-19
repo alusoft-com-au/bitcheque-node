@@ -21,7 +21,7 @@ const QUIET_S = 50;              // the backup miner mines when no block has com
                                  // mining it finds one each wake, about one a minute (the block target)
 const MINE_MS = 3000;            // at most this long per wake (the floor is ~2^19 hashes: about a second here)
 const MINE_TRIES = 50_000;       // nonces per call into the wasm, between clock checks
-const CHAIN_VERSION = '6';        // bump to reset the network: each region forgets its chain and starts from block 0
+const CHAIN_VERSION = '7';        // bump to reset the network: each region forgets its chain and starts from block 0
 const FALLBACK_S = 120;          // each further region in MINE_REGIONS waits this much longer (if the first is down)
 const RERELAY_MAX = 50;          // waiting transactions offered again to each other region per wake
 const POOL_MAX = 1000;           // waiting transactions kept in the database across unloads (all offered again on load)

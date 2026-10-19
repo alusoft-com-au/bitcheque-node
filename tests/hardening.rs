@@ -236,10 +236,14 @@ fn a_number_is_published_only_once_final_and_the_lookup_code_finds_it() {
     assert!(!young.contains("\nnumber "), "a young number is not shown: {young}");
     assert!(!get("/summary/1").contains("number="), "nor in the block");
     // asking for it by number gives exactly what an unknown number gives, so new numbers cannot be probed for
-    for path in ["/account/1", "/history/1", "/proof/1"] {
+    for path in ["/history/1", "/proof/1"] {
         assert_eq!(get(path).split("\r\n\r\n").nth(1), get(&path.replace('1', "77")).split("\r\n\r\n").nth(1), "{path}");
         assert!(get(path).contains("no such number"), "{path}");
     }
+    // by number it says only that the number is pending and when it becomes final, never whose it is
+    let pending = get("/account/1");
+    assert!(pending.ends_with("pending\nready_at 4") && !pending.contains(&id), "{pending}");
+    assert!(get("/account/77").contains("no such number"));
     // and a block cannot pay it yet
     assert_eq!(node.template(1).err(), Some("coinbase payee not mature"));
     for _ in 0..3 { mine(&node, 0).unwrap(); }

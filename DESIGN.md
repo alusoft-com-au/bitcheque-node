@@ -432,9 +432,10 @@ otherwise the next value of a global counter (starting at 1). The mapping
   and the block with "coinbase payee not mature".
 - **Publication (node policy, not consensus):** no RPC output prints a
   number until it is final (100 blocks deep): `/id` and `/lookup` omit the
-  number line, `/account/<n>`, `/history/<n>` and `/proof/<n>` answer a
-  number that is not final exactly as an unknown one ("no such number"), so
-  new numbers cannot be probed for, a sender not yet final appears in a
+  number line, `/account/<n>` of a number not yet final answers only
+  `pending` and its `ready_at` block (the explorer counts down to it), never
+  the account behind it, `/history/<n>` and `/proof/<n>` answer it as an
+  unknown number, a sender not yet final appears in a
   history as its account id, `/top` leaves the account out, block
   summaries show a registration's number and a cheque's sender only once
   final, and the mempool lists a waiting cheque only when its recipient is

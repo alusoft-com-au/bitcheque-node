@@ -1,7 +1,8 @@
 //! Wallet-facing HTTP interface, plain text, standard library only.
 //!   GET  /height   GET /peers   GET /addrs (known peer addresses)   GET /tip                GET /block/<height>   (hex)   GET /summary/<height> (text)
 //!   GET  /account/<number>    GET /id/<account id hex>   GET /lookup/<code> (start of the id after its scheme byte)
-//!   (a number appears in any output only once it is final, number_maturity blocks deep)
+//!   (a number appears in any output only once it is final, number_maturity blocks deep; /account/<n> of a
+//!   number not final yet answers only "pending" and its ready_at)
 //!   GET /proof/<number>   GET /regtarget (4 LE limbs, hex)
 //!   GET  /history/<number>  (newest first, the last block::HISTORY_CAP events: height kind key=value...; a cheque to yourself is listed as receive, then send)
 //!   GET  /stats   (lifetime totals, and the reward schedule: reward of the next block, base, halving interval, next halving, maturity)
@@ -127,7 +128,10 @@ impl Node {
             }
             ("GET", ["account", n]) => {
                 let num: u32 = n.parse().map_err(|_| "bad number")?;
-                let (id, _) = c.state.numbers.get(&num).filter(|_| is_final(c, num)).ok_or("no such number")?;   // not final: as if unknown
+                let &(ref id, at) = c.state.numbers.get(&num).ok_or("no such number")?;
+                // not final yet: only that it is pending and the block it becomes final at (public from the chain's
+                // order anyway), never the account behind it, so a provisional number is not handed out
+                if !is_final(c, num) { return Ok(format!("pending\nready_at {}", at + c.params.number_maturity)); }
                 Ok(account_text(c, id))
             }
             ("GET", ["id", h]) => {
