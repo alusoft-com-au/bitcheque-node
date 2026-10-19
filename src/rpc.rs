@@ -7,7 +7,8 @@
 //!   GET  /stats   (lifetime totals, and the reward schedule: reward of the next block, base, halving interval, next halving, maturity)
 //!   GET  /mempool (count, then one line per waiting transaction in the /summary format, then a cheque line per waiting cheque whose recipient is readable)
 //!   GET  /top[/N]  (richest N accounts, default 50: number balance book_size last_cheque unspent)
-//!   POST /tx  (body: hex-encoded tx)
+//!   GET  /template/<number>  (hex: the next block to mine, reward to that number (0 burns it), nonce 0)
+//!   POST /tx  (body: hex-encoded tx)   POST /block (body: hex-encoded block, mined from a template)
 //!   POST /check (body: one hex tx per line; dry run, nothing stored)
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -89,6 +90,12 @@ impl Node {
             ("GET", ["peers"]) => { drop(st); Ok(self.peer_count().to_string()) }
             ("GET", ["addrs"]) => { drop(st); let a = self.known_addrs(); Ok(format!("count {}\n{}", a.len(), a.join("\n"))) }
             ("GET", ["tip"]) => Ok(hex(&c.tip())),
+            ("GET", ["template", n]) => { drop(st); self.template(n.parse().map_err(|_| "bad number")?).map(|b| hex(&b.encode())) }
+            ("POST", ["block"]) => {
+                drop(st);
+                let b = unhex(body).and_then(|raw| crate::block::Block::decode(&raw).ok()).ok_or("bad block")?;
+                self.submit_block(&b, None).map(|_| "accepted".to_string())
+            }
             ("GET", ["block", h]) => c.blocks.get(h.parse::<usize>().map_err(|_| "bad height")?).map(|b| hex(&b.encode())).ok_or("no such block"),
             ("GET", ["summary", h]) => {
                 let i: usize = h.parse().map_err(|_| "bad height")?;

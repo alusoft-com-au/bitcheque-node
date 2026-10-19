@@ -1,5 +1,7 @@
 //! Two in-process nodes: B syncs A's history, then a tx submitted at B is relayed to A,
 //! mined there and relayed back as a block.
+mod common;
+use common::mine;
 use std::time::{Duration, Instant};
 use bitcheque::block::Chain;
 use bitcheque::net::Node;
@@ -19,7 +21,7 @@ fn sync_and_relay() {
     let b = Node::new(Store::open(p.clone(), &g, None).unwrap());
     let miner = Book { salt: [1; 16], n256: false, book_size: 16, domains: vec![Domain([7; 32])] };
     a.submit_tx(mine_registration(miner.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
-    for _ in 0..3 { a.mine_once(1).unwrap(); }
+    for _ in 0..3 { mine(&a, 1).unwrap(); }
     assert_eq!(a.height(), 3);
 
     let addr = a.listen("127.0.0.1:0").unwrap();
@@ -30,7 +32,7 @@ fn sync_and_relay() {
     let user = Book { salt: [2; 16], n256: false, book_size: 11, domains: vec![Domain([8; 32]), Domain([9; 32])] };
     b.submit_tx(mine_registration(user.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
     wait(|| a.mempool.lock().unwrap().len() == 1);
-    a.mine_once(1).unwrap();
+    mine(&a, 1).unwrap();
     wait(|| b.height() == 4);
     assert!(b.store.lock().unwrap().chain.state.accounts.contains_key(&user.id()));
     assert!(b.mempool.lock().unwrap().is_empty());
@@ -50,7 +52,7 @@ fn queued_cheque_does_not_block_the_next() {
     let user = Book { salt: [2; 16], n256: false, book_size: 11, domains: vec![Domain([8; 32])] };
     a.submit_tx(mine_registration(miner.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
     a.submit_tx(mine_registration(user.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
-    for _ in 0..4 { a.mine_once(1).unwrap(); } // miner is number 1, user number 2; rewards matured, numbers mature
+    for _ in 0..4 { mine(&a, 1).unwrap(); } // miner is number 1, user number 2; rewards matured, numbers mature
     let balance = |b: &Book| a.store.lock().unwrap().chain.state.accounts[&b.id()].balance;
     assert!(balance(&miner) >= 50 * COIN);
 
@@ -64,7 +66,7 @@ fn queued_cheque_does_not_block_the_next() {
     let next = miner.sign(2, &Message::new(2, 3, 8, 1)); // 3 coins
     assert!(a.check_txs(&next).iter().all(|r| r.is_ok()));
     for t in &next { a.submit_tx(t.clone(), None).unwrap(); }
-    a.mine_once(1).unwrap();
+    mine(&a, 1).unwrap();
     let st = a.store.lock().unwrap();
     let m = &st.chain.state.accounts[&miner.id()];
     assert_eq!((m.nonce, m.open.is_none(), m.commits.contains_key(&1)), (Some(2), true, false));

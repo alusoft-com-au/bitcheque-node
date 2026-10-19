@@ -1,4 +1,6 @@
 //! Reorg to the heavier branch, persistence across restart, account proofs, and the RPC.
+mod common;
+use common::mine;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use bitcheque::block::Chain;
@@ -24,8 +26,8 @@ fn reorg_and_persist() {
     // branch A: 2 blocks with a registration; branch B: 3 blocks, no txs
     let a = Node::new(Store::open(p.clone(), &g, Some(&path)).unwrap());
     a.submit_tx(mine_registration(miner().register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
-    a.mine_once(1).unwrap();
-    a.mine_once(1).unwrap();
+    mine(&a, 1).unwrap();
+    mine(&a, 1).unwrap();
     let mut b = Store::open(p.clone(), &g, None).unwrap();
     let mut bc = Chain::new(p.clone(), &g).unwrap();
     for i in 0..3 { let blk = bc.make_block(g.header.time + 600 * (i + 1), 0, vec![]).unwrap(); bc.add(&blk, now()).unwrap(); b.accept(&blk, now()).unwrap(); }
@@ -40,7 +42,7 @@ fn reorg_and_persist() {
     assert_eq!(a.mempool.lock().unwrap().len(), 1);
     assert!(a.store.lock().unwrap().chain.state.accounts.is_empty());
     // mine it again on the new branch
-    a.mine_once(0).unwrap();
+    mine(&a, 0).unwrap();
     assert_eq!(a.store.lock().unwrap().chain.state.accounts[&miner().id()].number, 1);
     let tip = a.store.lock().unwrap().chain.tip();
     drop(a);
@@ -64,8 +66,8 @@ fn proof_and_rpc() {
     let n = Node::new(Store::open(p.clone(), &g, None).unwrap());
     let m = miner();
     n.submit_tx(mine_registration(m.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
-    n.mine_once(1).unwrap();
-    n.mine_once(1).unwrap(); // reward credited
+    mine(&n, 1).unwrap();
+    mine(&n, 1).unwrap(); // reward credited
     // Merkle proof of the miner's account against the state root
     let st = n.store.lock().unwrap();
     let (leaf, path) = st.chain.state.account_proof(&m.id()).unwrap();

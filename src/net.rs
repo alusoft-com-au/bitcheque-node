@@ -26,7 +26,6 @@ const BATCH: usize = 500; // blocks per GET_BLOCKS reply
 const MAX_FRAME: usize = 9_000_000;
 const MAX_OUTBOUND: usize = 8;   // connections this node keeps dialling on its own
 const MAX_BOOK: usize = 1000;    // addresses remembered
-const TEMPLATE_REFRESH: u64 = 10; // seconds between template rebuilds while mining
 const ADDR_REPLY: usize = 50;    // addresses shared per GET_ADDR
 const GIVE_UP: u32 = 3;          // failed dials before an address is forgotten
 const MAX_INBOUND: usize = 125;  // inbound connections accepted (Bitcoin's default)
@@ -429,41 +428,23 @@ impl Node {
         let mut st = Self::next_state(c, &m, &mut self.next.lock().unwrap()).clone();
         txs.iter().map(|t| st.apply(&c.params, t).map(|_| ())).collect()
     }
-    /// Build a block from the mempool under the lock, search nonces without it (so RPC and
-    /// peers stay responsive), and give up as soon as the tip moves. Like a Bitcoin miner, the
-    /// template is rebuilt every TEMPLATE_REFRESH seconds when the mempool has changed, so
-    /// transactions that arrive while a block is being mined still make it in.
-    pub fn mine_once(&self, payee: u32) -> Result<Block, &'static str> {
-        if self.sync.lock().unwrap().is_some() { return Err("syncing"); }   // never mine on a stale tip while catching up
-        let build = || -> Result<(Block, [u8; 32], usize), &'static str> {
-            let st = self.store.lock().unwrap(); let c = &st.chain;
-            let m = self.mempool.lock().unwrap();
-            let mut s = c.state.clone();
-            s.begin_block(&c.params, c.height() + 1);
-            // fill up to the block size limit (header and coinbase take well under the margin), oldest first
-            let room = c.params.max_block_bytes.saturating_sub(4096);
-            let mut used = 0;
-            let txs: Vec<Tx> = m.iter().filter(|t| {
-                let n = t.encode().len() + 4;
-                if used + n > room || s.apply(&c.params, t).is_err() { return false; }
-                used += n; true
-            }).cloned().collect();
-            Ok((c.template(now().max(c.median_time() + 1), payee, txs)?, c.tip(), m.len()))
-        };
-        let (mut b, tip, mut seen) = build()?;
-        let mut built = std::time::Instant::now();
-        loop {
-            for _ in 0..200_000 {
-                if b.header.meets_target() { self.submit_block(&b, None)?; return Ok(b); }
-                b.header.nonce = b.header.nonce.wrapping_add(1);
-            }
-            if self.store.lock().unwrap().chain.tip() != tip { return Err("tip moved"); }
-            // refresh on a changed mempool, and always before the nonce space runs out
-            if built.elapsed().as_secs() >= TEMPLATE_REFRESH && (self.mempool.lock().unwrap().len() != seen || b.header.nonce > u32::MAX - 400_000) {
-                let (nb, ntip, n) = build()?;
-                if ntip != tip { return Err("tip moved"); }
-                b = nb; seen = n; built = std::time::Instant::now();
-            }
-        }
+    /// The next block to mine for `payee`, nonce 0: the tip, the time, and waiting transactions oldest
+    /// first up to the block size limit. The node does not mine: miners fetch this over RPC
+    /// (GET /template/<number>), search nonces themselves and send the block back (POST /block).
+    pub fn template(&self, payee: u32) -> Result<Block, &'static str> {
+        if self.sync.lock().unwrap().is_some() { return Err("syncing"); }   // never hand out a stale tip while catching up
+        let st = self.store.lock().unwrap(); let c = &st.chain;
+        let m = self.mempool.lock().unwrap();
+        let mut s = c.state.clone();
+        s.begin_block(&c.params, c.height() + 1);
+        // fill up to the block size limit (header and coinbase take well under the margin), oldest first
+        let room = c.params.max_block_bytes.saturating_sub(4096);
+        let mut used = 0;
+        let txs: Vec<Tx> = m.iter().filter(|t| {
+            let n = t.encode().len() + 4;
+            if used + n > room || s.apply(&c.params, t).is_err() { return false; }
+            used += n; true
+        }).cloned().collect();
+        c.template(now().max(c.median_time() + 1), payee, txs)
     }
 }

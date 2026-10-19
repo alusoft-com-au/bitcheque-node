@@ -1,8 +1,9 @@
 // Bitcheque edge node: three Durable Objects (one per region) running the node's own chain code
-// (bitcheque_edge.wasm, built from edge/src) with no sockets and no miner. Each wakes every minute,
-// pulls new blocks from the upstream nodes' RPC (GET /height, GET /block/<n>), keeps them in its SQLite
-// database, and answers the same RPC the node serves. Transactions posted to it are checked, kept,
-// and forwarded upstream, where the miners are. Cost: it sleeps between wakes (no duration billed).
+// (bitcheque_edge.wasm, built from edge/src) with no sockets. Miners anywhere fetch GET /template/<number>
+// and send mined blocks to POST /block; transactions arrive at POST /tx. Whatever one region accepts it
+// passes straight to the others (and to any upstream nodes); each also wakes every minute and pulls what
+// it missed (GET /height, GET /block/<n>). Blocks live in its SQLite database. Cost: it sleeps between
+// wakes (no duration billed).
 import { DurableObject } from 'cloudflare:workers';
 import WASM from './bitcheque_edge.wasm';
 
@@ -129,9 +130,11 @@ export class EdgeNode extends DurableObject {
     if (url.pathname === '/edge') return text(`region ${this.meta('region')}\nheight ${this.x.height()}\nupstreams ${this.upstreams().join(' ')}\nlast_sync ${this.meta('last_sync') ?? 'never'}\n`);
     const body = req.method === 'POST' ? await req.text() : '';
     const [code, reply] = this.rpc(req.method, url.pathname, body);
-    // a new transaction goes on to the miners (not back to a region that sent it)
-    if (req.method === 'POST' && url.pathname === '/tx' && code === 200 && !req.headers.get('X-Edge-Peer'))
-      this.ctx.waitUntil(Promise.allSettled(this.upstreams().map(up => this.call(up, '/tx', { method: 'POST', body }))));
+    // a new transaction or a newly mined block goes on to the other regions and upstream nodes at once
+    // (not back to the region that sent it); polling every minute is only the safety net
+    if (req.method === 'POST' && (url.pathname === '/tx' || url.pathname === '/block') && code === 200 && !req.headers.get('X-Edge-Peer'))
+      this.ctx.waitUntil(Promise.allSettled(this.upstreams().map(up => this.call(up, url.pathname, { method: 'POST', body }))));
+    if (req.method === 'POST' && url.pathname === '/block') this.trim();
     return text(reply, code);
   }
 }

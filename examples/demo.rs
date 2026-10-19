@@ -10,7 +10,7 @@ fn main() {
     let g = Chain::genesis(&p, now() - 3600, b"Bitcheque local demo");
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
     println!("rpc on {}", node.serve_rpc("127.0.0.1:8732").expect("port 8732 busy"));
-    let mine = |n: u32| loop { if node.mine_once(n).is_ok() { println!("block {}", node.height()); break; } };
+    let mine = |n: u32| loop { let Ok(mut b) = node.template(n) else { continue }; b.header.mine(); if node.submit_block(&b, None).is_ok() { println!("block {}", node.height()); break; } };
     let miner = Book { salt: [1; 16], n256: false, book_size: 64, domains: vec![Domain([7; 32])] };
     let saver = Book { salt: [2; 16], n256: false, book_size: 11, domains: vec![Domain([8; 32])] };   // one seed
     let shop = Book { salt: [3; 16], n256: false, book_size: 11, domains: vec![Domain([10; 32])] };  // one seed

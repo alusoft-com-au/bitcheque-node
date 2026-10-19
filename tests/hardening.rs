@@ -1,6 +1,8 @@
 //! Hostile and unlucky inputs that used to crash or wedge a node: malformed transactions and
 //! requests, junk side blocks, a crash mid-write, a reorg below the snapshot, and a template
 //! that must pick up transactions arriving while a block is being mined.
+mod common;
+use common::mine;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use bitcheque::block::Chain;
@@ -29,7 +31,7 @@ fn malformed_account_ids_are_refused_not_fatal() {
     assert!(node.submit_tx(t, None).is_err());
     assert!(node.submit_tx(Tx::Renew { account: vec![0x13], start: 0 }, None).is_err());
     assert!(node.submit_tx(Tx::RegisterBatch { account: vec![], batch: bitcheque::tx::Batch { start: 0, count: 1, cheques: vec![], path: vec![] } }, None).is_err());
-    node.mine_once(0).unwrap();   // still alive, locks not poisoned
+    mine(&node, 0).unwrap();   // still alive, locks not poisoned
     assert_eq!(node.height(), 1);
 }
 
@@ -44,7 +46,7 @@ fn non_ascii_rpc_input_is_refused() {
     let get = |path: &[u8]| { let mut s = TcpStream::connect(addr).unwrap(); s.write_all(&[b"GET ", path, b" HTTP/1.0\r\n\r\n"].concat()).unwrap(); let mut o = String::new(); let _ = s.read_to_string(&mut o); o };
     let _ = get(b"/id/a\xFF");
     assert!(get(b"/height").ends_with("0\n") || get(b"/height").contains("\r\n\r\n0"));
-    node.mine_once(0).unwrap();
+    mine(&node, 0).unwrap();
 }
 
 #[test]
@@ -90,10 +92,10 @@ fn a_crash_mid_write_loses_only_the_partial_block() {
     let p = params();
     let g = Chain::genesis(&p, now() - 100_000, b"hard");
     let path = tmp("trunc");
-    { let n = Node::new(Store::open(p.clone(), &g, Some(&path)).unwrap()); for _ in 0..3 { n.mine_once(0).unwrap(); } }
+    { let n = Node::new(Store::open(p.clone(), &g, Some(&path)).unwrap()); for _ in 0..3 { mine(&n, 0).unwrap(); } }
     // simulate a crash halfway through writing block 4
     { let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap(); f.write_all(&500u32.to_le_bytes()).unwrap(); f.write_all(&[7; 100]).unwrap(); }
-    { let n = Node::new(Store::open(p.clone(), &g, Some(&path)).unwrap()); assert_eq!(n.height(), 3); for _ in 0..5 { n.mine_once(0).unwrap(); } }
+    { let n = Node::new(Store::open(p.clone(), &g, Some(&path)).unwrap()); assert_eq!(n.height(), 3); for _ in 0..5 { mine(&n, 0).unwrap(); } }
     // the blocks mined after the crash survive the next restart too
     assert_eq!(Store::open(p.clone(), &g, Some(&path)).unwrap().chain.height(), 8);
     let _ = std::fs::remove_file(&path);
@@ -130,7 +132,7 @@ fn a_data_file_from_another_genesis_is_reported() {
     let g1 = Chain::genesis(&p, now() - 100_000, b"one");
     let g2 = Chain::genesis(&p, now() - 100_000, b"two");
     let path = tmp("genesis");
-    { let n = Node::new(Store::open(p.clone(), &g1, Some(&path)).unwrap()); n.mine_once(0).unwrap(); }
+    { let n = Node::new(Store::open(p.clone(), &g1, Some(&path)).unwrap()); mine(&n, 0).unwrap(); }
     assert_eq!(Store::open(p.clone(), &g2, Some(&path)).unwrap().chain.height(), 0);   // warns on stderr, does not panic
     let _ = std::fs::remove_file(&path);
 }
@@ -181,7 +183,7 @@ fn a_peer_that_never_reads_does_not_block_the_node() {
     // keep mining (every block is relayed to it) while it keeps asking for batches it never reads
     let t0 = std::time::Instant::now();
     for _ in 0..40 {
-        node.mine_once(0).unwrap();
+        mine(&node, 0).unwrap();
         // ask the node for 500 blocks over and over, from the silent peer
         s.write_all(&frame(&p.magic, 1, &1u32.to_le_bytes())).unwrap();
     }
@@ -205,7 +207,7 @@ fn a_full_mempool_is_mined_over_several_blocks_not_into_one_oversized_block() {
     }
     let mut mined = 0;
     for _ in 0..10 {
-        let b = node.mine_once(0).unwrap();
+        let b = mine(&node, 0).unwrap();
         assert!(b.encode().len() <= p.max_block_bytes, "block of {} bytes", b.encode().len());
         mined += b.txs.len() - 1;
         if mined == 10 { break; }
@@ -227,13 +229,13 @@ fn a_number_is_published_only_once_final_and_the_lookup_code_finds_it() {
     let id = bitcheque::crypto::hex(&b.id());
     let target = node.store.lock().unwrap().chain.state.reg_target;
     node.submit_tx(mine_registration(b.register(0, 16, Payment::Pow(0)), target), None).unwrap();
-    node.mine_once(0).unwrap();
+    mine(&node, 0).unwrap();
     let code = &id[2..14];                                   // the id's root, after the scheme byte
     let young = get(&format!("/lookup/{}-{}-{}", &code[..4], &code[4..8], &code[8..]));
     assert!(young.contains(&format!("id {id}")) && young.contains("mature false"), "{young}");
     assert!(!young.contains("\nnumber "), "a young number is not shown: {young}");
     assert!(!get("/summary/1").contains("number="), "nor in the block");
-    for _ in 0..3 { node.mine_once(0).unwrap(); }
+    for _ in 0..3 { mine(&node, 0).unwrap(); }
     let fin = get(&format!("/lookup/{}", code.to_uppercase()));
     assert!(fin.contains("\nnumber 1\n") && fin.contains("mature true"), "{fin}");
     assert!(get("/summary/1").contains("number=1"), "final: shown in the block too");
@@ -253,9 +255,9 @@ fn a_cheque_to_yourself_shows_as_both_receive_and_send() {
     let b = Book { salt: [7; 16], n256: false, book_size: 12, domains: vec![Domain([8; 32])] };
     let target = node.store.lock().unwrap().chain.state.reg_target;
     node.submit_tx(mine_registration(b.register(0, 16, Payment::Pow(0)), target), None).unwrap();
-    for _ in 0..4 { node.mine_once(1).unwrap(); }              // account 1 mines its own rewards
+    for _ in 0..4 { mine(&node, 1).unwrap(); }              // account 1 mines its own rewards
     for t in b.sign(1, &Message::new(1, 1000, 5, 1)) { node.submit_tx(t, None).unwrap(); }   // 1 coin to itself
-    node.mine_once(1).unwrap();
+    mine(&node, 1).unwrap();
     let h = get("/history/1");
     assert!(h.contains(" receive from=1 cheque=1 amount=100000000"), "{h}");
     assert!(h.contains(" send cheque=1 to=1 amount=100000000"), "{h}");
