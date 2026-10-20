@@ -103,6 +103,19 @@ pub extern "C" fn pieces() -> usize {
     out(b.pieces(cheque, &d).iter().map(|t| hex(&t.encode())).collect::<Vec<_>>().join("\n"))
 }
 
+/// io = seed (32) || cheque (2, little-endian) || 18 digits (one byte each) -> the 18 cells those digits pick (column c,
+/// row digit c), 32 hex digits each, one per line: the cells of `pieces` without deriving the whole book, so printing
+/// a sheet can check every cheque against the wallet's own code cheaply.
+#[no_mangle]
+pub extern "C" fn cells() -> usize {
+    let i = io().clone();
+    if i.len() != 52 { return 0; }
+    let Some(b) = book(&i[..32]) else { return 0 };
+    let cheque = u16::from_le_bytes([i[32], i[33]]);
+    if i[34..].iter().any(|&x| x > 9) { return 0; }
+    out((0..18u8).map(|c| hex(&b.domains[0].cell(b.n(), cheque, c, i[34 + c as usize]))).collect::<Vec<_>>().join("\n"))
+}
+
 /// io = seed (32) || cheque (2, little-endian) -> io = that cheque's commitments in the format of the node's
 /// GET /commits/<id>/<cheque>: 18 lines (columns), each 10 lowercase hex commitments (rows), space-separated. Equal to the
 /// node's answer when the node holds this book's cheque as registered: check it before revealing any cell.
@@ -161,6 +174,16 @@ pub extern "C" fn qr_read() -> usize {
 mod tests {
     use super::*;
     fn call(f: extern "C" fn() -> usize, input: &[u8]) -> String { *io() = input.to_vec(); let n = f(); String::from_utf8(io()[..n].to_vec()).unwrap() }
+    #[test]
+    fn cells_match_pieces() {
+        let seed = [9u8; 32];
+        for (q, d) in [(1u16, [3u8; 18]), (255, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 7])] {
+            let input = [&seed[..], &q.to_le_bytes(), &d].concat();
+            let want: Vec<String> = call(pieces, &input).lines().map(|t| t[t.len() - 32..].to_string()).collect();
+            assert_eq!(call(cells, &input).lines().collect::<Vec<_>>(), want);
+        }
+        assert_eq!({ *io() = [&seed[..], &[1, 0], &[10u8; 18]].concat(); cells() }, 0);
+    }
     #[test]
     fn cell_commit_matches_the_cheque_commitments() {
         let seed = [7u8; 32];
