@@ -119,14 +119,14 @@ impl Blocks {
         }
     }
     /// Encoded blocks `from..from+n` (fewer at the tip), opening the file once.
-    pub fn read_many(&self, from: usize, n: usize) -> Vec<Vec<u8>> {
+    pub fn read_many(&self, from: usize, count: usize) -> Vec<Vec<u8>> {
         match self {
-            Blocks::Mem(v) => v.iter().skip(from).take(n).map(|b| b.encode()).collect(),
+            Blocks::Mem(v) => v.iter().skip(from).take(count).map(|b| b.encode()).collect(),
             Blocks::File { path, genesis, at } => {
                 use std::io::{Read, Seek, SeekFrom};
                 let mut out = Vec::new();
                 let Ok(mut f) = std::fs::File::open(path) else { return out };
-                for h in from..(from + n).min(at.len()) {
+                for h in from..(from + count).min(at.len()) {
                     if h == 0 { out.push(genesis.encode()); continue; }
                     let (off, len) = at[h];
                     let mut buf = vec![0u8; len as usize];
@@ -135,7 +135,7 @@ impl Blocks {
                 }
                 out
             }
-            Blocks::Host { genesis, n, io } => (from..(from + n).min(*n)).map_while(|h| if h == 0 { Some(genesis.encode()) } else { (io.get)(h) }).collect(),
+            Blocks::Host { genesis, n, io } => (from..(from + count).min(*n)).map_while(|h| if h == 0 { Some(genesis.encode()) } else { (io.get)(h) }).collect(),
             Blocks::Count(_) => Vec::new(),
         }
     }

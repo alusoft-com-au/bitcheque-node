@@ -31,7 +31,7 @@ fn tmp(name: &str) -> std::path::PathBuf {
     for q in [p.clone(), p.with_extension("snap"), std::path::PathBuf::from(format!("{}.corrupt", p.display()))] { let _ = std::fs::remove_file(q); }
     p
 }
-fn book(k: u8) -> Book { Book { salt: [k; 16], n256: false, book_size: 256, domains: vec![Domain([k; 32])] } }
+fn book(k: u8) -> Book { Book { salt: [k; 16], n256: false, book_size: 256, domains: vec![Domain([k; 32])], net: rp().magic } }
 
 /// Before HELLO: the whole HELLO must arrive within HELLO_WAIT from accept (a byte every few seconds no longer holds a
 /// slot), a HELLO header claiming more than a HELLO can hold is refused at once, and so is any other first frame.
@@ -301,9 +301,9 @@ fn a_bad_registration_is_checked_once() {
     let p = rp();
     let g = Chain::genesis(&p, now() - 100_000, b"a");
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
-    let mut reg = book(4).register(0, 16, Payment::Pow(0));
+    let mut reg = book(4).register(0, 16, Payment::Pow([0; 32], 0));
     if let Tx::RegisterBook { batch, .. } = &mut reg { batch.cheques[15][17][9][0][0] ^= 1; }
-    let reg = mine_registration(reg, p.reg_pow_target);
+    let reg = mine_registration(reg, common::tip(&node), p.reg_pow_target);
     let line = bitcheque::crypto::hex(&reg.encode());
     assert_eq!(node.route("POST", "/check", &vec![line.as_str(); 64].join("\n")).err(), Some("too many registrations in one check"));
     let r = node.route("POST", "/check", &[line.as_str(), &line].join("\n")).unwrap();
@@ -329,7 +329,7 @@ fn the_mempool_listing_is_cached() {
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
     let books: Vec<Book> = (10..30).map(book).collect();
     for ch in books.chunks(10) {
-        for b in ch { node.submit_tx(mine_registration(b.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap(); }
+        for b in ch { node.submit_tx(mine_registration(b.register(0, 16, Payment::Pow([0; 32], 0)), common::tip(&node), p.reg_pow_target), None).unwrap(); }
         mine(&node, 0).unwrap();
     }
     { let mut m = node.mempool.lock().unwrap(); for b in &books { for t in b.pieces(1, &[9u8; 18]).into_iter().take(17) { assert!(m.push(t)); } } }

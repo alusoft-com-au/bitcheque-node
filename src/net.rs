@@ -674,9 +674,11 @@ impl Node {
     fn precheck(&self, t: &Tx) -> Result<[u8; 32], &'static str> {
         let id = t.txid();
         if let Some(e) = self.bad_txs.lock().unwrap().0.get(&id) { return Err(e); }
-        if let Tx::RegisterBook { .. } = t {
+        if let Tx::RegisterBook { pay: crate::tx::Payment::Pow(anchor, _), .. } = t {
+            // the anchor's recency depends on the chain, so it is taken as recent here and checked under the lock
             let mut s = State::new(&self.params);
             s.begin_block(&self.params, 1);
+            s.recent.push_back(*anchor);
             if let Err(e) = s.apply(&self.params, t) {
                 let mut b = self.bad_txs.lock().unwrap();
                 if b.0.insert(id, e).is_none() { b.1.push_back(id); }
