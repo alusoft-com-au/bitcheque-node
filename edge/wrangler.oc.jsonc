@@ -1,7 +1,7 @@
 // A fourth node, in Oceania (Sydney), deployed as its own Worker so the three in wrangler.jsonc are not touched:
 //   npx wrangler deploy -c wrangler.oc.jsonc
-// It is one of five nodes in a mesh: it pushes what it accepts to the other four and pulls from them every 30 seconds,
-// reaching them through service bindings to their Workers. It does not mine.
+// It is one of five nodes in a mesh: it pushes what it accepts to the other four and pulls from them every 3 minutes,
+// reaching them through service bindings to their Workers (UPSTREAMS: nearest first). It does not mine.
 {
   "$schema": "https://unpkg.com/wrangler@4/config-schema.json",
   "name": "bitcheque-node-oc",
@@ -11,11 +11,13 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["EdgeNode"] }],
   "services": [{ "binding": "NODE_MAIN", "service": "bitcheque-node" }, { "binding": "NODE_SA", "service": "bitcheque-node-sa" }],
   "triggers": { "crons": ["*/30 * * * *"] },
-  // the public's uncached requests: at most 300 a minute per address (peers, with EDGE_SECRET, are not limited)
-  "ratelimits": [{ "name": "RL", "namespace_id": "1001", "simple": { "limit": 300, "period": 60 } }],
+  // the public's uncached requests: at most 300 a minute per address (peers, with EDGE_SECRET, are not limited);
+  // /check and /template (the costliest) also at most 30 a minute
+  "ratelimits": [{ "name": "RL", "namespace_id": "1001", "simple": { "limit": 300, "period": 60 } },
+                 { "name": "RL_HEAVY", "namespace_id": "1002", "simple": { "limit": 30, "period": 60 } }],
   "routes": [{ "pattern": "node-oc.bitcheque.org", "custom_domain": true }],
   "vars": { "NET": "0", "REGIONS": "{\"oc\":\"oc\"}",
             "UPSTREAMS": "https://node-ap.bitcheque.org,https://node-us.bitcheque.org,https://node-eu.bitcheque.org,https://node-sa.bitcheque.org",
             "SERVICES": "{\"node-ap.bitcheque.org\":\"NODE_MAIN\",\"node-us.bitcheque.org\":\"NODE_MAIN\",\"node-eu.bitcheque.org\":\"NODE_MAIN\",\"node-sa.bitcheque.org\":\"NODE_SA\"}",
-            "MINE_REGIONS": "", "MINER_ID": "", "SYNC_S": "30" }
+            "MINE_REGIONS": "", "MINER_ID": "", "SYNC_S": "180" }
 }
