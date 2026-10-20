@@ -50,7 +50,10 @@ impl Book {
     /// Unmined registrations (nonce 0) covering cheques `first..=last` in batches of `BATCH`: the batch holding
     /// cheque 0 registers the book, every later one adds to it. Leaves are derived once for all of them.
     pub fn registrations(&self, first: u32, last: u32) -> Vec<Tx> {
-        let (leaves, n, root, id) = (self.leaves(), self.n(), self.root(), self.id());
+        // the book is derived once: root and id come from these leaves
+        let (leaves, n) = (self.leaves(), self.n());
+        let root = book::account_root(&self.key(), n, &leaves, self.book_size);
+        let id = account_id(self.m(), self.n256, &root);
         let last = last.min(self.book_size - 1);
         (first / BATCH..=last / BATCH).map(|k| {
             let (start, end) = (k * BATCH, ((k + 1) * BATCH).min(self.book_size));
