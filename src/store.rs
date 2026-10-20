@@ -174,6 +174,14 @@ impl Store {
     pub fn accept(&mut self, b: &Block, now: u32) -> Result<Accepted, &'static str> { self.accept_inner(b, now, None) }
     /// Whether a block is already stored, on the main chain or off it (a resend can be dropped before it is decoded).
     pub fn knows(&self, h: &[u8; 32]) -> bool { self.index.contains_key(h) || self.side.contains_key(h) }
+    /// Whether a block is known to break the rules, or builds on one that does (then it is remembered as bad too), told
+    /// from its header alone.
+    pub fn bad_header(&mut self, h: &crate::block::Header) -> bool {
+        let hash = h.hash();
+        if self.bad.contains_key(&hash) { return true; }
+        if self.bad.contains_key(&h.prev) { self.mark_bad(hash, "bad parent"); return true; }
+        false
+    }
 
     /// `loc`: the block's place in the file when loading; None means "new block, append it". A block that fails after
     /// its proof of work and tx root have checked out is remembered as bad (with its descendants), so sending it again

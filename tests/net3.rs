@@ -339,3 +339,33 @@ fn a_zero_filled_tail_is_cut_off() {
     let _ = std::fs::remove_file(&path); let _ = std::fs::remove_file(path.with_extension("snap"));
     let _ = std::fs::remove_file(format!("{}.corrupt", path.display()));
 }
+
+/// A10: a peer we dial whose taller chain breaks our rules (here, an older rule set's registration anchored further back
+/// than ours allows) is dropped at its first invalid block and not dialled again for a while, so it cannot keep holding
+/// templates back with its height claim while it keeps mining.
+#[test]
+fn a_peer_on_an_invalid_chain_does_not_hold_templates_back() {
+    let (pa, pb) = (rp(), Params { reg_anchor_window: 2, ..rp() });
+    let (a, b) = (node(&pa), node(&pb));
+    for _ in 0..4 { mine(&a, 0).unwrap(); }
+    let anchor = a.store.lock().unwrap().chain.hashes[1];
+    a.submit_tx(mine_registration(book(1).register(0, 16, Payment::Pow([0; 32], 0)), anchor, pa.reg_pow_target), None).unwrap();
+    for _ in 0..20 { mine(&a, 0).unwrap(); }
+    let addr = a.listen("127.0.0.1:0").unwrap().to_string();
+    let stop = Arc::new(Mutex::new(false));
+    let (a2, s2) = (a.clone(), stop.clone());
+    let miner = std::thread::spawn(move || while !*s2.lock().unwrap() { mine(&a2, 0).unwrap(); std::thread::sleep(Duration::from_millis(100)); });
+    b.maintain(vec![addr], Duration::from_millis(500));   // pinned: redialled whenever it drops
+    assert!(wait(10, || b.height() == 4), "the valid blocks are taken: {}", b.height());
+    assert!(wait(5, || b.peer_count() == 0), "dropped at the first invalid block");
+    let t = Instant::now();
+    let mut refused = 0;
+    while t.elapsed() < Duration::from_secs(6) {
+        if b.template(0).is_err() { refused += 1; }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    *stop.lock().unwrap() = true; miner.join().unwrap();
+    assert_eq!(refused, 0, "templates refused while a peer on an invalid chain was connected");
+    assert_eq!(b.peer_count(), 0, "the peer is dropped and not dialled again");
+    assert_eq!(b.height(), 4);
+}

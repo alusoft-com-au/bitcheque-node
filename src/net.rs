@@ -241,6 +241,7 @@ pub struct Node {
     banned: Mutex<HashMap<std::net::IpAddr, Instant>>,
     strikes: Mutex<(HashMap<std::net::IpAddr, (u32, Instant)>, Option<Instant>)>,   // bad messages per address (ban_key), since when; last sweep
     bars: Mutex<HashMap<std::net::IpAddr, Instant>>,   // addresses (ban_key) whose new connections start barred as sync sources
+    shunned: Mutex<HashMap<String, Instant>>,   // "host:port"s that served blocks our rules reject: not dialled before then
     addr_sources: Mutex<(HashMap<Vec<u8>, (u32, Instant)>, Option<Instant>)>,   // addresses taken from gossip per sending network, since when; last sweep
     bad_txs: Mutex<(HashMap<[u8; 32], &'static str>, VecDeque<[u8; 32]>)>,   // txids that can never be valid -> why, oldest first
     pub mempool_text: Mutex<Option<((usize, [u8; 32]), String)>>,   // /mempool's reply for (mempool version, tip)
@@ -303,7 +304,7 @@ impl Node {
         Arc::new(Node { store: Mutex::new(store), mempool: Mutex::default(), peers: Mutex::new(Vec::new()), next_id: Mutex::new(1), magic,
                         book: Mutex::new(BTreeMap::new()), book_path: Mutex::new(None), advertise: Mutex::new(None),
                         sync: Mutex::new(None), rpc_limit: Mutex::default(), top_cache: Mutex::new(None),
-                        next: Mutex::new(None), banned: Mutex::default(), strikes: Mutex::default(), bars: Mutex::default(), addr_sources: Mutex::default(), bad_txs: Mutex::default(),
+                        next: Mutex::new(None), banned: Mutex::default(), strikes: Mutex::default(), bars: Mutex::default(), shunned: Mutex::default(), addr_sources: Mutex::default(), bad_txs: Mutex::default(),
                         mempool_text: Mutex::new(None), params, upstream: Mutex::new(Vec::new()),
                         mempool_cap: AtomicUsize::new(MEMPOOL_BYTES), tpl_cache: Mutex::new(None) })
     }
@@ -416,6 +417,7 @@ impl Node {
     pub fn connect(self: &Arc<Self>, addr: &str) -> std::io::Result<()> {
         let a = addr.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::other("no address"))?;
         if !a.ip().to_canonical().is_loopback() && self.is_banned(Some(a.ip())) { return Err(std::io::Error::other("banned for a while")); }
+        if self.shunned.lock().unwrap().get(addr).is_some_and(|t| *t > Instant::now()) { return Err(std::io::Error::other("on a chain our rules reject, not dialled for a while")); }
         let s = TcpStream::connect_timeout(&a, DIAL_WAIT)?;
         self.add_peer_from(s, Some(addr.to_string()), true);
         Ok(())
@@ -575,8 +577,24 @@ impl Node {
         let p = &self.params;
         if crate::u256::U256::from_compact(h.bits) > crate::u256::U256::from_compact(p.min_bits.max(p.initial_bits)) { return Err("bits"); }
         if !h.meets_target() { return Err("pow"); }
-        if self.store.lock().unwrap().knows(&h.hash()) { return Err("known"); }
-        self.submit_block(&Block::decode(payload).map_err(|_| "decode")?, Some(from))
+        let hash = h.hash();
+        { let mut st = self.store.lock().unwrap(); if st.knows(&hash) { return Err("known"); } if st.bad_header(&h) { return Err("invalid chain"); } }
+        let r = self.submit_block(&Block::decode(payload).map_err(|_| "decode")?, Some(from));
+        // a failure our rules give every time (the store remembers the block as bad): the sender's chain is not ours
+        if r.is_err() && self.store.lock().unwrap().bad_header(&h) { return Err("invalid chain"); }
+        r
+    }
+    /// A peer sent a block our rules reject for good (a node on other consensus rules, or a liar): nothing it has from
+    /// there on is any use, and its height claim would hold templates back for as long as it mines. Its address is not
+    /// dialled for BAN (one off loopback is banned outright); the caller drops the connection.
+    fn shun(&self, peer: &Peer) {
+        let until = Instant::now() + BAN;
+        if let Some(a) = peer.addr.lock().unwrap().clone() {
+            let mut s = self.shunned.lock().unwrap();
+            s.retain(|_, t| *t > Instant::now());
+            s.insert(a, until);
+        }
+        if let Some(ip) = peer.ip.filter(|a| !a.is_loopback()) { self.banned.lock().unwrap().insert(ban_key(ip), until); }
     }
     fn serve(&self, peer: Arc<Peer>, mut reader: TcpStream, hello_by: Instant) -> std::io::Result<()> {
         send(&peer, &self.magic, HELLO, &self.hello());
@@ -692,6 +710,7 @@ impl Node {
                                 last_backoff = (self.height(), std::time::Instant::now(), depth);
                                 self.request_from(&peer, self.height().saturating_sub(depth).max(1));
                             }
+                            Err("invalid chain") => { self.shun(&peer); return Err(std::io::Error::other("peer on a chain our rules reject dropped")); }
                             // invalid, not merely unknown: a time too far ahead can be clock skew, one at or below the median cannot
                             Err("pow" | "bits" | "tx root" | "state root" | "decode" | "coinbase" | "block too large" | "duplicate transaction" | "old time" | "bad parent") => bad = true,
                             _ => {}

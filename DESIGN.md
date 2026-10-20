@@ -352,9 +352,14 @@ its whole HELLO (at most 200 bytes, and the first frame must be one) within
 10 s of connecting; after that a frame may take at most 120 s once it has
 started, and none may be longer than the largest block (plus 4 KB). A
 block's header and proof of work are checked, and a block already stored is
-recognised, before its transactions are decoded. 3 bad messages (an invalid
-block, one timestamped at or below the median, one built on a block known to
-be invalid, a repeated `getaddr`, a transaction that can never be valid, such
+recognised, before its transactions are decoded. A block our rules reject
+for good (one remembered as invalid, below, or built on one) ends the
+connection at once: the peer is on other consensus rules or lying, nothing
+it has from there on is any use, and its height claim would otherwise hold
+templates back for as long as it mines. Its address is not dialled again,
+and one off loopback is refused, for 30 minutes. 3 bad messages (a block
+failing a cheaper check, such as its proof of work or transaction root, a
+repeated `getaddr`, a transaction that can never be valid, such
 as a cheque piece matching no commitment) drop a peer and refuse its
 address for 30 minutes; strikes are counted per address (an IPv6 /64)
 across connections, and loopback is dropped but never refused (devnets run
