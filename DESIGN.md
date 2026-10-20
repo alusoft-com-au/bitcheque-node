@@ -228,8 +228,11 @@ is how miners, pools and exchanges use the chain:
   trusted, the ordinary hot-wallet position.
 - The command-line wallet (`bitcheque wallet`) drives one book from one
   seed: `register` registers the first 16 cheques (`--cheques N` for more),
-  `more` the next ones. It dry-runs every cheque against the node (`/check`)
-  before sending, and refuses to spend cheque 255 on anything but `sweep`
+  `more` the next ones. It keeps a locked, fsynced record of the last
+  cheque it signed (written before signing; cheque 0 is only ever the
+  honesty check), checks the message locally, never trusts a node's numbers
+  past the book or more than 3 cheques ahead (`--force-skip` burns the
+  skipped ones), and refuses to spend cheque 255 on anything but `sweep`
   unless told `--last`.
 - The one-time nature remains. A software wallet restored from seed must
   start above the chain's consumed number; the first-piece rule (§10.12)
