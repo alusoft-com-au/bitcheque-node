@@ -307,13 +307,43 @@ edge nodes above; placeholders on mainnet until the project has a domain), a
 and eight outbound connections kept up from that book. A node told nothing
 dials the seeds; a node told one peer with `--peer` learns the rest from it.
 `--advertise` is the address a node tells others it can be reached on.
-Limits: 125 inbound connections, 4 per address, 3 bad messages before a
-peer is dropped and its address refused for 30 minutes, 500 blocks per sync
-reply, a sync source that stalls for 30 s replaced, a 64 MB mempool.
+The book keeps one entry per IP (eight per /16), so one host on many ports
+cannot fill it. Outbound peers are chosen at random, addresses that
+answered a HELLO before ("tried") taking turns with new ones, at most one
+per /16 (/32 for IPv6), dialled in parallel with a 3 s timeout.
+
+Limits: 125 inbound connections, 4 per address. A new connection must send
+its whole HELLO (at most 200 bytes, and the first frame must be one) within
+10 s of connecting; after that a frame may take at most 120 s once it has
+started. 3 bad messages (an invalid block, one timestamped at or below the
+median, one built on a block known to be invalid) drop a peer and refuse its
+address for 30 minutes; strikes are counted per address (an IPv6 /64)
+across connections, and loopback is dropped but never refused (devnets run
+many nodes on one machine). 500 blocks per sync reply. The sync source is a
+random peer that is ahead, one we dialled if there is one (a claimed height
+is not trusted to choose by); it must raise our height by 50 blocks, or all
+it has left, every 30 s, or it is replaced and barred for 10 minutes, so a
+block now and then cannot hold the slot. Templates are refused ("syncing")
+only while a usable peer is more than 6 blocks ahead. A 64 MB mempool, with
+a txid set and a running byte count beside it.
+
+A block that fails validation after its proof of work and transaction root
+have checked out is remembered (the last 4,096), with any block built on
+it, so sending it again costs a lookup, not another validation or reorg
+replay. A tip block's header (difficulty, time) is checked before the
+block is written to the data file. After a reorg the new blocks are relayed
+first; the mempool is rebuilt from the abandoned blocks' transactions and
+what was waiting, and only the abandoned ones are relayed again. A
+registration's proof of work and batch (which need no chain state) are
+checked before the store lock is taken, and a txid that failed them is
+refused at once next time.
 
 Mining: a miner fills its block from the mempool oldest first up to the
 block size limit; there is no fee ordering yet. The template is rebuilt
-every 10 s when the mempool has changed.
+every 10 s when the mempool has changed. The node chooses a template's
+transactions once per tip, mempool and second, and keeps the blocks built
+from them for up to 16 payees, so miners with different payees cost one
+build each.
 
 ## 8. Open decisions
 
@@ -932,15 +962,35 @@ lines. Module map: `sha256` (own FIPS 180-4, with midstate), `u256`,
 4–6), `tx` (§2.2), `params` (§12.1: mainnet, research network, local),
 `state` (§2.1, §10.11, §10.12, Merkle state root with account proofs),
 `block` (§1, §12, LWMA, stall relief, per-account history and totals for
-the RPC), `store` (blocks left in the data file and read by offset, state
-snapshots every 1,000 blocks (as many kept as a reorg of `max_reorg` could need), most-work chain selection (a fork deeper than 100 blocks, `max_reorg`, needs twice the work of what it replaces), reorg by replay
-from the latest snapshot), `net` (§7 discovery, connection caps,
+the RPC), `store` (blocks left in the data file and read by offset; at
+startup the file is scanned header by header and only blocks after the
+snapshot are read and checked; a torn last record is cut off, but a record
+length no block can have stops the node and moves the file aside to
+`<data>.corrupt` rather than cutting off every block after it; state
+snapshots every 1,000 blocks to disk and, on a node, one in memory every
+`max_reorg` blocks (as many kept as a reorg of `max_reorg` could need), so
+an ordinary reorg replays at most about 2 × `max_reorg` blocks; with no
+usable snapshot a fork more than 2 × `max_reorg` blocks back is refused
+rather than replayed from genesis (on the edge node, whose snapshots are
+the host's, this bounds how deep a reorg it follows); most-work chain
+selection (a fork deeper than 100 blocks, `max_reorg`, needs twice the
+work of what it replaces, and its side blocks are kept only while the
+branch has at least half the main chain's work over the same heights;
+none forking more than 2,000 blocks back); side-branch work summed from
+headers; reorg by replay from the latest snapshot at or below the fork),
+`net` (§7 discovery, connection caps,
 misbehaviour strikes, mempool, mining; no transport encryption yet), `rpc`
-(plain-text HTTP, 120 requests per minute per address), `wallet` (§4.2
+(plain-text HTTP, 120 requests per minute per address (an IPv6 /64), 8
+connections at once per address (an IPv6 /56) and 256 in all; behind a
+reverse proxy on the same machine the client is the last
+`X-Forwarded-For` entry, which assumes exactly one proxy hop; a request
+must arrive within 20 s, plus a second per 32 KB of body actually
+received, and its reply be taken within 60 s; bodies must be ASCII;
+`/mempool` is cached per mempool version and tip), `wallet` (§4.2
 derivation, registration mining, non-consensus), `main` (`bitcheque
 genesis | node | wallet`). Tests: `tests/chain.rs` (life of the chain),
 `tests/net.rs` (sync and relay), `tests/store.rs` (reorg, persistence,
-proofs, RPC), `tests/hardening.rs`, plus the block 0 vector cross-checked
+proofs, RPC), `tests/hardening.rs`, `tests/net2.rs` (network, storage and RPC abuse), plus the block 0 vector cross-checked
 by `genesis.py`. P2P ports: 8730 mainnet, 8731 research network; the RPC
 listens only where `--rpc` says. The research network's genesis is
 2026-10-17 14:00 UTC, so blocks are mined before mainnet launch.
@@ -952,7 +1002,9 @@ their numbers once final, completed cheques with sender and recipient),
 `/history/<number>` (last 50 events; a cheque to yourself is listed as
 receive and send), `/proof/<number>`, `/regtarget`, `/stats`, `/top[/N]`,
 `/mempool` (with decoded waiting cheques, §10.12), `POST /tx`, `POST /check`
-(dry run of up to 64 transactions). Explorer addresses: `#block=N`,
+(dry run of up to 64 transactions, at most 2 of them registrations; a
+repeated line is answered "duplicate transaction"; an empty body answers
+at once). Explorer addresses: `#block=N`,
 `#account=N`, `#code=XXXX-XXXX-XXXX`, `#mempool`.
 
 Browser wallet: `web/wasm` compiles the same crate to WebAssembly for the
