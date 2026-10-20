@@ -257,6 +257,19 @@ nodes do not pull from it, so its own blocks reach them only by that push.
 The RPC is plain HTTP (no TLS dependency): blocks and transactions check
 themselves, so a party in between can withhold them but not forge them.
 
+The edge nodes form a mesh among themselves: each pushes what it accepts to
+the other four and pulls only as a safety net (not while pushed blocks keep
+arriving). Their calls carry a shared secret and the chain version; a peer
+on another version (an old node after a reset) is neither pulled from nor
+pushed to, and without the secret nobody counts as a peer. A peer that
+times out is left alone for three minutes; one that sends a refused block,
+or claims a greater height but sends nothing that moves the chain, is not
+pulled from for ten. A fork is found by comparing block hashes, stepping
+back 1, 2, 4… blocks and then halving the gap. Only transactions a node had
+from the public are offered to the others again, after a wake, at most
+twice. Their RPC answers only paths spelt one way (no leading zeros, no
+trailing slash), so each has one cache key.
+
 Peer discovery over TCP follows Bitcoin's model (implemented in `net.rs`): seed node names
 compiled into the binary (none on the research network, whose seeds are the
 edge nodes above; placeholders on mainnet until the project has a domain), a
