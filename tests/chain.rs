@@ -27,6 +27,7 @@ fn life_of_the_chain() {
     let p = params();
     let g = Chain::genesis(&p, 1000, b"test");
     let mut net = Net { chain: Chain::new(p.clone(), &g).unwrap(), t: 1000 };
+    net.mine(0, vec![]).unwrap();   // block 0 is no registration anchor
 
     // miner: software book, m = 1, 16 cheques, PoW-paid. A number takes rewards only once final (number_maturity
     // blocks deep, as for a cheque's payee), so it mines to nobody until then (§12.2)
@@ -59,10 +60,10 @@ fn life_of_the_chain() {
     // user pays 0.5 coin back with cheque 3, payee columns in one block, the rest in the next
     let pieces = user.sign(3, &Message::new(1, 5000, 4, 2));
     net.mine(1, pieces[..12].to_vec()).unwrap();
-    assert!(net.chain.state.accounts[&user.id()].open.is_some());
+    assert!(net.chain.state.accounts[&user.id()].open.contains_key(&3));
     net.mine(1, pieces[12..].to_vec()).unwrap();
     let u = &net.chain.state.accounts[&user.id()];
-    assert_eq!((u.balance, u.nonce, u.open.is_none()), (COIN - 5000 * 10_000 - 2 * p.fee_unit, Some(3), true));
+    assert_eq!((u.balance, u.nonce, u.open.is_empty()), (COIN - 5000 * 10_000 - 2 * p.fee_unit, Some(3), true));
     assert!(!u.commits.contains_key(&1) && !u.commits.contains_key(&2) && !u.commits.contains_key(&3));
 
     // rejections: lower number, replay, wrong shares
@@ -81,7 +82,7 @@ fn life_of_the_chain() {
     assert_eq!(net.chain.state.clone().apply(&p, &wrong[17]), Err("payee check digit wrong"));
     for _ in 0..3 { net.mine(1, vec![]).unwrap(); }
     let u = &net.chain.state.accounts[&user.id()];
-    assert!(u.open.is_none() && !u.commits.contains_key(&4) && u.nonce == Some(4));
+    assert!(u.open.is_empty() && !u.commits.contains_key(&4) && u.nonce == Some(4));
 
     // sweep: user empties the account to the miner with cheque 10; only cheques above it stay spendable
     net.mine(1, user.sign(10, &Message::new(1, 0, 9, 1))).unwrap();
@@ -178,6 +179,7 @@ fn a_book_grows_a_batch_at_a_time() {
     let p = params();
     let g = Chain::genesis(&p, 1000, b"test");
     let mut net = Net { chain: Chain::new(p.clone(), &g).unwrap(), t: 1000 };
+    net.mine(0, vec![]).unwrap();   // block 0 is no registration anchor
     let book = Book { salt: [3; 16], n256: false, book_size: bitcheque::wallet::BOOK_SIZE, domains: vec![Domain([4; 32])], net: Params::mainnet().magic };
     let first = book.registrations(0, 11);
     assert_eq!(first.len(), 1);

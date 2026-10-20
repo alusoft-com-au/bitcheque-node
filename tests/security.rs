@@ -17,7 +17,8 @@ fn params() -> Params {
 }
 struct Net { chain: Chain, t: u32 }
 impl Net {
-    fn new(p: &Params) -> Net { let g = Chain::genesis(p, 1000, b"t"); Net { chain: Chain::new(p.clone(), &g).unwrap(), t: 1000 } }
+    /// After one empty block: block 0's hash is no registration anchor.
+    fn new(p: &Params) -> Net { let g = Chain::genesis(p, 1000, b"t"); let mut n = Net { chain: Chain::new(p.clone(), &g).unwrap(), t: 1000 }; n.mine(0, vec![]).unwrap(); n }
     fn mine(&mut self, payee: u32, txs: Vec<Tx>) -> Result<(), &'static str> {
         self.t += 600;
         let b = self.chain.make_block(self.t, payee, txs)?;

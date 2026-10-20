@@ -5,6 +5,8 @@ use crate::u256::U256;
 pub const COIN: u64 = 100_000_000;
 /// Cheques per registration: every batch has exactly this many (also the decoder's cap).
 pub const MAX_BATCH: u32 = 16;
+/// The public research network's magic. Its books derive cells without the magic, as they always have (DESIGN.md §4.2).
+pub const TESTNET_MAGIC: [u8; 4] = [0xBC, 0x4E, 0x51, 0x01];
 
 #[derive(Clone, Debug)]
 pub struct Params {
@@ -71,7 +73,7 @@ impl Params {
             min_fund: COIN,                // permanence costs a coin held, not one base unit
             renew_window: 43_200,          // the last 30 days of a batch's life
             max_reorg: 100,                // as deep as number_maturity: replacing a final number takes twice the work
-            unfunded_pow_lifetime: 43_200, // 30 days
+            unfunded_pow_lifetime: 4_320,  // 3 days: one registration a block at the floor target then holds ~200 MB, not ~2 GB
             number_quarantine: 525_600,    // a year
             batch_lifetime: 2_100_000,     // about four years
             piece_lifetime: 10_000,        // about a week
@@ -86,7 +88,7 @@ impl Params {
         // the easiest target is about 2^19 hashes a block: under a second for any computer, and about a second for
         // the edge node's backup miner (WebAssembly, ~0.8 MH/s), which mines only when nobody else has for 50
         // seconds. Real miners joining raise it within a few blocks (LWMA, up to 3x per block).
-        Params { initial_bits: 0x1F00_FFFF, min_bits: 0x1E20_0000, stall_relief: true, magic: [0xBC, 0x4E, 0x51, 0x01], ..Params::mainnet() }
+        Params { initial_bits: 0x1F00_FFFF, min_bits: 0x1E20_0000, stall_relief: true, magic: TESTNET_MAGIC, ..Params::mainnet() }
     }
     /// Private network for running several nodes on one machine: 1-minute blocks, short maturities, easy work.
     pub fn local() -> Params {

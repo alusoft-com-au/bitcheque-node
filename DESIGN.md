@@ -1,4 +1,4 @@
-# BITCHEQUE — design notes (v0.7, 12-cheque books, 2026-10-19)
+# BITCHEQUE — design notes (v0.8, 256-cheque books, 2026-10-20)
 
 A Bitcoin-derived chain with six hard requirements:
 
@@ -34,8 +34,8 @@ them 16 at a time (§10.10). The printed cheques are printed in **two parts, as 
 clean, offline computer with a USB-only printer that is switched off
 afterwards:
 
-- **Part A**: the 12 recipient columns P1–P12 of cheques 1–11.
-- **Part B**: the amount columns D1–D4, the exponent E and the fee tier F.
+- **Part A**: the 12 recipient columns P1–P12 (columns 0–11) of every printed cheque.
+- **Part B**: the amount columns D1–D4, the exponent E and the fee tier F (columns 12–17).
 
 Parts are kept in different places and brought together only to write a
 cheque. A cheque reveals **18 cells, 216 words** (or 18 scanned QR codes,
@@ -43,7 +43,9 @@ cheque. A cheque reveals **18 cells, 216 words** (or 18 scanned QR codes,
 (§6).
 
 What the part split does and does not buy: a thief who finds only part A or
-only part B cannot write a cheque, because every cheque needs cells from both.
+only part B cannot write a cheque, because every cheque needs cells from both,
+and cannot burn cheques either: pieces from one part bind nothing (§10.12). At
+worst such a thief pins some unused cheques to its digits until they expire.
 It does **not** protect against a compromised machine: the computer that holds
 the seed sees every cell. Offline printing is therefore the main defence.
 
@@ -78,7 +80,7 @@ Account {
   funded       bool                  has held at least min_fund (1 coin) or been mined to; an unfunded PoW account expires (§2.2)
   batches      map                   registered cheque ranges and their expiry
   commits      map                   commitments of registered, unspent cheques
-  open         cheque or none        the cheque being submitted piece by piece (§10.12)
+  open         map                   cheques with pieces on chain, each with its digits and expiry (§10.12)
 }
 ```
 
@@ -103,11 +105,12 @@ A third party can only register your true hashes, which helps you. A
 `RegisterBook` or `RegisterBatch` is paid only by proof of work over its txid (no coins
 needed), so every 16 cheques of node state cost the same work however they arrive: initial target 2^228 (≈ 2^28 hashes), at most 16 per block (about what fits), the
 target adjusting every block (§8 item 2). The work is anchored: the payment is `(anchor, nonce)`, where
-`anchor` is the hash of one of the last 144 blocks (`reg_anchor_window`) of the chain it is mined into, and
+`anchor` is the hash of one of the last 144 blocks (`reg_anchor_window`) of the chain it is mined into (never block 0, which is
+known before launch), and
 the txid covers it. So the work is done at mining time for one chain and one moment: it cannot be replayed
 after the account expires, on another network, or a day later. Registration files made offline carry a
 zero anchor; the online wallet sets the tip as the anchor when it mines. A PoW account that has
-not been funded after 43,200 blocks (~30 days) is deleted and its number
+not been funded after 4,320 blocks (~3 days) is deleted and its number
 quarantined for 525,600 blocks (~a year) before reuse; once funded it is
 permanent. Funded means a balance of at least `min_fund` (1 coin) after a cheque arrives, or a block reward
 mined to it; dust does not count. An account
@@ -145,10 +148,9 @@ carried in `RegisterBook`; the reference wallets derive it from the seed
 the book. `net` is the network's 4-byte magic (`Params::magic`: mainnet, the research network, a local
 devnet), so the same seed and salt give different commitments, roots and account ids on each network:
 a registration or a piece made for one is invalid on another. Testnet books keep their ids across testnet
-resets (same magic), which is intended. Caveats: (1) the paper cells themselves come from the seed alone, so a
-seed used on two networks reveals on one the cells of the same cheque number on the other, and anyone can
-then send that same cheque (same payee number, same amount) there: never use one seed on two networks
-(binding the cell derivation to the network needs a print-page change and is left for mainnet). (2) After a
+resets (same magic), which is intended. Caveats: (1) the paper cells are bound to the network too
+(§4.2), except on the research network, whose books derive them from the seed alone; a research-network
+seed reused elsewhere is still a different book there, so no cheque crosses over. (2) After a
 testnet reset a re-registered book has the same commitments as before, so pieces of cheques it revealed on
 the old chain can be replayed on the new one if those cheque numbers are registered and unused again; hold
 such a book's old cheques as used (spend above the old nonce) or start a new book. `addr` is 8 bytes: (tag, cheque u16, column, index, extra, 0, 0),
@@ -166,15 +168,15 @@ onlookers but plays no part in validity.
 | Stage | Who | Computes | Compares / verifies | Secret? |
 |---|---|---|---|---|
 | 1. Seed | the offline printing computer (one per domain in a split book) | 256 random bits, shown as 24 words | — | yes, paper only |
-| 2. Cheque key | the offline printing computer | `key[N] = SHA256("bitcheque/key" ‖ seed ‖ N)` | — | yes |
+| 2. Cheque key | the offline printing computer | `key[N] = SHA256("bitcheque/key" ‖ net ‖ seed ‖ N)` (no `net` on the research network, §4.2) | — | yes |
 | 3. Cell | the offline printing computer | `cell[N][c][r] = SHA256("bitcheque/cell" ‖ key[N] ‖ c ‖ r)[..n]`; printed | — | yes, paper only |
 | 4. Commitment | any computer, from the share hashes | `h_k = H(addr, cell_k)` per domain k; `commit = H(addr, h_1 ‖ … ‖ h_m)` | — | no |
 | 5. Column tree, cheque leaf, root | any computer | Merkle tree over the 10 commits of a column (padded to 16); `leaf[N] = H(root_0 … root_17)`; account root over all leaves | — | no |
 | 6. Registration | every node | recomputes leaves from submitted share hashes, walks Merkle paths | path must end at the root in the account id; batch aligned and not overlapping; PoW below target, per-block cap | no |
 | 7. Writing | the user | nothing | reads a row per digit, copies or scans 18 × m cells | reveals exactly those cells |
 | 8. Decoding | broadcasting computer | `H(addr, cell)` for each cell | finds the row whose stored commit matches; shows the decoded recipient and amount | sees only revealed cells |
-| 9. Piece validation | every node | `commit' = H(addr, H(addr, cell_1) ‖ … ‖ H(addr, cell_m))` per row | some row's `commit'` == stored commit; account exists; `N > nonce` (or N is the open cheque); column not yet revealed; batch registered and unexpired; on first piece `nonce := N`, lower unspent cheques and any other open cheque are deleted | no |
-| 10. Completion | every node | Damm over P1–P12; amount = mantissa × 10^E (sweep: balance − fee); fee = F × FEE_UNIT | Damm result == 0; recipient is 0 or an existing number 100 blocks old; balance ≥ amount + fee; then transfer, prune cheque N's commits | no |
+| 9. Piece validation | every node | `commit' = H(addr, H(addr, cell_1) ‖ … ‖ H(addr, cell_m))` per row | some row's `commit'` == stored commit; account exists; `N > nonce` (or N is open); column not yet revealed; batch registered and unexpired; when cheque N first has a column from each part, `nonce := N` and every lower cheque, open or not, is deleted | no |
+| 10. Completion | every node | Damm over P1–P12; amount = mantissa × 10^E (sweep: balance − fee); fee = F × FEE_UNIT | Damm result == 0; recipient is 0 or an existing number 100 blocks old, otherwise the cheque is void (nothing moves); balance ≥ amount + fee; then transfer, prune cheque N's commits | no |
 | 11. Block | miner, then every node | SHA-256d over the header; tx Merkle root; state root | header meets difficulty; every piece re-validated; state root matches | no |
 | 12. Afterwards | anyone, light clients | — | Merkle proofs against `state_root` for balance, nonce, number | no |
 
@@ -206,9 +208,13 @@ computer's randomness mixed with mouse movement. No passphrase.
 ### 4.2 Derivation (one-way, hierarchical)
 
 ```
-key[N]            = SHA256("bitcheque/key"  || seed_X || N)          per seed X, per cheque N
+key[N]            = SHA256("bitcheque/key"  || net || seed_X || N)   per seed X, per cheque N
 cell[N][col][row] = SHA256("bitcheque/cell" || key[N] || col || row)[..n]
 ```
+
+`net` is the network's 4-byte magic, so one seed on two networks gives unrelated cells and a cheque written
+on one cannot be replayed on the other. The research network (magic `BC 4E 51 01`) leaves `net` out, as every
+book printed for it so far was derived, so those books keep working.
 
 The seed enters the offline computer at printing, and again whenever the
 holder prints more cheques of the same book (§10.10). Account discovery: a restored wallet recomputes
@@ -235,7 +241,7 @@ is how miners, pools and exchanges use the chain:
   skipped ones), and refuses to spend cheque 255 on anything but `sweep`
   unless told `--last`.
 - The one-time nature remains. A software wallet restored from seed must
-  start above the chain's consumed number; the first-piece rule (§10.12)
+  start above the chain's consumed number; the binding rule (§10.12)
   bounds any mistake to sending more to a chosen recipient.
 
 There is no other signature type. A device that wants to sign "normally"
@@ -251,10 +257,11 @@ simply drives a cheque book.
   for a split book, m = 2). Verification: each piece is tried row by row,
   m + 1 hashes per row, so at most 18 × 10 × (m + 1) hashes (360 at m = 1).
 - A 16-cheque registration is ≈ 58 KB at m = 1, so about 17 fit in a block,
-  well below the PoW cap of 200. A full 256-cheque book is 16 of them and
+  about the PoW cap of 16. A full 256-cheque book is 16 of them and
   ≈ 740 KB of node state while unspent.
 - 1 MB block ≈ 1,100 cheques a minute ≈ 18 cheques/s.
 - Light clients: headers + `state_root` proofs for balance, nonce, number.
+- Unfunded registrations: ≈ 200 MB at one a block (§8 item 2).
 - In memory a registered cheque's 180 commitments are one flat 2,880-byte blob shared between state copies
   (≈ 3.1 KB per cheque all told); snapshots write them as raw blobs. Accounts are shared between the
   per-block state copies (copy on write) and each caches its leaf hash, so a block copies one pointer per
@@ -266,6 +273,8 @@ simply drives a cheque book.
   those are not hashed again); `rest` hashes the height, the next new number, the free-number queue, pending
   rewards, deleted accounts' nonces, the registration target and this block's registration count. The last
   144 block hashes (registration anchors) are state too, but follow from the header chain and are not hashed.
+  Snapshots therefore carry some state (`numbers`, the expiry list, those hashes, the magic) that the root does
+  not check when one is loaded: a node loads only its own (or its host's) snapshots, never one from elsewhere.
 
 ## 7. Network layer (non-consensus)
 
@@ -360,6 +369,12 @@ build each.
    4.5 times in 144), so a burst hardens within hours; an empty block makes it
    0.07% easier (about e times easier per quiet day); never easier than the
    initial target.
+   Memory: a registration holds 16 × 2,880 B ≈ 46 KB of commitments until
+   funded or deleted. At the floor target one a block costs only ~2^28
+   hashes, so an unfunded account lives 4,320 blocks (~3 days): one a block
+   then holds ≈ 4,320 × 46 KB ≈ 200 MB, against ≈ 2 GB at the former 43,200;
+   more than one a block hardens the target exponentially (two a block: twice
+   as hard every ~1,000 blocks), so the window cannot be filled much faster.
    Open: whether the level is right with real demand.
 3. **`FEE_UNIT`** adjustment rule and whether tiers scale with a
    fee-market signal.
@@ -421,8 +436,8 @@ A cheque says exactly one thing, written in 18 decimal digits:
 
 - Cheque number: printed on the sheet; must be greater than the account's
   nonce (or be the open cheque being completed), so a used cheque can never
-  be replayed. Numbers are used in rising order: the first piece of a higher
-  number deletes every unused lower one.
+  be replayed. Numbers are used in rising order: once a higher number binds
+  (a cell of each part on chain, §10.12) every unused lower one is deleted.
 - mantissa `0000` with exponent `0` means zero coins (honesty check);
   mantissa `0000` with exponent `9` means "entire balance minus fee"
   (sweep); `0000` with any other exponent is invalid.
@@ -505,11 +520,12 @@ All hashes are address-tweaked (§3.1). Cells derive from the seed as in
 Security: forging a different message on a used leaf needs a preimage for an
 unrevealed secret (2^128 classical, 2^64 sequential quantum). No message
 hashing means no collision surface at all. Writing a second, different
-cheque on a used number leaks secrets that allow mix-and-match forgeries,
-but the nonce rule makes a second use unincludable once the first has a
-piece on chain, so the only exposure is a race where two different cheques
-with the same number are both in the public mempool before either
-confirms.
+cheque on a used number leaks secrets that allow mix-and-match forgeries.
+A piece on chain does not end that exposure: the cheque stays completable,
+from any mix of the revealed cells that fits the columns already fixed, until
+it completes (or, bound, expires). Columns already on chain cannot be
+replaced, so once the recipient columns are in a block only the amount can
+still be mixed; never write a number twice.
 
 ### 10.4 Sequential account numbers
 
@@ -555,9 +571,10 @@ otherwise the next value of a global counter (starting at 1). The mapping
   apply by hand.
 - Numbers are `u32` on chain (up to ≈ 4.3 × 10^9); the 11-digit field
   leaves room to widen. Unfunded PoW accounts expire and their numbers
-  return after the quarantine, so spam can hold at most about
-  200 × 569,000 ≈ 1.1 × 10^8 numbers at once (fewer in practice: block size
-  allows about 23 registrations per block).
+  return after the quarantine, so spam can hold at most
+  16 × (4,320 + 525,600) ≈ 8.5 × 10^6 numbers at once at the per-block cap,
+  and about 530,000 at the one registration a block the target settles at
+  (§8 item 2).
 - Only numbers of deleted never-funded accounts are reused, after a
   one-year quarantine. Number 0 is nobody (honesty check, fee sink).
 - Numbers carry no secret and no authority: knowing all of them only lets
@@ -582,10 +599,12 @@ This replaces the name registry of earlier drafts.
   only. To void it, confirm any higher-numbered cheque; lower numbers become
   invalid.
 - An account gets its number at `RegisterBook` and can receive after 100
-  blocks; only then is the number published. Until funded it can only run
-  zero-amount cheques, and if never funded it expires after 43,200 blocks.
-- Unfinished cheque: its pieces die after 10,000 blocks (~a week); the
-  number stays consumed.
+  blocks; only then is the number published. Until funded (1 coin held, or
+  a block reward) it is temporary: if never funded it is deleted after
+  4,320 blocks (~3 days). It can send whatever it holds meanwhile.
+- Unfinished cheque: its pieces die 10,000 blocks (~a week) after the
+  first. If cells of both parts were on chain the number stays consumed;
+  pieces from one part only leave the cheque usable.
 - Untrusted online computer: it learns 18 secrets that only authorise the
   exact cheque you wrote. It can refuse to broadcast, nothing more.
 
@@ -620,11 +639,14 @@ are allowed (`m`-of-`m`, m up to 7 in the account's scheme byte
 
 What a malicious device can still do is **sabotage**: print one book but
 hash a different set of secrets, so your account can never send (it
-cannot send either, lacking the other half). Defence, used by every book:
-before funding the account, send cheque 0 for zero coins to number 0 and
-let the chain verify it against the root. If it verifies, every device told
-the truth about its hashes, because it cannot know which 18 secrets you
-would reveal. Cheque 0 is reserved for this and sent with the registration.
+cannot send either, lacking the other half). Cheque 0 for zero coins to
+number 0 is sent with the registration and verified by the chain, but it
+proves little: it always reveals row 0 of every column of cheque 0, a cheque
+that is never printed, so it shows only that the device can compute cheque 0,
+not that the printed cheques match what was registered. The check that does:
+before funding, the wallet compares cells picked at random from the printed
+sheets against the registered commitments (`GET /commits/<id>/<cheque>`),
+which a device cannot predict at printing.
 
 Per-cheque cost at `m = 2`:
 
@@ -662,8 +684,8 @@ setup, 36 cells to sign from any two books, 3 commitments per cell
 (registration ≈ 3×), a thief still needs two books, and the loss of one
 seed-and-book pair is recoverable by reprinting from the other two. It is
 also the inheritance shape: holder, spouse, lawyer. The one-time rule is
-unchanged: a cheque number is consumed by its first public piece whichever
-pair signs it.
+unchanged: a cheque number is consumed once cells of both parts are public,
+whichever pair signs it.
 
 ### 10.7 Machine-readable paper
 
@@ -707,10 +729,11 @@ advance. Consensus does not implement it.
   the original printing. Without this the book is unrecoverable.
 - **Store halves apart.** Keep book A and book B in different places and
   bring them together only to sign. A stolen half cannot send.
-- **Sabotage is bounded.** Cheque 0 samples 18 of 180 cells, so a
-  dishonest device can corrupt a few cells and make specific messages
-  unsignable from that book. It cannot steal, and coins can always be
-  moved in other amounts.
+- **Sabotage.** Cheque 0 alone proves nothing about the paper (§10.6);
+  random printed cells checked against `GET /commits` before funding catch
+  a device that hashed something else. A device that corrupts only a few
+  cells can still make specific messages unsignable from that book; it
+  cannot steal, and coins can be moved in other amounts.
 
 ### 10.10 Seeds, derivation and the fixed book
 
@@ -780,14 +803,36 @@ may come from different devices, places and times.
 - Uses: thin channels (SMS, radio, post); several people each holding some
   columns as an approval mechanism; in a split book, cells from two
   machines.
-- **Commitment rule.** Once any piece is public the cheque number is bound
-  to that recipient and amount. Finish it or void it with a higher number;
-  never write a different cheque with the same number.
-- Pieces of an unfinished cheque expire after 10,000 blocks (~a week); the
-  number stays consumed (the account nonce is advanced on first piece). A
-  first piece of another number also deletes the open cheque.
-- Wallets submit recipient columns first, so the recipient is fixed on
-  chain before anything else is public.
+- **Opening and binding (consensus).** A piece of cheque N > nonce opens N
+  and binds nothing else; several cheques may be open at once (at most the
+  registered unspent ones, each a few dozen bytes beside its 2.9 KB of
+  commitments). When N first has a revealed column from each printed part
+  (one of columns 0–11 and one of 12–17), N **binds**: `nonce := N`, and
+  every lower cheque, open or not, is deleted. Completion has all 18 columns,
+  so it always binds.
+- **Expiry.** An open cheque expires 10,000 blocks (~a week) after its first
+  piece; later pieces do not move that. A bound cheque's number stays used.
+  A cheque opened from one part only is forgotten and stays spendable.
+- So a holder of only part A, only part B, or one leaked cell can neither
+  burn nor freeze the book: it can open cheques with its own digits, which
+  the owner ignores (other cheques, or a higher one that deletes them) or
+  waits out. It cannot complete them. Residual: a thief with a whole part
+  can keep re-opening unused cheques as they expire, so after any theft of
+  a part sweep the balance to a new book.
+- **Commitment rule.** Once any piece is public, its digit is fixed for
+  that cheque while it is open, and its cell is public for good. Finish the
+  cheque or void it with a higher number; never write a different cheque
+  with the same number.
+- Wallets submit the 12 recipient columns first and the amount only once
+  those are in a block, and only after checking that the chain shows that
+  cheque open with exactly their recipient (a part-A thief cannot then
+  substitute its own: those columns are taken). A cheque already open with
+  someone else's digits is skipped. A part-B holder racing the amount
+  pieces could at worst choose the amount the owner's recipient receives.
+- **Unknown recipient.** A completing piece whose payee number does not
+  exist or is not yet final (100 blocks) is accepted and voids the cheque:
+  the number is used, no coins move and no fee is charged. So nobody who
+  gets that number later can collect it.
 - Nodes decode waiting pieces against the commitments: `/mempool` lists a
   waiting cheque's recipient once its 12 recipient digits are visible, valid
   and final, and its amount and fee once all 18 are.
@@ -823,9 +868,11 @@ that remain:
   Decide before freezing; not implemented.
 - **Fee unit.** Tiers are multiples of `FEE_UNIT`; an on-chain adjustment
   rule (e.g. median fee of recent blocks) is needed so tiers track demand.
-- **Sampled honesty check.** 18 of 180 cells are proven; a dishonest device
-  can still corrupt a few cells, which is denial of specific amounts, not
-  theft.
+- **Honesty check.** Cheque 0 always reveals row 0 of an unprinted cheque,
+  so it shows only that the device computes cheque 0; random printed cells
+  compared with `GET /commits` before funding are the real check. A
+  dishonest device can still corrupt a few cells, which is denial of
+  specific amounts, not theft.
 
 ## 11. Security relative to Bitcoin (summary)
 
@@ -859,11 +906,11 @@ is unspendable, as in Bitcoin.
 | Proof-of-work | SHA-256d over the 112-byte header | AuxPoW (merge-mining) not implemented, §8 item 1 |
 | Header | version 4 B, prev 32 B, tx root 32 B, state root 32 B, time 4 B, bits 4 B, nonce 4 B | 112 B |
 | Block limit | 1,000,000 bytes (encoded block) | §6 |
-| Registration PoW | target 2^228 initially, adjusting every block (time constant 1,440 blocks); anchored to one of the last 144 block hashes; at most 16 PoW registrations per block | §8 item 2 |
+| Registration PoW | target 2^228 initially, adjusting every block (time constant 1,440 blocks); anchored to one of the last 144 block hashes (not block 0's); at most 16 PoW registrations per block | §8 item 2 |
 | Funding | an account becomes permanent once it holds 1 coin (`min_fund`) after a cheque, or is mined to | §2.2 |
-| Unfunded PoW account | deleted after 43,200 blocks (~30 days); number quarantined 525,600 blocks (~a year) | §2.2 |
+| Unfunded PoW account | deleted after 4,320 blocks (~3 days); number quarantined 525,600 blocks (~a year) | §2.2, §8 item 2 |
 | Batch lifetime | 2,100,000 blocks (~4 years); `Renew` costs 10,000 base units, `RegisterBatch` the registration proof of work | §10.11 |
-| Piece lifetime | 10,000 blocks (~a week) | §10.12 |
+| Piece lifetime | 10,000 blocks (~a week) from a cheque's first piece | §10.12 |
 | Book size | exactly 256 cheques; every batch exactly 16, aligned, the first (`RegisterBook`) at cheque 0, each paid by proof of work | §2.2, §10.10; a 16-cheque batch (≈ 58 KB) fits any block |
 | `FEE_UNIT` | 1,000 base units (0.00001 coin) initially | adjustment rule: §8 item 3 |
 | Account number 0 | reserved: nobody; coins and fee of a cheque to it go to the block's miner | §2.2 |
@@ -990,7 +1037,8 @@ received, and its reply be taken within 60 s; bodies must be ASCII;
 derivation, registration mining, non-consensus), `main` (`bitcheque
 genesis | node | wallet`). Tests: `tests/chain.rs` (life of the chain),
 `tests/net.rs` (sync and relay), `tests/store.rs` (reorg, persistence,
-proofs, RPC), `tests/hardening.rs`, `tests/net2.rs` (network, storage and RPC abuse), plus the block 0 vector cross-checked
+proofs, RPC), `tests/hardening.rs`, `tests/net2.rs` (network, storage and RPC abuse), `tests/consensus2.rs` and
+`tests/consensus3.rs` (consensus audits), plus the block 0 vector cross-checked
 by `genesis.py`. P2P ports: 8730 mainnet, 8731 research network; the RPC
 listens only where `--rpc` says. The research network's genesis is
 2026-10-17 14:00 UTC, so blocks are mined before mainnet launch.
@@ -1008,7 +1056,7 @@ at once). Explorer addresses: `#block=N`,
 `#account=N`, `#code=XXXX-XXXX-XXXX`, `#mempool`.
 
 Browser wallet: `web/wasm` compiles the same crate to WebAssembly for the
-website: the 12-cheque book from a seed, the registration (mined in slices
+website: the 256-cheque book from a seed, the registration (mined in slices
 by workers on all cores), the honesty check, cheque pieces, the lookup
 code, and a QR encoder (levels M and H) and camera reader.
 

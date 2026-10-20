@@ -37,6 +37,7 @@ fn bk(k: u8, net: [u8; 4]) -> Book { Book { salt: [k; 16], n256: false, book_siz
 fn fragment_registration_refused() {
     let p = params();
     let mut net = Net::new(&p, 1000);
+    net.mine(0, vec![]).unwrap();   // block 0 is no registration anchor
     let v = bk(9, p.magic);
     let victim_tx = net.reg(&v);
     let Tx::RegisterBook { salt, m, n256, book_size, root, batch, .. } = victim_tx.clone() else { panic!() };
@@ -60,6 +61,7 @@ fn cross_chain_replay_refused() {
     let pa = Params { magic: [1, 1, 1, 1], ..params() };
     let pb = Params { magic: [2, 2, 2, 2], ..params() };
     let (mut a, mut b) = (Net::new(&pa, 1000), Net::new(&pb, 5000));
+    a.mine(0, vec![]).unwrap(); b.mine(0, vec![]).unwrap();
     let (ua, ub) = (bk(5, pa.magic), bk(5, pb.magic));
     assert_ne!(ua.id(), ub.id(), "the same seed, two accounts");
     let reg = a.reg(&ua);
@@ -84,6 +86,7 @@ fn cross_chain_replay_refused() {
 fn registration_pow_not_reusable() {
     let p = Params { reg_anchor_window: 3, ..params() };
     let mut net = Net::new(&p, 1000);
+    net.mine(0, vec![]).unwrap();   // block 0 is no registration anchor
     let u = bk(6, p.magic);
     let reg = net.reg(&u);
     net.mine(0, vec![]).unwrap();
@@ -129,6 +132,7 @@ fn decode_is_strict() {
 fn dust_does_not_fund() {
     let p = Params { unfunded_pow_lifetime: 30, ..params() };
     let mut net = Net::new(&p, 1000);
+    net.mine(0, vec![]).unwrap();   // block 0 is no registration anchor
     let (miner, dust, coin) = (bk(1, p.magic), bk(2, p.magic), bk(3, p.magic));
     let regs = vec![net.reg(&miner), net.reg(&dust), net.reg(&coin)];
     net.mine(0, regs).unwrap();
@@ -142,7 +146,7 @@ fn dust_does_not_fund() {
     let st = &net.chain.state;
     assert!(!st.accounts[&dust.id()].funded && st.accounts[&dust.id()].balance == 1);
     assert!(st.accounts[&coin.id()].funded && st.accounts[&coin.id()].balance == COIN);
-    while net.chain.height() < 31 { net.mine(0, vec![]).unwrap(); }
+    while net.chain.height() < 32 { net.mine(0, vec![]).unwrap(); }
     assert!(!net.chain.state.accounts.contains_key(&dust.id()) && net.chain.state.accounts.contains_key(&coin.id()));
 }
 
@@ -151,6 +155,7 @@ fn dust_does_not_fund() {
 fn numbers_reused_oldest_first() {
     let p = Params { number_quarantine: 2, ..params() };
     let mut net = Net::new(&p, 1000);
+    net.mine(0, vec![]).unwrap();   // block 0 is no registration anchor
     let old: Vec<Book> = (10..13).map(|k| bk(k, p.magic)).collect();
     for b in &old { let r = net.reg(b); net.mine(0, vec![r]).unwrap(); }   // numbers 1, 2, 3, released a block apart
     let nums: Vec<u32> = old.iter().map(|b| net.chain.state.accounts[&b.id()].number).collect();
@@ -169,6 +174,7 @@ fn commits_route() {
     let p = Params { reward_maturity: 1, number_maturity: 1, ..params() };
     let g = Chain::genesis(&p, now() - 100_000, b"commits");
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
+    let mut b = node.template(0).unwrap(); b.header.mine(); node.submit_block(&b, None).unwrap();
     let u = bk(4, p.magic);
     let anchor = node.store.lock().unwrap().chain.tip();
     node.submit_tx(mine_registration(u.register(0, 16, Payment::Pow([0; 32], 0)), anchor, p.reg_pow_target), None).unwrap();
@@ -181,7 +187,7 @@ fn commits_route() {
     let mine = Commits::new(book::leaf_from_shares(&u.key(), 16, 3, &u.shares(3)).1);
     assert_eq!(text, mine.lines(16));
     // cell (column 5, row 7) as the page checks it: the commitment of that one cell's share
-    let cell = u.domains[0].cell(16, 3, 5, 7);
+    let cell = u.domains[0].cell(&u.net, 16, 3, 5, 7);
     let c = book::commit(&u.key(), 16, 3, 5, 7, &[book::share_hash(&u.key(), 16, 3, 5, 7, 0, &cell)]);
     assert_eq!(lines[5].split(' ').nth(7).unwrap(), bitcheque::crypto::hex(&c));
     assert_eq!(node.route("GET", &format!("/commits/{id}/16"), ""), Err("no such cheque"));
@@ -194,6 +200,7 @@ fn commits_route() {
 fn cached_root_and_compact_snapshot() {
     let p = Params { unfunded_pow_lifetime: 50, ..params() };
     let mut net = Net::new(&p, 1000);
+    net.mine(0, vec![]).unwrap();   // block 0 is no registration anchor
     let (m, u) = (bk(1, p.magic), bk(2, p.magic));
     let regs = vec![net.reg(&m), net.reg(&u)];
     net.mine(0, regs).unwrap();
@@ -222,7 +229,7 @@ fn synth_state(p: &Params, accounts: usize, cheques: u16) -> State {
         let mut batches = BTreeMap::new(); batches.insert(0u32, (16u32, 2_000_000u32));
         let number = i as u32 + 1;
         s.numbers.insert(number, (id.clone(), 0));
-        s.accounts.insert(id, Arc::new(Account { number, balance: 5, nonce: None, book_size: 256, salt: [1; 16], pow_paid: true, funded: true, batches, commits, open: None, leaf: OnceLock::new() }));
+        s.accounts.insert(id, Arc::new(Account { number, balance: 5, nonce: None, book_size: 256, salt: [1; 16], pow_paid: true, funded: true, batches, commits, open: BTreeMap::new(), leaf: OnceLock::new() }));
     }
     s.next_number = accounts as u32 + 1;
     s

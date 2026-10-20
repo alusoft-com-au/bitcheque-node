@@ -4,6 +4,8 @@ use crate::damm;
 pub const COLS: usize = 18;
 pub const ROWS: usize = 10;
 pub const PAYEE_DIGITS: usize = 11;
+/// Columns of printed part A (recipient and check digit); the rest (amount, exponent, fee tier) are part B.
+pub const PART_A: usize = PAYEE_DIGITS + 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Message {

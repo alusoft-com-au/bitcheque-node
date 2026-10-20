@@ -17,9 +17,10 @@ fn main() {
     let tip = || node.store.lock().unwrap().chain.tip();
     let submit = |txs: Vec<bitcheque::tx::Tx>| for t in txs { node.submit_tx(t, None).unwrap(); };
 
+    mine(0);                                                              // block 0's hash is no registration anchor
     submit(miner.registrations(0, 63).into_iter().map(|t| mine_registration(t, tip(), p.reg_pow_target)).collect());   // 64 cheques, 16 per batch
-    mine(0); mine(0);                                                     // number 1 is final from block 3: until then, mine to nobody
-    mine(1); mine(1); mine(1);                                            // the block-3 reward matures
+    mine(0); mine(0);                                                     // number 1 is final from block 4: until then, mine to nobody
+    mine(1); mine(1); mine(1);                                            // the block-4 reward matures
     submit(vec![mine_registration(saver.register(0, 16, Payment::Pow([0; 32], 0)), tip(), p.reg_pow_target)]);
     mine(1);
     submit(saver.sign(0, &Message::new(1, 0, 0, 0)));                     // honesty check (zero coins, any number)

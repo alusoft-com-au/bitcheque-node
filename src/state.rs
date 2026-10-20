@@ -6,13 +6,20 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use crate::book::{self, ChequeCommits};
 use crate::crypto::{key, sha256, Key};
-use crate::message::{self, COLS, ROWS};
+use crate::message::{self, COLS, PART_A, ROWS};
 use crate::params::Params;
 use crate::tx::{account_id, id_m, id_n, AccountId, Batch, Payment, Tx, R, W};
 use crate::u256::U256;
 
+/// A cheque with some columns on chain (§10.12). `expiry` is set by its first piece and never moves.
 #[derive(Clone, Debug)]
-pub struct OpenCheque { pub n: u16, pub digits: [Option<u8>; COLS], pub expiry: u32 }
+pub struct OpenCheque { pub digits: [Option<u8>; COLS], pub expiry: u32 }
+impl OpenCheque {
+    /// Cells of both printed parts are public (a recipient column 0-11 and an amount column 12-17): only a holder of
+    /// both parts can do that, and from then on the number is used (`nonce`). An opening from one part binds nothing.
+    pub fn bound(&self) -> bool { binds(&self.digits) }
+}
+fn binds(d: &[Option<u8>; COLS]) -> bool { d[..PART_A].iter().any(|x| x.is_some()) && d[PART_A..].iter().any(|x| x.is_some()) }
 
 /// A registered cheque's commitments, flat (`book::ChequeCommits`). They never change after registration (only get
 /// deleted), so they are shared between state copies, and their hash for the state root is computed once.
@@ -37,7 +44,7 @@ pub struct Account {
     pub funded: bool,
     pub batches: BTreeMap<u32, (u32, u32)>,      // start -> (count, expiry height)
     pub commits: BTreeMap<u16, Commits>,          // unspent registered cheques
-    pub open: Option<OpenCheque>,
+    pub open: BTreeMap<u16, OpenCheque>,         // cheques with pieces on chain, all above nonce but a bound one at nonce
     pub leaf: OnceLock<[u8; 32]>,                 // cached account_leaf; reset by every change (State::edit)
 }
 
@@ -80,7 +87,8 @@ impl State {
                 pending: BTreeMap::new(), expiries: BTreeMap::new(), gone: BTreeMap::new(), reg_target: p.reg_pow_target, reg_block_count: 0,
                 recent: VecDeque::new(), wake: BTreeMap::new(), net: p.magic, log: Vec::new() }
     }
-    /// Remember a block's hash as a registration anchor (called by the chain after each block, and for block 0).
+    /// Remember a block's hash as a registration anchor (called by the chain after each block; never for block 0, which is
+    /// known before the chain starts and so would let registrations be mined ahead of it).
     pub fn push_hash(&mut self, p: &Params, h: [u8; 32]) {
         self.recent.push_back(h);
         while self.recent.len() > p.reg_anchor_window as usize { self.recent.pop_front(); }
@@ -109,16 +117,16 @@ impl State {
         // only the accounts with something due now (the index may name some whose cheque or batch moved on: no-op)
         for id in self.wake.remove(&height).unwrap_or_default() {
             let Some(a) = self.accounts.get(&id) else { continue };
-            if !a.open.as_ref().is_some_and(|o| o.expiry <= height) && !a.batches.values().any(|&(_, e)| e <= height) { continue; }
+            if !a.open.values().any(|o| o.expiry <= height) && !a.batches.values().any(|&(_, e)| e <= height) { continue; }
             let a = edit(&mut self.accounts, &id);
-            if a.open.as_ref().is_some_and(|o| o.expiry <= height) {
-                let n = a.open.take().unwrap().n;
-                a.commits.remove(&n);
-            }
+            // an unfinished cheque: a bound one's number stays used (its commitments go); one opened from a single part
+            // never bound anything, so the cheque stays spendable and only its pieces are forgotten
+            let stale: Vec<u16> = a.open.iter().filter(|(_, o)| o.expiry <= height).map(|(&n, _)| n).collect();
+            for n in stale { if a.open.remove(&n).unwrap().bound() { a.commits.remove(&n); } }
             let dead: Vec<u32> = a.batches.iter().filter(|(_, &(_, e))| e <= height).map(|(&s, _)| s).collect();
             for s in dead {
                 let (count, _) = a.batches.remove(&s).unwrap();
-                for n in s..s + count { a.commits.remove(&(n as u16)); }
+                for n in s..s + count { a.commits.remove(&(n as u16)); a.open.remove(&(n as u16)); }
             }
         }
         for id in self.expiries.remove(&height).unwrap_or_default() {
@@ -134,6 +142,8 @@ impl State {
 
     /// Everything consensus holds, as bytes (for snapshots). `log` is transient and `wake` is rebuilt, so neither is
     /// included. Commitments are written as flat blobs (their length follows from the account id).
+    /// Not all of it is under the state root: `numbers`, `expiries`, `recent` and `net` are checked by nothing when a
+    /// snapshot is loaded, so a snapshot must be the node's own (or its host's), never one taken from someone else.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
         w.u32(self.height); w.u32(self.next_number); w.u32(self.reg_block_count); w.0.extend_from_slice(&self.net);
@@ -146,8 +156,8 @@ impl State {
             w.u32(a.batches.len() as u32); for (s, (c, e)) in &a.batches { w.u32(*s); w.u32(*c); w.u32(*e); }
             w.u32(a.commits.len() as u32);
             for (nn, c) in &a.commits { w.u16(*nn); w.0.extend_from_slice(&c.cells); }
-            w.u8(a.open.is_some() as u8);
-            if let Some(o) = &a.open { w.u16(o.n); w.u32(o.expiry); for d in o.digits { w.u8(d.unwrap_or(255)); } }
+            w.u32(a.open.len() as u32);
+            for (nn, o) in &a.open { w.u16(*nn); w.u32(o.expiry); for d in o.digits { w.u8(d.unwrap_or(255)); } }
         }
         w.u32(self.numbers.len() as u32); for (n, (id, h)) in &self.numbers { w.u32(*n); w.bytes(id); w.u32(*h); }
         w.u32(self.free.len() as u32); for (r, n) in &self.free { w.u32(*r); w.u32(*n); }
@@ -168,8 +178,9 @@ impl State {
             let mut batches = BTreeMap::new(); for _ in 0..r.u32()? { let s = r.u32()?; batches.insert(s, (r.u32()?, r.u32()?)); }
             let mut commits = BTreeMap::new();
             for _ in 0..r.u32()? { let nn = r.u16()?; commits.insert(nn, Commits::new(r.take(COLS * ROWS * id_n(&id))?.to_vec())); }
-            let open = if r.u8()? == 1 { let n = r.u16()?; let expiry = r.u32()?; let mut digits = [None; COLS]; for d in digits.iter_mut() { let x = r.u8()?; *d = if x == 255 { None } else { Some(x) }; } Some(OpenCheque { n, digits, expiry }) } else { None };
-            for e in open.iter().map(|o| o.expiry).chain(batches.values().map(|&(_, e)| e)) { wake.entry(e).or_default().push(id.clone()); }
+            let mut open = BTreeMap::new();
+            for _ in 0..r.u32()? { let n = r.u16()?; let expiry = r.u32()?; let mut digits = [None; COLS]; for d in digits.iter_mut() { let x = r.u8()?; *d = if x == 255 { None } else { Some(x) }; } open.insert(n, OpenCheque { digits, expiry }); }
+            for e in open.values().map(|o| o.expiry).chain(batches.values().map(|&(_, e)| e)) { wake.entry(e).or_default().push(id.clone()); }
             accounts.insert(id, Arc::new(Account { number, balance, nonce: if has_nonce { Some(nonce) } else { None }, book_size, salt, pow_paid, funded, batches, commits, open, leaf: OnceLock::new() }));
         }
         let mut numbers = BTreeMap::new(); for _ in 0..r.u32()? { let n = r.u32()?; let id = r.bytes()?; numbers.insert(n, (id, r.u32()?)); }
@@ -245,7 +256,7 @@ impl State {
                 // registered before and expired: the cheques it used stay used
                 let nonce = self.gone.remove(&id);
                 let mut a = Account { number, balance: 0, nonce, book_size: *book_size, salt: *salt, pow_paid: true, funded: false,
-                                      batches: BTreeMap::new(), commits: BTreeMap::new(), open: None, leaf: OnceLock::new() };
+                                      batches: BTreeMap::new(), commits: BTreeMap::new(), open: BTreeMap::new(), leaf: OnceLock::new() };
                 a.batches.insert(batch.start, (batch.count, height + p.batch_lifetime));
                 for (nn, c) in cheques { if nonce.map_or(true, |x| nn > x) { a.commits.insert(nn, Commits::new(c)); } }
                 self.accounts.insert(id, Arc::new(a));
@@ -255,7 +266,10 @@ impl State {
                 // more cheques for an existing book: paid by the same proof of work as a first registration,
                 // so every 16 cheques of state cost the same however they arrive
                 let a = self.accounts.get(account).ok_or("no such account")?;
-                if a.batches.contains_key(&batch.start) || a.batches.iter().any(|(&s, &(c, _))| batch.start < s + c && s < batch.start + batch.count) { return Err("batch overlaps"); }
+                // the batch's shape first, so the overlap test below adds only small, checked numbers
+                if batch.count != p.max_batch || batch.start % batch.count != 0 || batch.start >= a.book_size { return Err("batch not aligned"); }
+                let end = batch.start.checked_add(batch.count).ok_or("batch not aligned")?;
+                if a.batches.iter().any(|(&s, &(c, _))| batch.start < s.saturating_add(c) && s < end) { return Err("batch overlaps"); }
                 self.check_pow(p, tx, pay)?;
                 let cheques = Self::check_batch(&self.key(&a.salt), id_m(account) as usize, id_n(account), a.book_size, &account[1..], batch, p)?;
                 // ---- mutate ----
@@ -301,42 +315,47 @@ impl State {
         let a = self.accounts.get(account).ok_or("no such account")?;
         if column as usize >= COLS || shares.len() != m || shares.iter().any(|x| x.len() != n) { return Err("piece malformed"); }
         if !a.batches.iter().any(|(&s, &(c, e))| nn as u32 >= s && (nn as u32) < s + c && e > height) { return Err("cheque not registered or expired"); }
-        let continuing = a.open.as_ref().map_or(false, |o| o.n == nn);
-        if !continuing && a.nonce.map_or(false, |x| nn <= x) { return Err("cheque number already consumed"); }
+        let open = a.open.get(&nn);
+        if open.is_none() && a.nonce.map_or(false, |x| nn <= x) { return Err("cheque number already consumed"); }
         a.commits.get(&nn).ok_or("cheque not spendable")?;
-        let mut digits = if continuing { a.open.as_ref().unwrap().digits } else { [None; COLS] };
+        let mut digits = open.map_or([None; COLS], |o| o.digits);
         if digits[column as usize].is_some() { return Err("column already revealed"); }
         // row 9 of §3.2: which stored commitment does this column's preimage match?
         let row = self.piece_digit(account, nn, column, shares).ok_or("no commitment matches")?;
         digits[column as usize] = Some(row);
-        // completion (row 10 of §3.2), checked before any mutation
-        let mut done: Option<(u64, u64, u32, [u8; COLS])> = None; // (amount, fee, payee, digits)
+        // the first piece from the second part binds the number (completion always does: it has both)
+        let bind = binds(&digits) && !open.is_some_and(|o| o.bound());
+        // completion (row 10 of §3.2), checked before any mutation. A payee number nobody holds yet, or not yet final,
+        // voids the cheque (payee None): its number is used and nothing moves, so whoever gets that number later
+        // cannot collect it.
+        let mut done: Option<(u64, u64, Option<u32>, [u8; COLS])> = None; // (amount, fee, payee, digits)
         if digits.iter().all(|d| d.is_some()) {
             let d: [u8; COLS] = std::array::from_fn(|i| digits[i].unwrap());
             let msg = message::parse(&d)?;
-            let fee = msg.tier as u64 * p.fee_unit;
-            let amount = match msg.amount() { Some(x) => x, None => a.balance.checked_sub(fee).ok_or("sweep below fee")? };
-            if msg.payee != 0 {
-                let (_, assigned) = self.numbers.get(&msg.payee).ok_or("payee number unknown")?;
-                if assigned + p.number_maturity > height { return Err("payee number not mature"); }
-            }
-            if a.balance < amount + fee { return Err("insufficient balance"); }
-            done = Some((amount, fee, msg.payee, d));
+            let final_payee = msg.payee == 0 || self.numbers.get(&msg.payee).is_some_and(|&(_, assigned)| assigned + p.number_maturity <= height);
+            done = Some(if final_payee {
+                let fee = msg.tier as u64 * p.fee_unit;
+                let amount = match msg.amount() { Some(x) => x, None => a.balance.checked_sub(fee).ok_or("sweep below fee")? };
+                if a.balance < amount + fee { return Err("insufficient balance"); }
+                (amount, fee, Some(msg.payee), d)
+            } else { (0, 0, None, d) });
         }
         // ---- mutate ----
-        if done.is_none() { self.wake.entry(height + p.piece_lifetime).or_default().push(account.clone()); }
+        let expiry = open.map_or(height + p.piece_lifetime, |o| o.expiry);   // set by the first piece, never moved
+        if done.is_none() && open.is_none() { self.wake.entry(expiry).or_default().push(account.clone()); }
         let a = edit(&mut self.accounts, account);
-        if !continuing {
-            if let Some(o) = a.open.take() { a.commits.remove(&o.n); }
-            let dead: Vec<u16> = a.commits.range(..nn).map(|(&k, _)| k).collect();
-            for k in dead { a.commits.remove(&k); }
+        if bind {
+            // cells of both parts are public: the number is used, and every lower cheque, opened or not, goes with it
+            a.commits = a.commits.split_off(&nn);
+            a.open = a.open.split_off(&nn);
             a.nonce = Some(nn);
         }
         match done {
-            None => { a.open = Some(OpenCheque { n: nn, digits, expiry: height + p.piece_lifetime }); Ok(0) }
+            None => { a.open.insert(nn, OpenCheque { digits, expiry }); Ok(0) }
             Some((amount, fee, payee, digits)) => {
-                a.open = None;
+                a.open.remove(&nn);
                 a.commits.remove(&nn);
+                let Some(payee) = payee else { return Ok(0) };   // void
                 a.balance -= amount + fee;
                 self.log.push(Event::Transfer { from: account.clone(), cheque: nn, to: payee, amount, fee, digits });
                 if payee == 0 {
@@ -378,8 +397,8 @@ impl State {
         u(&mut v, a.nonce.map_or(u64::MAX, |x| x as u64)); v.push(a.funded as u8); v.push(a.pow_paid as u8); u(&mut v, a.book_size as u64);
         u(&mut v, a.batches.len() as u64);
         for (s, (c, e)) in &a.batches { u(&mut v, *s as u64); u(&mut v, *c as u64); u(&mut v, *e as u64); }
-        v.push(a.open.is_some() as u8);
-        if let Some(o) = &a.open { u(&mut v, o.n as u64); u(&mut v, o.expiry as u64); for d in o.digits { v.push(d.unwrap_or(255)); } }
+        u(&mut v, a.open.len() as u64);
+        for (nn, o) in &a.open { u(&mut v, *nn as u64); u(&mut v, o.expiry as u64); for d in o.digits { v.push(d.unwrap_or(255)); } }
         u(&mut v, a.commits.len() as u64);
         for (nn, c) in &a.commits { u(&mut v, *nn as u64); v.extend_from_slice(&c.digest); }
         sha256(&v)

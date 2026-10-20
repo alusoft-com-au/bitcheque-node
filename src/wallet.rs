@@ -3,16 +3,22 @@
 use crate::book::{self, Bytes, ChequeShares};
 use crate::crypto::{key, sha256, Key};
 use crate::message::{Message, COLS, ROWS};
+use crate::params::TESTNET_MAGIC;
 use crate::tx::{account_id, AccountId, Batch, Payment, Tx};
 use crate::u256::U256;
 
 /// One seed. A standard book has one; a split book (optional) has one per domain. Cells: `cell = SHA256("bitcheque/cell" || key[N] || col || row)[..n]`,
-/// `key[N] = SHA256("bitcheque/key" || seed || N)`.
+/// `key[N] = SHA256("bitcheque/key" || net || seed || N)` with `net` the network's magic, so a seed used on two networks
+/// gives unrelated cells on each; on the research network (`TESTNET_MAGIC`) the magic is left out, so books printed
+/// before this rule keep working there.
 #[derive(Clone)]
 pub struct Domain(pub [u8; 32]);
 impl Domain {
-    pub fn key(&self, cheque: u16) -> [u8; 32] { sha256(&[b"bitcheque/key".as_slice(), &self.0, &cheque.to_le_bytes()].concat()) }
-    pub fn cell(&self, n: usize, cheque: u16, col: u8, row: u8) -> Bytes { sha256(&[b"bitcheque/cell".as_slice(), &self.key(cheque), &[col, row]].concat())[..n].to_vec() }
+    pub fn key(&self, net: &[u8; 4], cheque: u16) -> [u8; 32] {
+        let net: &[u8] = if *net == TESTNET_MAGIC { &[] } else { net };
+        sha256(&[b"bitcheque/key".as_slice(), net, &self.0, &cheque.to_le_bytes()].concat())
+    }
+    pub fn cell(&self, net: &[u8; 4], n: usize, cheque: u16, col: u8, row: u8) -> Bytes { sha256(&[b"bitcheque/cell".as_slice(), &self.key(net, cheque), &[col, row]].concat())[..n].to_vec() }
 }
 
 /// Cheques per registration (`Params::max_batch`), and the size of every new book: it grows a batch at a time.
@@ -28,7 +34,7 @@ impl Book {
     /// Public share hashes of one cheque, `[col][row][k]`; a one-seed book has a single share (k = 0).
     pub fn shares(&self, cheque: u16) -> ChequeShares {
         (0..COLS as u8).map(|c| (0..ROWS as u8).map(|r| self.domains.iter().enumerate()
-            .map(|(k, d)| book::share_hash(&self.key(), self.n(), cheque, c, r, k as u8, &d.cell(self.n(), cheque, c, r))).collect()).collect()).collect()
+            .map(|(k, d)| book::share_hash(&self.key(), self.n(), cheque, c, r, k as u8, &d.cell(&self.net, self.n(), cheque, c, r))).collect()).collect()).collect()
     }
     pub fn leaves(&self) -> Vec<Bytes> { (0..self.book_size).map(|i| book::leaf_from_shares(&self.key(), self.n(), i as u16, &self.shares(i as u16)).0).collect() }
     pub fn root(&self) -> Bytes { book::account_root(&self.key(), self.n(), &self.leaves(), self.book_size) }
@@ -58,7 +64,7 @@ impl Book {
     pub fn pieces(&self, cheque: u16, digits: &[u8; COLS]) -> Vec<Tx> {
         let id = self.id();
         (0..COLS as u8).map(|c| Tx::ChequePiece { account: id.clone(), cheque, column: c,
-            shares: self.domains.iter().map(|d| d.cell(self.n(), cheque, c, digits[c as usize])).collect() }).collect()
+            shares: self.domains.iter().map(|d| d.cell(&self.net, self.n(), cheque, c, digits[c as usize])).collect() }).collect()
     }
     pub fn sign(&self, cheque: u16, msg: &Message) -> Vec<Tx> { self.pieces(cheque, &msg.digits()) }
 }

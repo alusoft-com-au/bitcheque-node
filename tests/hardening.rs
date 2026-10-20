@@ -200,6 +200,7 @@ fn a_full_mempool_is_mined_over_several_blocks_not_into_one_oversized_block() {
     let p = Params { max_block_bytes: 150_000, reg_pow_target: bitcheque::u256::U256::MAX.shr(4), ..params() };
     let g = Chain::genesis(&p, now() - 100_000, b"hard");
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
+    mine(&node, 0).unwrap();   // block 0 is no registration anchor
     for k in 0..10u8 {
         let b = Book { salt: [k; 16], n256: false, book_size: 256, domains: vec![Domain([k + 1; 32])], net: Params::mainnet().magic };
         let target = node.store.lock().unwrap().chain.state.reg_target;
@@ -213,7 +214,7 @@ fn a_full_mempool_is_mined_over_several_blocks_not_into_one_oversized_block() {
         if mined == 10 { break; }
     }
     assert_eq!(mined, 10, "every registration is mined eventually");
-    assert!(node.height() > 1, "they took more than one block");
+    assert!(node.height() > 2, "they took more than one block");
 }
 
 #[test]
@@ -223,6 +224,7 @@ fn a_number_is_published_only_once_final_and_the_lookup_code_finds_it() {
     let p = Params { number_maturity: 3, reg_pow_target: bitcheque::u256::U256::MAX.shr(4), ..params() };
     let g = Chain::genesis(&p, now() - 100_000, b"hard");
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
+    mine(&node, 0).unwrap();   // block 0 is no registration anchor
     let addr = node.serve_rpc("127.0.0.1:0").unwrap();
     let get = |path: &str| { let mut s = TcpStream::connect(addr).unwrap(); s.write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes()).unwrap(); let mut o = String::new(); let _ = s.read_to_string(&mut o); o };
     let b = Book { salt: [5; 16], n256: false, book_size: 256, domains: vec![Domain([6; 32])], net: Params::mainnet().magic };
@@ -234,7 +236,7 @@ fn a_number_is_published_only_once_final_and_the_lookup_code_finds_it() {
     let young = get(&format!("/lookup/{}-{}-{}", &code[..4], &code[4..8], &code[8..]));
     assert!(young.contains(&format!("id {id}")) && young.contains("mature false"), "{young}");
     assert!(!young.contains("\nnumber "), "a young number is not shown: {young}");
-    assert!(!get("/summary/1").contains("number="), "nor in the block");
+    assert!(!get("/summary/2").contains("number="), "nor in the block");
     // asking for it by number gives exactly what an unknown number gives, so new numbers cannot be probed for
     for path in ["/history/1", "/proof/1"] {
         assert_eq!(get(path).split("\r\n\r\n").nth(1), get(&path.replace('1', "77")).split("\r\n\r\n").nth(1), "{path}");
@@ -242,7 +244,7 @@ fn a_number_is_published_only_once_final_and_the_lookup_code_finds_it() {
     }
     // by number it says only that the number is pending and when it becomes final, never whose it is
     let pending = get("/account/1");
-    assert!(pending.ends_with("pending\nready_at 4") && !pending.contains(&id), "{pending}");
+    assert!(pending.ends_with("pending\nready_at 5") && !pending.contains(&id), "{pending}");
     assert!(get("/account/77").contains("no such number"));
     // and a block cannot pay it yet
     assert_eq!(node.template(1).err(), Some("coinbase payee not mature"));
@@ -251,7 +253,7 @@ fn a_number_is_published_only_once_final_and_the_lookup_code_finds_it() {
     assert!(node.template(1).is_ok(), "and it can take a block reward");
     let fin = get(&format!("/lookup/{}", code.to_uppercase()));
     assert!(fin.contains("\nnumber 1\n") && fin.contains("mature true"), "{fin}");
-    assert!(get("/summary/1").contains("number=1"), "final: shown in the block too");
+    assert!(get("/summary/2").contains("number=1"), "final: shown in the block too");
     assert!(get("/lookup/1234").contains("8 or more"));
 }
 
@@ -263,6 +265,7 @@ fn a_cheque_to_yourself_shows_as_both_receive_and_send() {
     let p = Params { reg_pow_target: bitcheque::u256::U256::MAX.shr(4), ..params() };
     let g = Chain::genesis(&p, now() - 100_000, b"hard");
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
+    mine(&node, 0).unwrap();   // block 0 is no registration anchor
     let addr = node.serve_rpc("127.0.0.1:0").unwrap();
     let get = |path: &str| { let mut s = TcpStream::connect(addr).unwrap(); s.write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes()).unwrap(); let mut o = String::new(); let _ = s.read_to_string(&mut o); o };
     let b = Book { salt: [7; 16], n256: false, book_size: 256, domains: vec![Domain([8; 32])], net: Params::mainnet().magic };
@@ -288,6 +291,7 @@ fn a_batch_of_transactions_lands_in_one_block() {
     let p = Params { reg_pow_target: bitcheque::u256::U256::MAX.shr(4), ..params() };
     let g = Chain::genesis(&p, now() - 100_000, b"hard");
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
+    mine(&node, 0).unwrap();   // block 0 is no registration anchor
     let b = Book { salt: [9; 16], n256: false, book_size: 256, domains: vec![Domain([10; 32])], net: Params::mainnet().magic };
     let target = node.store.lock().unwrap().chain.state.reg_target;
     let mut txs = vec![mine_registration(b.register(0, 16, Payment::Pow([0; 32], 0)), tip(&node), target)];

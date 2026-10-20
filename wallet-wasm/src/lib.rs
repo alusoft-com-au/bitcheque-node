@@ -169,7 +169,7 @@ mod tests {
             let lines = call(commits, &[&seed[..], &q.to_le_bytes()].concat());
             let cm: Vec<Vec<&str>> = lines.lines().map(|l| l.split(' ').collect()).collect();
             for c in 0..18u8 { for r in 0..10u8 {
-                let cell = b.domains[0].cell(16, q, c, r);
+                let cell = b.domains[0].cell(&b.net, 16, q, c, r);
                 assert_eq!(call(cell_commit, &[&b.salt[..], &q.to_le_bytes(), &[c, r], &cell].concat()), cm[c as usize][r as usize]);
             } }
         }

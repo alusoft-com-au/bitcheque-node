@@ -327,6 +327,7 @@ fn the_mempool_listing_is_cached() {
     let p = rp();
     let g = Chain::genesis(&p, now() - 100_000, b"a");
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
+    mine(&node, 0).unwrap();   // block 0 is no registration anchor
     let books: Vec<Book> = (10..30).map(book).collect();
     for ch in books.chunks(10) {
         for b in ch { node.submit_tx(mine_registration(b.register(0, 16, Payment::Pow([0; 32], 0)), common::tip(&node), p.reg_pow_target), None).unwrap(); }

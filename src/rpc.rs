@@ -261,7 +261,7 @@ impl Node {
                 // what each waiting cheque says so far, read from the pieces against the sender's commitments
                 let mut seen: BTreeMap<(Vec<u8>, u16), [Option<u8>; COLS]> = BTreeMap::new();
                 for t in m.iter() { if let Tx::ChequePiece { account, cheque, column, shares } = t {
-                    let d = seen.entry((account.clone(), *cheque)).or_insert_with(|| c.state.accounts.get(account).and_then(|a| a.open.as_ref().filter(|o| o.n == *cheque)).map_or([None; COLS], |o| o.digits));
+                    let d = seen.entry((account.clone(), *cheque)).or_insert_with(|| c.state.accounts.get(account).and_then(|a| a.open.get(cheque)).map_or([None; COLS], |o| o.digits));
                     if let Some(x) = c.state.piece_digit(account, *cheque, *column, shares) { d[*column as usize] = Some(x); }
                 } }
                 for ((account, cheque), d) in seen {
@@ -365,7 +365,7 @@ fn account_text(c: &crate::block::Chain, id: &[u8]) -> String {
     let number = if mature { format!("number {}\n", a.number) } else { String::new() };
     format!("id {}\n{number}balance {}\npending {}\nnonce {}\nbook_size {}\nunspent {}\nfunded {}\nmature {}\nready_at {}\nopen {}\nsalt {}", hex(id), a.balance,
             pending_of(c, a.number), a.nonce.map_or("none".into(), |x| x.to_string()), a.book_size, a.commits.keys().map(|k| k.to_string()).collect::<Vec<_>>().join(","),
-            a.funded, mature, ready_at, a.open.as_ref().map_or("none".into(), |o| o.n.to_string()), hex(&a.salt))
+            a.funded, mature, ready_at, if a.open.is_empty() { "none".into() } else { a.open.keys().map(|k| k.to_string()).collect::<Vec<_>>().join(",") }, hex(&a.salt))
 }
 
 fn tx_line(t: &Tx) -> String {

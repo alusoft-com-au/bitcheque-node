@@ -246,8 +246,8 @@ impl Chain {
     }
     pub fn new(p: Params, genesis: &Block) -> Result<Chain, &'static str> {
         if !genesis.header.meets_target() || genesis.header.bits != p.initial_bits { return Err("bad genesis"); }
-        let mut state = State::new(&p);
-        state.push_hash(&p, genesis.header.hash());
+        // block 0's hash is no registration anchor: it is known before launch, so work anchored to it could be done early
+        let state = State::new(&p);
         Ok(Chain { params: p, blocks: Blocks::Mem(vec![genesis.clone()]), headers: vec![genesis.header.clone()], hashes: vec![genesis.header.hash()], state, history: HashMap::new(), totals: Totals::default(), base: 0, keep: None })
     }
     pub fn height(&self) -> u32 { self.base + self.headers.len() as u32 - 1 }

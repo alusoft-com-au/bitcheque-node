@@ -19,21 +19,22 @@ fn sync_and_relay() {
     let g = Chain::genesis(&p, bitcheque::net::now() - 100_000, b"net test");
     let a = Node::new(Store::open(p.clone(), &g, None).unwrap());
     let b = Node::new(Store::open(p.clone(), &g, None).unwrap());
+    mine(&a, 0).unwrap();   // block 0 is no registration anchor
     let miner = Book { salt: [1; 16], n256: false, book_size: 256, domains: vec![Domain([7; 32])], net: Params::mainnet().magic };
     a.submit_tx(mine_registration(miner.register(0, 16, Payment::Pow([0; 32], 0)), tip(&a), p.reg_pow_target), None).unwrap();
     for _ in 0..3 { mine(&a, 0).unwrap(); }   // number 1 is not final for 100 blocks: mine to nobody
-    assert_eq!(a.height(), 3);
+    assert_eq!(a.height(), 4);
 
     let addr = a.listen("127.0.0.1:0").unwrap();
     b.connect(&addr.to_string()).unwrap();
-    wait(|| b.height() == 3);
+    wait(|| b.height() == 4);
     assert_eq!(b.store.lock().unwrap().chain.tip(), a.store.lock().unwrap().chain.tip());
 
     let user = Book { salt: [2; 16], n256: false, book_size: 256, domains: vec![Domain([8; 32]), Domain([9; 32])], net: Params::mainnet().magic };
     b.submit_tx(mine_registration(user.register(0, 16, Payment::Pow([0; 32], 0)), tip(&b), p.reg_pow_target), None).unwrap();
     wait(|| a.mempool.lock().unwrap().len() == 1);
     mine(&a, 0).unwrap();
-    wait(|| b.height() == 4);
+    wait(|| b.height() == 5);
     assert!(b.store.lock().unwrap().chain.state.accounts.contains_key(&user.id()));
     assert!(b.mempool.lock().unwrap().is_empty());
 }
@@ -50,10 +51,11 @@ fn queued_cheque_does_not_block_the_next() {
     let a = Node::new(Store::open(p.clone(), &g, None).unwrap());
     let miner = Book { salt: [1; 16], n256: false, book_size: 256, domains: vec![Domain([7; 32])], net: Params::mainnet().magic };
     let user = Book { salt: [2; 16], n256: false, book_size: 256, domains: vec![Domain([8; 32])], net: Params::mainnet().magic };
+    mine(&a, 0).unwrap();   // block 0 is no registration anchor
     a.submit_tx(mine_registration(miner.register(0, 16, Payment::Pow([0; 32], 0)), tip(&a), p.reg_pow_target), None).unwrap();
     a.submit_tx(mine_registration(user.register(0, 16, Payment::Pow([0; 32], 0)), tip(&a), p.reg_pow_target), None).unwrap();
-    // miner is number 1, user number 2 (height 1); both are final at height 3, when the miner's rewards start,
-    // and the height-3 reward is credited at height 5
+    // miner is number 1, user number 2 (height 2); both are final at height 4, when the miner's rewards start,
+    // and the height-4 reward is credited at height 6
     for k in 0..5 { mine(&a, if k < 2 { 0 } else { 1 }).unwrap(); }
     let balance = |b: &Book| a.store.lock().unwrap().chain.state.accounts[&b.id()].balance;
     assert!(balance(&miner) >= 50 * COIN);
@@ -71,7 +73,7 @@ fn queued_cheque_does_not_block_the_next() {
     mine(&a, 1).unwrap();
     let st = a.store.lock().unwrap();
     let m = &st.chain.state.accounts[&miner.id()];
-    assert_eq!((m.nonce, m.open.is_none(), m.commits.contains_key(&1)), (Some(2), true, false));
+    assert_eq!((m.nonce, m.open.is_empty(), m.commits.contains_key(&1)), (Some(2), true, false));
     assert_eq!(st.chain.state.accounts[&user.id()].balance, 3 * COIN);
     drop(st);
     // and a finished number is refused with the text the wallet looks for

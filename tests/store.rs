@@ -23,21 +23,22 @@ fn reorg_and_persist() {
     let path = std::env::temp_dir().join(format!("bitcheque-test-{}.dat", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
-    // branch A: 2 blocks with a registration; branch B: 3 blocks, no txs
+    // a shared block 1 (block 0 is no registration anchor); then branch A: 2 blocks with a registration; branch B: 3 blocks, no txs
+    let mut b = Store::open(p.clone(), &g, None).unwrap();
+    let mut bc = Chain::new(p.clone(), &g).unwrap();
+    for i in 0..4 { let blk = bc.make_block(g.header.time + 600 * (i + 1), 0, vec![]).unwrap(); bc.add(&blk, now()).unwrap(); b.accept(&blk, now()).unwrap(); }
     let a = Node::new(Store::open(p.clone(), &g, Some(&path)).unwrap());
+    a.submit_block(&b.chain.blocks.get(1).unwrap(), None).unwrap();
     a.submit_tx(mine_registration(miner().register(0, 16, Payment::Pow([0; 32], 0)), tip(&a), p.reg_pow_target), None).unwrap();
     mine(&a, 0).unwrap();   // number 1 is final from the next block (number_maturity 1)
     mine(&a, 1).unwrap();
-    let mut b = Store::open(p.clone(), &g, None).unwrap();
-    let mut bc = Chain::new(p.clone(), &g).unwrap();
-    for i in 0..3 { let blk = bc.make_block(g.header.time + 600 * (i + 1), 0, vec![]).unwrap(); bc.add(&blk, now()).unwrap(); b.accept(&blk, now()).unwrap(); }
 
-    // feed B's branch to A: first two are side blocks (equal or less work), the third reorgs
+    // feed B's branch to A: the first two after block 1 are side blocks (equal or less work), the third reorgs
     let mut results = Vec::new();
-    for h in 1..=b.chain.height() as usize { let blk = b.chain.blocks.get(h).unwrap(); results.push(matches!(a.submit_block(&blk, None), Ok(_))); }
+    for h in 2..=b.chain.height() as usize { let blk = b.chain.blocks.get(h).unwrap(); results.push(matches!(a.submit_block(&blk, None), Ok(_))); }
     assert_eq!(results, vec![true, true, true]);
     assert_eq!(a.store.lock().unwrap().chain.tip(), b.chain.tip());
-    assert_eq!(a.height(), 3);
+    assert_eq!(a.height(), 4);
     // the abandoned registration went back to the mempool and the account no longer exists
     assert_eq!(a.mempool.lock().unwrap().len(), 1);
     assert!(a.store.lock().unwrap().chain.state.accounts.is_empty());
@@ -49,14 +50,14 @@ fn reorg_and_persist() {
 
     // restart from the file: same tip, same height, side blocks remembered
     let s = Store::open(p.clone(), &g, Some(&path)).unwrap();
-    assert_eq!((s.chain.height(), s.chain.tip(), s.side.len()), (4, tip, 2));
+    assert_eq!((s.chain.height(), s.chain.tip(), s.side.len()), (5, tip, 2));
     let _ = std::fs::remove_file(&path);
 
     // a side block with less work is kept but does not switch the chain
     let mut s = s;
     let lone = Chain::new(p.clone(), &g).unwrap().make_block(g.header.time + 601, 0, vec![]).unwrap();
     assert!(matches!(s.accept(&lone, now()), Ok(Accepted::Side)));
-    assert_eq!(s.chain.height(), 4);
+    assert_eq!(s.chain.height(), 5);
 }
 
 #[test]
@@ -64,11 +65,12 @@ fn proof_and_rpc() {
     let p = params();
     let g = Chain::genesis(&p, now() - 100_000, b"rpc test");
     let n = Node::new(Store::open(p.clone(), &g, None).unwrap());
+    mine(&n, 0).unwrap();   // block 0 is no registration anchor
     let m = miner();
     n.submit_tx(mine_registration(m.register(0, 16, Payment::Pow([0; 32], 0)), tip(&n), p.reg_pow_target), None).unwrap();
     mine(&n, 0).unwrap();   // number 1 assigned; final from the next block
     mine(&n, 1).unwrap();
-    mine(&n, 1).unwrap();   // the height-2 reward credited
+    mine(&n, 1).unwrap();   // the height-3 reward credited
     // Merkle proof of the miner's account against the state root
     let st = n.store.lock().unwrap();
     let (leaf, path, root) = st.chain.state.account_proof(&m.id()).unwrap();
@@ -79,9 +81,9 @@ fn proof_and_rpc() {
 
     let addr = n.serve_rpc("127.0.0.1:0").unwrap();
     let http = |req: String| { let mut s = TcpStream::connect(addr).unwrap(); s.write_all(req.as_bytes()).unwrap(); let mut r = String::new(); s.read_to_string(&mut r).unwrap(); r.split("\r\n\r\n").nth(1).unwrap().to_string() };
-    assert_eq!(http("GET /height HTTP/1.0\r\n\r\n".into()), "3");
+    assert_eq!(http("GET /height HTTP/1.0\r\n\r\n".into()), "4");
     assert!(http("GET /account/1 HTTP/1.0\r\n\r\n".into()).contains(&format!("balance {}", p.reward_base)));
-    // the height-3 reward is not spendable yet (reward_maturity 1): it shows as pending, here and in /top
+    // the height-4 reward is not spendable yet (reward_maturity 1): it shows as pending, here and in /top
     assert!(http("GET /account/1 HTTP/1.0\r\n\r\n".into()).contains(&format!("\npending {}\n", p.reward_base)));
     assert!(http("GET /top HTTP/1.0\r\n\r\n".into()).lines().any(|l| l.starts_with("1 ") && l.ends_with(&format!(" {}", p.reward_base))));
     let tx = m.sign(0, &Message::new(0, 1000, 2, 1)); // cheque to number 0
@@ -122,10 +124,12 @@ fn snapshot_restart_and_reorg() {
     let mut blk = |maker: &mut Chain, txs: Vec<bitcheque::tx::Tx>| { let b = maker.make_block(maker.headers.last().unwrap().time + 600, 1, txs).unwrap(); maker.add(&b, now()).unwrap(); b };
     {
         let mut st = Store::open(p.clone(), &g, Some(&path)).unwrap();
-        let reg = mine_registration(miner().register(0, 16, Payment::Pow([0; 32], 0)), maker.tip(), p.reg_pow_target);
-        let b1 = { let b = maker.make_block(t0 + 600, 0, vec![reg]).unwrap(); maker.add(&b, now()).unwrap(); b };
+        let b1 = { let b = maker.make_block(t0 + 600, 0, vec![]).unwrap(); maker.add(&b, now()).unwrap(); b };
         st.accept(&b1, now()).unwrap();
-        for _ in 1..n { let b = blk(&mut maker, vec![]); st.accept(&b, now()).unwrap(); }
+        let reg = mine_registration(miner().register(0, 16, Payment::Pow([0; 32], 0)), maker.tip(), p.reg_pow_target);
+        let b2 = { let b = maker.make_block(t0 + 1200, 0, vec![reg]).unwrap(); maker.add(&b, now()).unwrap(); b };
+        st.accept(&b2, now()).unwrap();
+        for _ in 2..n { let b = blk(&mut maker, vec![]); st.accept(&b, now()).unwrap(); }
         let b = blk(&mut maker, vec![miner().sign(1, &Message::new(1, 5, 8, 1))[0].clone()]); // leaves an open cheque in the state
         st.accept(&b, now()).unwrap();
         assert_eq!(bitcheque::state::State::decode(&mut R::new(&st.chain.state.encode())).unwrap().root(), st.chain.state.root(), "state codec round-trips");
@@ -138,7 +142,7 @@ fn snapshot_restart_and_reorg() {
     assert_eq!(b.chain.height(), n + 1);
     assert_eq!(b.chain.tip(), maker.tip());
     assert_eq!(b.chain.state.root(), maker.state.root(), "state after restart from snapshot matches a full replay");
-    assert!(b.chain.state.accounts[&miner().id()].open.is_some());
+    assert!(b.chain.state.accounts[&miner().id()].open.len() == 1);
     // reorg at a fork above the snapshot: a heavier branch from height n-10
     let fork = n - 10;
     let mut alt = Chain::new(p.clone(), &g).unwrap();
@@ -176,9 +180,10 @@ fn host_store_restore_and_reorg() {
     let mut maker = Chain::new(p.clone(), &g).unwrap();
     let blk = |maker: &mut Chain| { let b = maker.make_block(maker.headers.last().unwrap().time + 600, 1, vec![]).unwrap(); maker.add(&b, now()).unwrap(); b };
     let mut st = Store::open_host(p.clone(), &g, host_io(), None, &[], 100, host_snap).unwrap();
+    let b1 = maker.make_block(t0 + 600, 0, vec![]).unwrap(); maker.add(&b1, now()).unwrap(); st.accept(&b1, now()).unwrap();
     let reg = mine_registration(miner().register(0, 16, Payment::Pow([0; 32], 0)), maker.tip(), p.reg_pow_target);
-    let b1 = maker.make_block(t0 + 600, 0, vec![reg]).unwrap(); maker.add(&b1, now()).unwrap(); st.accept(&b1, now()).unwrap();
-    for _ in 1..251 { let b = blk(&mut maker); st.accept(&b, now()).unwrap(); }
+    let b2 = maker.make_block(t0 + 1200, 0, vec![reg]).unwrap(); maker.add(&b2, now()).unwrap(); st.accept(&b2, now()).unwrap();
+    for _ in 2..251 { let b = blk(&mut maker); st.accept(&b, now()).unwrap(); }
     assert_eq!(st.chain.height(), 251);
     assert_eq!(st.chain.blocks.get(7).unwrap(), maker.blocks.get(7).unwrap(), "blocks are read back from the host");
     let snap = SNAP.with(|s| s.borrow().clone()).expect("snapshot handed to the host");
