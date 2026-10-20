@@ -29,7 +29,7 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
 }
 
-const RPC_PER_MINUTE: u32 = 120;   // requests one address (an IPv6 /64) may make per minute
+const RPC_PER_MINUTE: u32 = 120;   // requests one address (an IPv6 /48) may make per minute
 const CHECK_MAX: usize = 64;       // transactions per /check or per batched /tx
 const BODY_MAX: usize = 8 << 20;   // request body bytes (16 registrations of 16 cheques, with a cheque, are under 2 MB of hex)
 const HEAD_MAX: usize = 16 << 10;  // request line and headers
@@ -39,16 +39,29 @@ const DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);   // t
 const WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);   // ...and the whole reply must be taken within this
 const CHECK_REGS: usize = 2;       // registrations per /check (each can cost thousands of hashes)
 const MEMPOOL_LIST: usize = 500;   // waiting transactions listed by /mempool
+const COSTLY_PER_SECOND: u32 = 100; // /check, /proof and /template requests served per second, from everyone together
 static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static COSTLY: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));   // (second, requests in it)
 
-/// The key an address is limited by: an IPv4 address, or the /64 an IPv6 address is in (one host has a whole /64).
+/// The key an address is limited by: an IPv4 address, or the /48 an IPv6 address is in (a home or a server is commonly
+/// given a /48, and many /64s cost nothing).
 fn limit_key(ip: std::net::IpAddr) -> std::net::IpAddr {
-    match ip { std::net::IpAddr::V6(a) if a.to_ipv4_mapped().is_none() => { let s = a.segments(); std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)) } x => x }
+    match ip.to_canonical() { std::net::IpAddr::V6(a) => { let s = a.segments(); std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], 0, 0, 0, 0, 0)) } x => x }
+}
+/// The routes that cost real work whoever asks (proofs of work and hash checks, state proofs, block building) share one
+/// budget per second besides each address's own limit, so many addresses together cannot take the node's whole CPU.
+fn costly_ok(path: &str) -> bool {
+    if !(path == "/check" || path.starts_with("/proof/") || path.starts_with("/template/")) { return true; }
+    let sec = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut c = COSTLY.lock().unwrap();
+    if c.0 != sec { *c = (sec, 0); }
+    c.1 += 1;
+    c.1 <= COSTLY_PER_SECOND
 }
 
 /// The key connections are counted by: an IPv4 address, or the /56 an IPv6 address is in.
 fn conn_key(ip: std::net::IpAddr) -> std::net::IpAddr {
-    match ip { std::net::IpAddr::V6(a) if a.to_ipv4_mapped().is_none() => { let s = a.segments(); std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3] & 0xff00, 0, 0, 0, 0)) } x => x }
+    match ip.to_canonical() { std::net::IpAddr::V6(a) => { let s = a.segments(); std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3] & 0xff00, 0, 0, 0, 0)) } x => x }
 }
 type Open = Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>;
 /// One connection counted against its address while this lives (None: not limited), or None when it already has PER_IP.
@@ -72,23 +85,23 @@ fn write_by(s: &mut TcpStream, b: &[u8]) {
 }
 
 impl Node {
-    /// Simple per-address limiter: a fixed one-minute window.
+    /// Simple per-address limiter: a fixed one-minute window (expired windows are swept once a minute).
     fn allow(&self, ip: std::net::IpAddr) -> bool {
-        let mut l = self.rpc_limit.lock().unwrap();
+        let mut g = self.rpc_limit.lock().unwrap();
+        let (l, swept) = &mut *g;
         let now = std::time::Instant::now();
-        let ip = limit_key(ip);
-        let e = l.entry(ip).or_insert((0, now));
+        if crate::net::every_minute(swept, now) { l.retain(|_, v| now.duration_since(v.1).as_secs() < 60); }
+        let e = l.entry(limit_key(ip)).or_insert((0, now));
         if now.duration_since(e.1).as_secs() >= 60 { *e = (0, now); }
         e.0 += 1;
-        if l.len() > 10_000 { l.retain(|_, v| now.duration_since(v.1).as_secs() < 60); }
-        l.get(&ip).map_or(true, |e| e.0 <= RPC_PER_MINUTE)
+        e.0 <= RPC_PER_MINUTE
     }
     pub fn serve_rpc(self: &Arc<Self>, addr: &str) -> std::io::Result<SocketAddr> {
         let l = TcpListener::bind(addr)?;
         let local = l.local_addr()?;
         let node = self.clone();
         let open: Open = Arc::default();   // connections being served, per address
-        std::thread::spawn(move || for mut s in l.incoming().flatten() {
+        crate::net::spawn(move || for mut s in l.incoming().flatten() {
             use std::sync::atomic::Ordering;
             // loopback is counted once the request names its client (X-Forwarded-For from a proxy), in handle
             let key = s.peer_addr().ok().map(|a| conn_key(a.ip())).filter(|ip| !ip.is_loopback());
@@ -96,12 +109,13 @@ impl Node {
             let Some(held) = held else { let _ = write!(s, "HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"); continue };
             ACTIVE.fetch_add(1, Ordering::Relaxed);
             let (n, open) = (node.clone(), open.clone());
-            std::thread::spawn(move || {
+            // no thread to be had: the connection is closed, not a panic that would stop the whole RPC
+            if crate::net::spawn(move || {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| n.handle(s, &open)));
                 drop(held);
                 ACTIVE.fetch_sub(1, Ordering::Relaxed);
-            });
-        });
+            }).is_err() { ACTIVE.fetch_sub(1, Ordering::Relaxed); }
+        })?;
         Ok(local)
     }
     fn handle(&self, mut s: TcpStream, open: &Open) {
@@ -133,16 +147,18 @@ impl Node {
         let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
         // the limits are per address; behind a reverse proxy on this machine every request comes from loopback, so the
         // proxy's X-Forwarded-For names the client. Loopback with no such header is the operator's own tools: not limited.
-        // This assumes exactly one proxy, which appends the address it saw: the last entry is believed (earlier ones are
-        // whatever the client claimed). Behind a chain of proxies every client would look like the last proxy but one.
+        // This assumes exactly one proxy, which appends the address it saw: the last entry of the last X-Forwarded-For line
+        // is believed (earlier ones, and earlier lines, are whatever the client sent; a proxy that adds a line of its own
+        // adds it last). Behind a chain of proxies every client would look like the last proxy but one.
         let mut _held = None;
         if let Ok(a) = s.peer_addr() {
+            let a = a.ip().to_canonical();
             // one that does not parse is limited as loopback, so a made-up header buys nothing
-            let fwd = head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("x-forwarded-for")).map(|(_, v)| v.to_string()));
-            let who = if !a.ip().is_loopback() { Some(a.ip()) } else { fwd.map(|v| v.rsplit(',').next().and_then(|x| x.trim().parse().ok()).unwrap_or(a.ip())) };
+            let fwd = head.lines().filter_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("x-forwarded-for")).map(|(_, v)| v.to_string())).last();
+            let who = if !a.is_loopback() { Some(a) } else { fwd.map(|v| v.rsplit(',').next().and_then(|x| x.trim().parse::<std::net::IpAddr>().ok()).map_or(a, |ip| ip.to_canonical())) };
             if who.is_some_and(|ip| !self.allow(ip)) { return reply(&mut s, "429 Too Many Requests"); }
             // a proxied client is held to PER_IP connections too (a direct one was counted when it connected)
-            if a.ip().is_loopback() { if let Some(ip) = who { match Held::take(open, Some(conn_key(ip))) { Some(h) => _held = Some(h), None => return reply(&mut s, "503 Service Unavailable") } } }
+            if a.is_loopback() { if let Some(ip) = who { match Held::take(open, Some(conn_key(ip))) { Some(h) => _held = Some(h), None => return reply(&mut s, "503 Service Unavailable") } } }
         }
         while buf.len() < head_end + body_len {
             let Some(n) = read(&mut s, &mut tmp) else { return };
@@ -155,6 +171,7 @@ impl Node {
         let body = String::from_utf8_lossy(&buf[head_end..]);
         let mut words = head.split_whitespace();
         let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+        if !costly_ok(path) { return reply(&mut s, "503 Service Unavailable"); }
         let (status, text) = match self.route(method, path, &body) { Ok(t) => ("200 OK", t), Err(e) => ("400 Bad Request", e.to_string()) };
         write_by(&mut s, format!("HTTP/1.0 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{text}", text.len()).as_bytes());
     }
