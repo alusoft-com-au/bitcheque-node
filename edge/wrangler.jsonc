@@ -23,5 +23,5 @@
   // (empty: no backup miner); MINER_ID: the account id they pay (its number is looked up each time)
   "vars": { "NET": "0", "UPSTREAMS": "https://node-oc.bitcheque.org,https://node-sa.bitcheque.org",
             "SERVICES": "{\"node-oc.bitcheque.org\":\"NODE_OC\",\"node-sa.bitcheque.org\":\"NODE_SA\"}",
-            "MINE_REGIONS": "ap,us,eu", "MINER_ID": "13d94e1e8bad344115c3df7af49b74e524" }
+            "MINE_REGIONS": "ap,us,eu", "MINER_ID": "13c65f6100e16588790ed61ee25dbae3d2" }
 }
