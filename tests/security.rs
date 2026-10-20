@@ -218,9 +218,9 @@ fn a_reorg_after_a_reorg_starts_from_a_snapshot() {
 fn frame(magic: &[u8; 4], kind: u8, payload: &[u8]) -> Vec<u8> { [&magic[..], &[kind], &(payload.len() as u32).to_le_bytes(), payload].concat() }
 fn get(addr: std::net::SocketAddr, path: &str) -> String { let mut s = TcpStream::connect(addr).unwrap(); write!(s, "GET {path} HTTP/1.0\r\n\r\n").unwrap(); let mut o = String::new(); let _ = s.read_to_string(&mut o); o }
 
-/// A peer claiming a huge height holds the sync slot only until it stalls; then a second HELLO on the same connection
-/// does not take it again (a new connection from the same address is banned for a while too, except from loopback,
-/// where devnets run many nodes). Slow (35 s): cargo test --release -- --ignored
+/// A peer that called us claiming a huge height never holds templates back (it delivers nothing, and only a peer we
+/// dialled or a delivering sync source does); it holds the sync slot only until it stalls, and a second HELLO on the same
+/// connection does not take it again. Slow (35 s): cargo test --release -- --ignored
 #[test]
 #[ignore]
 fn a_fake_height_cannot_hold_the_node_in_sync() {
@@ -232,10 +232,9 @@ fn a_fake_height_cannot_hold_the_node_in_sync() {
     let hello = frame(&p.magic, 0, &[&u32::MAX.to_le_bytes()[..], &[0u8; 32]].concat());
     let mut s = TcpStream::connect(at).unwrap();
     s.write_all(&hello).unwrap();
-    std::thread::sleep(Duration::from_millis(800));
-    let r = get(rpc, "/template/0");
-    assert!(r.contains("syncing"), "{r}");
     node.maintain(vec![], Duration::from_secs(1));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(get(rpc, "/template/0").contains("200 OK"), "a claim alone holds nothing back, sync source or not");
     std::thread::sleep(Duration::from_secs(33));
     assert!(get(rpc, "/template/0").contains("200 OK"), "the stalled source was dropped");
     let _ = s.write_all(&hello);   // the same connection again: refused (once per connection)

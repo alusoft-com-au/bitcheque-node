@@ -32,12 +32,13 @@ pub struct Store {
     pub chain: Chain,
     // blocks off the main chain, in memory only: a new side block is written to the file only once a reorg makes it
     // main (abandoned main blocks keep their place in the file), so blocks nobody builds on never pile up on disk
-    pub side: HashMap<[u8; 32], (Block, Option<(u64, u32)>)>,
+    pub side: HashMap<[u8; 32], (Block, Option<(u64, u32)>, usize)>,   // (block, place in the file, encoded size)
     side_order: VecDeque<[u8; 32]>,
     side_bytes: usize, side_cap: usize,
     index: HashMap<[u8; 32], u32>, // main-chain hash -> height (with a header window, only heights still in it)
     file: Option<File>,
     file_len: u64,
+    synced: Option<std::time::Instant>,   // when the data file was last flushed to the disk (None: not yet)
     path: Option<PathBuf>,
     genesis: Block,
     snaps: Vec<Snap>,   // oldest first: every snapshot within max_reorg of the tip, and the newest one below that, so a reorg up to max_reorg deep starts from one
@@ -53,8 +54,9 @@ pub fn work(bits: u32) -> u128 {
 }
 
 /// Scan the data file without loading it: (offset of the block bytes, length, header) per record. A last record cut
-/// short (a crash while writing) is cut off; a length no block can have means the file is damaged: it is moved aside
-/// and the node refuses to start, rather than cutting off every block after the damage.
+/// short (a crash while writing) is cut off, and so is a tail of zeros (a crash after the file grew but before its data
+/// reached the disk); any other length no block can have means the file is damaged: it is moved aside and the node
+/// refuses to start, rather than cutting off every block after the damage.
 fn scan(path: &Path, max: usize) -> std::io::Result<Vec<(u64, u32, Header)>> {
     let size = std::fs::metadata(path)?.len();
     let mut f = BufReader::new(File::open(path)?);
@@ -63,6 +65,7 @@ fn scan(path: &Path, max: usize) -> std::io::Result<Vec<(u64, u32, Header)>> {
         f.read_exact(&mut lb)?;
         let len = u32::from_le_bytes(lb) as u64;
         if len < 116 || len > max as u64 {
+            if len == 0 && zeros_from(path, i)? { eprintln!("data file: zero-filled tail ignored"); break; }
             let aside = PathBuf::from(format!("{}.corrupt", path.display()));
             std::fs::rename(path, &aside)?;
             return Err(std::io::Error::other(format!("{}: damaged at byte {i} (record length {len}); moved to {}. Start again to sync from scratch.", path.display(), aside.display())));
@@ -78,10 +81,18 @@ fn scan(path: &Path, max: usize) -> std::io::Result<Vec<(u64, u32, Header)>> {
     Ok(out)
 }
 
+/// Whether everything in the file from `at` to its end is zero.
+fn zeros_from(path: &Path, at: u64) -> std::io::Result<bool> {
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::Start(at))?;
+    let mut buf = vec![0u8; 1 << 16];
+    loop { match f.read(&mut buf)? { 0 => return Ok(true), n => if buf[..n].iter().any(|&b| b != 0) { return Ok(false) } } }
+}
+
 impl Store {
     pub fn open(p: Params, genesis: &Block, path: Option<&Path>) -> std::io::Result<Store> {
         let chain = Chain::new(p, genesis).map_err(std::io::Error::other)?;
-        let mut s = Store { chain, side: HashMap::new(), side_order: VecDeque::new(), side_bytes: 0, side_cap: SIDE_BYTES, index: HashMap::new(), file: None, file_len: 0,
+        let mut s = Store { chain, side: HashMap::new(), side_order: VecDeque::new(), side_bytes: 0, side_cap: SIDE_BYTES, index: HashMap::new(), file: None, file_len: 0, synced: None,
                             path: path.map(Path::to_path_buf), genesis: genesis.clone(), snaps: Vec::new(), host_snap: None, bad: HashMap::new(), bad_order: VecDeque::new() };
         s.index.insert(genesis.header.hash(), 0);
         if let Some(path) = path {
@@ -161,6 +172,8 @@ impl Store {
         Ok(s)
     }
     pub fn accept(&mut self, b: &Block, now: u32) -> Result<Accepted, &'static str> { self.accept_inner(b, now, None) }
+    /// Whether a block is already stored, on the main chain or off it (a resend can be dropped before it is decoded).
+    pub fn knows(&self, h: &[u8; 32]) -> bool { self.index.contains_key(h) || self.side.contains_key(h) }
 
     /// `loc`: the block's place in the file when loading; None means "new block, append it". A block that fails after
     /// its proof of work and tx root have checked out is remembered as bad (with its descendants), so sending it again
@@ -183,7 +196,8 @@ impl Store {
         r
     }
     fn accept_checked(&mut self, b: &Block, h: [u8; 32], now: u32, loc: Option<(u64, u32)>) -> Result<Accepted, &'static str> {
-        if b.encode().len() > self.chain.params.max_block_bytes { return Err("block too large"); }
+        let size = loc.map_or_else(|| b.encode().len(), |l| l.1 as usize);   // encoded once, for the limit and the side cache
+        if size > self.chain.params.max_block_bytes { return Err("block too large"); }
         if b.header.prev == self.chain.tip() {
             // the header first, so a block that cannot extend the tip is never written to the file
             let (p, hs) = (&self.chain.params, &self.chain.headers);
@@ -202,7 +216,7 @@ impl Store {
         // own branch and its coinbase. Its transactions are checked if it ever becomes main.
         let (height, fork, new_work) = self.check_side_header(&b.header, now)?;
         if !matches!(b.txs.first(), Some(Tx::Coinbase { height: ch, .. }) if *ch == height) || b.txs[1..].iter().any(|t| matches!(t, Tx::Coinbase { .. })) { return Err("coinbase"); }
-        self.remember_side(h, b.clone(), loc);
+        self.remember_side(h, b.clone(), loc, size);
         let old_work: u128 = self.chain.headers_from(fork + 1).iter().map(|x| work(x.bits)).sum();
         // a fork deeper than max_reorg wins only with twice the work: blocks that deep are settled for everyday
         // purposes, yet a node that ended up on a wrong branch (say, synced from a liar first) still finds its way back
@@ -224,6 +238,8 @@ impl Store {
         }
         let loc = (self.file_len + 4, e.len() as u32);
         self.file_len += 4 + e.len() as u64;
+        // to the disk now and then, so a crash loses at most the last few seconds' blocks (and leaves no zeros before them)
+        if self.synced.map_or(true, |t| t.elapsed().as_secs() >= 10) { let _ = f.sync_data(); self.synced = Some(std::time::Instant::now()); }
         Ok(Some(loc))
     }
     /// Remove the block just appended (it failed validation), so junk does not pile up on disk.
@@ -241,7 +257,7 @@ impl Store {
         let p = &self.chain.params;
         let mut anc: Vec<Header> = Vec::new();
         let mut prev = h.prev;
-        while let Some((b, _)) = self.side.get(&prev) { anc.push(b.header.clone()); prev = b.header.prev; }
+        while let Some((b, _, _)) = self.side.get(&prev) { anc.push(b.header.clone()); prev = b.header.prev; }
         let Some(&fork) = self.index.get(&prev) else { return Err("branch root unknown") };
         let depth = self.chain.height().saturating_sub(fork);
         if fork < self.chain.base || depth as usize > SIDE_CAP { return Err("reorg too deep"); }
@@ -264,13 +280,13 @@ impl Store {
     }
     /// Keep a side block, evicting the oldest others past the caps, but never one of its own ancestors: a long branch
     /// being built must keep every block back to its fork, or it could never be followed.
-    fn remember_side(&mut self, h: [u8; 32], b: Block, loc: Option<(u64, u32)>) {
-        self.side_bytes += b.encode().len();
-        if let Some((old, _)) = self.side.insert(h, (b, loc)) { self.side_bytes -= old.encode().len(); } else { self.side_order.push_back(h); }
+    fn remember_side(&mut self, h: [u8; 32], b: Block, loc: Option<(u64, u32)>, size: usize) {
+        self.side_bytes += size;
+        if let Some((_, _, old)) = self.side.insert(h, (b, loc, size)) { self.side_bytes -= old; } else { self.side_order.push_back(h); }
         if self.side.len() <= SIDE_CAP && self.side_bytes <= self.side_cap { return; }
         let mut keep = std::collections::HashSet::new();
         let mut x = h;
-        while let Some((b, _)) = self.side.get(&x) { keep.insert(x); x = b.header.prev; }
+        while let Some((b, _, _)) = self.side.get(&x) { keep.insert(x); x = b.header.prev; }
         let mut kept = VecDeque::new();
         while self.side.len() > SIDE_CAP || self.side_bytes > self.side_cap {
             let Some(old) = self.side_order.pop_front() else { break };
@@ -281,14 +297,14 @@ impl Store {
     }
     /// Forgotten blocks leave their place in side_order, skipped when reached; it is swept only when mostly stale.
     fn forget_side(&mut self, h: &[u8; 32]) {
-        if let Some((b, _)) = self.side.remove(h) { self.side_bytes -= b.encode().len(); }
+        if let Some((_, _, size)) = self.side.remove(h) { self.side_bytes -= size; }
         if self.side_order.len() > 2 * self.side.len() + 64 { let side = &self.side; self.side_order.retain(|x| side.contains_key(x)); }
     }
     /// Side blocks from the fork point down to `tip`, oldest first.
     fn branch(&self, tip: [u8; 32]) -> Vec<(Block, Option<(u64, u32)>)> {
         let mut v = Vec::new();
         let mut h = tip;
-        while let Some((b, loc)) = self.side.get(&h) { h = b.header.prev; v.push((b.clone(), *loc)); }
+        while let Some((b, loc, _)) = self.side.get(&h) { h = b.header.prev; v.push((b.clone(), *loc)); }
         v.reverse();
         v
     }
@@ -337,7 +353,7 @@ impl Store {
         let mut blocks = self.chain.blocks.prefix(fork as usize + 1);
         for (b, loc) in &branch { let loc = match loc { Some(l) => Some(*l), None => self.persist(b)? }; blocks.push(b, loc); }
         c.blocks = blocks;
-        for (hash, b, loc) in old { self.index.remove(&hash); self.remember_side(hash, b, loc); }
+        for (hash, b, loc) in old { self.index.remove(&hash); let size = loc.map_or_else(|| b.encode().len(), |l| l.1 as usize); self.remember_side(hash, b, loc, size); }
         for (k, (b, _)) in branch.iter().enumerate() { let h = b.header.hash(); self.forget_side(&h); self.index.insert(h, fork + 1 + k as u32); }
         self.chain = c;
         self.prune_index();
@@ -368,6 +384,8 @@ impl Store {
     }
     fn take_snapshot(&mut self, disk: bool) {
         let h = self.chain.height();
+        // the blocks a disk snapshot stands on reach the disk first: a snapshot past the end of the data file is useless
+        if disk { if let Some(f) = &self.file { let _ = f.sync_data(); } }
         self.snaps.retain(|sn| sn.height < h);
         self.snaps.push(Snap { height: h, tip: self.chain.tip(), state: self.chain.state.clone(), index: self.chain.encode_index(), disk });
         // keep every snapshot a reorg of up to max_reorg could need (those above tip - max_reorg, and the newest at or
@@ -389,7 +407,8 @@ impl Store {
         for sn in disk.iter().rev().skip(1) { w.bytes(&encode_snap(sn)); }
         if let Some(path) = self.snap_path() {
             let tmp = path.with_extension("snap.tmp");
-            let _ = std::fs::write(&tmp, &w.0).and_then(|_| std::fs::rename(&tmp, &path));
+            // on the disk before it takes the old one's place, so a crash leaves one or the other, never a hole
+            let _ = File::create(&tmp).and_then(|mut f| { f.write_all(&w.0)?; f.sync_data() }).and_then(|_| std::fs::rename(&tmp, &path));
         } else if let Some((_, sink)) = self.host_snap { sink(&w.0); }
     }
     fn read_snapshot(&self) -> Vec<Snap> { std::fs::read(self.snap_path().unwrap_or_default()).map(|r| decode_snap(&r)).unwrap_or_default() }

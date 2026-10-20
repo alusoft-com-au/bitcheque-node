@@ -277,9 +277,12 @@ nodes on Cloudflare (`node-ap`, `node-us`, `node-eu`, `node-oc`, `node-sa`.bitch
 which cannot speak this TCP protocol: Workers neither open nor accept raw
 connections. So a node also follows *upstreams* over the HTTP RPC: every
 minute it pulls the blocks an upstream has above its own tip (`/height`,
-`/block/<n>`, walking back up to 200 blocks on a fork) and it posts every
-transaction and block it accepts, from its RPC or from its TCP peers, to all
-of them (`POST /tx`, one request per batch, and `POST /block`). With no
+`/block/<n>`, walking back up to 200 blocks on a fork; every upstream's
+height is asked and the highest pulled from, the next if that brings nothing
+new) and it posts every transaction and block it accepts, from its RPC or
+from its TCP peers, to all of them (`POST /tx`, one request per batch of at
+most 64, and `POST /block`; a block from a peer only if its time is within
+the last hour, so an initial sync is not posted block by block). With no
 `--upstream` it follows the four seeds; `--no-upstream` turns this off. A
 node following them and talking TCP to others bridges the two. The edge
 nodes do not pull from it, so its own blocks reach them only by that push.
@@ -303,29 +306,53 @@ Peer discovery over TCP follows Bitcoin's model (implemented in `net.rs`): seed 
 compiled into the binary (none on the research network, whose seeds are the
 edge nodes above; placeholders on mainnet until the project has a domain), a
 `getaddr`/`addr` exchange in which every node shares the addresses it knows
-(50 per reply, 1,000 remembered), an address book saved next to the data file,
+(50 per reply, once per connection, 1,000 remembered, at most 100 taken per
+sending /16 or /32 per 10 minutes), an address book saved next to the data file,
 and eight outbound connections kept up from that book. A node told nothing
 dials the seeds; a node told one peer with `--peer` learns the rest from it.
 `--advertise` is the address a node tells others it can be reached on.
 The book keeps one entry per IP (eight per /16), so one host on many ports
 cannot fill it. Outbound peers are chosen at random, addresses that
-answered a HELLO before ("tried") taking turns with new ones, at most one
-per /16 (/32 for IPv6), dialled in parallel with a 3 s timeout.
+answered a HELLO before ("tried", marked in the saved book) taking turns with
+new ones, at most one per /16 (/32 for IPv6), dialled in parallel with a 3 s
+timeout. Gossip never pushes a tried address out of a full book. Addresses
+that carry an IPv4 address inside (NAT64, 6to4, Teredo, IPv4-compatible) are
+not taken from gossip.
 
-Limits: 125 inbound connections, 4 per address. A new connection must send
+Limits: 125 inbound connections, 4 per address and 8 per /24 (/32 for IPv6).
+When all are taken a newcomer is let in by dropping the newest connection of
+the network holding the most, never one of the 8 longest-connected or of the
+8 that last brought new blocks. A new connection must send
 its whole HELLO (at most 200 bytes, and the first frame must be one) within
 10 s of connecting; after that a frame may take at most 120 s once it has
-started. 3 bad messages (an invalid block, one timestamped at or below the
-median, one built on a block known to be invalid) drop a peer and refuse its
+started, and none may be longer than the largest block (plus 4 KB). A
+block's header and proof of work are checked, and a block already stored is
+recognised, before its transactions are decoded. 3 bad messages (an invalid
+block, one timestamped at or below the median, one built on a block known to
+be invalid, a repeated `getaddr`, a transaction that can never be valid, such
+as a cheque piece matching no commitment) drop a peer and refuse its
 address for 30 minutes; strikes are counted per address (an IPv6 /64)
 across connections, and loopback is dropped but never refused (devnets run
-many nodes on one machine). 500 blocks per sync reply. The sync source is a
-random peer that is ahead, one we dialled if there is one (a claimed height
-is not trusted to choose by); it must raise our height by 50 blocks, or all
-it has left, every 30 s, or it is replaced and barred for 10 minutes, so a
-block now and then cannot hold the slot. Templates are refused ("syncing")
-only while a usable peer is more than 6 blocks ahead. A 64 MB mempool, with
-a txid set and a running byte count beside it.
+many nodes on one machine). More than 200 refused transactions in a minute
+are a strike, and the rest of that minute's are ignored. A sync reply is 500
+blocks or about 8 MB of them, whichever comes first; the asker counts both
+the same way and asks again then, or when the source has been quiet for 10 s
+(a reply cut short by a full send queue, 16 MB per peer). The sync source is
+a random peer that is ahead, one we dialled if there is one (a claimed height
+is not trusted to choose by); it must give us 50 blocks we did not have
+(main chain or side), or all it has left, every 30 s, or it is replaced and
+its address barred as a source for 10 minutes (not banned: it may be honest
+and slow), so a block now and then cannot hold the slot. Templates are
+refused ("syncing") only while a peer we dialled, or a sync source that has
+sent a new block in the last 10 s, is more than 6 blocks ahead: a claim from
+a peer that called us holds nothing back. A 64 MB mempool, with a txid set
+and a running byte count beside it.
+
+The RPC limits each address (an IPv6 /48) to 120 requests a minute, and
+`/check`, `/proof` and `/template` to 100 a second from everyone together.
+Behind a proxy the last entry of the last `X-Forwarded-For` line is the
+client. The data file is flushed to the disk every 10 s and before each
+snapshot; a tail of zeros after a crash is cut off like a torn record.
 
 A block that fails validation after its proof of work and transaction root
 have checked out is remembered (the last 4,096), with any block built on
