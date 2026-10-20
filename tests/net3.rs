@@ -92,6 +92,7 @@ fn junk_cheque_pieces_are_struck_and_remembered() {
     let p = rp();
     let v = node(&p);
     let b = book(7);
+    mine(&v, 0).unwrap();   // block 0 is no registration anchor
     v.submit_tx(mine_registration(b.register(0, 16, Payment::Pow([0; 32], 0)), common::tip(&v), p.reg_pow_target), None).unwrap();
     mine(&v, 0).unwrap();
     let Tx::ChequePiece { account, .. } = b.pieces(1, &[0u8; 18]).remove(0) else { panic!() };
@@ -274,22 +275,24 @@ fn upstream_posts_are_chunked_and_skip_old_blocks() {
     let g = Chain::genesis(&p, now() - 100_000, b"a3");
     let v = Node::new(Store::open(p.clone(), &g, None).unwrap());
     let books: Vec<Book> = (20..24).map(book).collect();
-    for b in &books { v.submit_tx(mine_registration(b.register(0, 16, Payment::Pow([0; 32], 0)), common::tip(&v), p.reg_pow_target), None).unwrap(); }
-    // an old block, as from a peer during an initial sync
-    let old = { let st = v.store.lock().unwrap(); let mut b: Block = st.chain.template(g.header.time + 60, 0, v.mempool.lock().unwrap().to_vec()).unwrap(); b.header.mine(); b };
+    // an old block, as from a peer during an initial sync (it is also the registrations' anchor: block 0 is none)
+    let old = { let st = v.store.lock().unwrap(); let mut b: Block = st.chain.template(g.header.time + 60, 0, vec![]).unwrap(); b.header.mine(); b };
     let (up, seen) = recorder();
     v.follow(vec![up], Duration::from_secs(60));
     assert_eq!(v.submit_block(&old, Some(7)), Ok(true));
+    for b in &books { v.submit_tx(mine_registration(b.register(0, 16, Payment::Pow([0; 32], 0)), common::tip(&v), p.reg_pow_target), None).unwrap(); }
     mine(&v, 0).unwrap();
     assert!(wait(5, || seen.lock().unwrap().iter().any(|(p, _)| p == "/block")));
+    // the registrations went up too, now that it follows: only what comes after them is counted
+    let regs = seen.lock().unwrap().iter().filter(|(p, _)| p == "/tx").count();
     let pieces: Vec<Tx> = books.iter().flat_map(|b| b.pieces(1, &[0u8; 18]).into_iter().take(17)).collect();
     assert_eq!(pieces.len(), 68);
     assert!(v.submit_txs(pieces, None).iter().all(|r| r.is_ok()));
-    assert!(wait(5, || seen.lock().unwrap().iter().filter(|(p, _)| p == "/tx").count() == 2));
+    assert!(wait(5, || seen.lock().unwrap().iter().filter(|(p, _)| p == "/tx").count() == regs + 2));
     std::thread::sleep(Duration::from_millis(300));
     let seen = seen.lock().unwrap();
     assert_eq!(seen.iter().filter(|(p, _)| p == "/block").count(), 1, "only the block mined here");
-    let lines: Vec<usize> = seen.iter().filter(|(p, _)| p == "/tx").map(|(_, b)| b.lines().count()).collect();
+    let lines: Vec<usize> = seen.iter().filter(|(p, _)| p == "/tx").skip(regs).map(|(_, b)| b.lines().count()).collect();
     assert_eq!(lines, vec![64, 4]);
 }
 

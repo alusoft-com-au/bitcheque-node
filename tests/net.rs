@@ -66,6 +66,9 @@ fn queued_cheque_does_not_block_the_next() {
     // the queue knows those columns are taken: the wallet skips a number on exactly this text
     let again = a.check_txs(&half[..1]);
     assert_eq!(again[0], Err("column already revealed"));
+    // the same column with another digit: someone else holds this part, and the wallet stops on exactly this text
+    let other = miner.sign(1, &Message::new(3, 1, 8, 1));
+    assert_eq!(a.check_txs(&other[10..11])[0], Err("column revealed with other digits"));
     // cheque 2 is accepted on top of the queue: it abandons cheque 1
     let next = miner.sign(2, &Message::new(2, 3, 8, 1)); // 3 coins
     assert!(a.check_txs(&next).iter().all(|r| r.is_ok()));

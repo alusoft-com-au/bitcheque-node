@@ -945,7 +945,13 @@ impl Node {
         txs.iter().zip(pre).map(|(t, pre)| {
             pre?;
             let row = match t { Tx::ChequePiece { account, cheque, column, shares } => st.piece_digit(account, *cheque, *column, shares), _ => None };
-            st.apply(&c.params, t).map(|_| row)
+            st.apply(&c.params, t).map(|_| row).map_err(|e| match t {
+                // the same cell again is harmless (an earlier run sent it); a column already showing another digit means
+                // someone else holds this part of the cheque, and a wallet must not send the rest
+                Tx::ChequePiece { account, cheque, column, .. } if e == "column already revealed"
+                    && st.accounts.get(account).and_then(|a| a.open.get(cheque)).and_then(|o| o.digits[*column as usize]) != row => "column revealed with other digits",
+                _ => e,
+            })
         }).collect()
     }
     /// The next block to mine for `payee`, nonce 0: the tip, the time, and waiting transactions oldest
