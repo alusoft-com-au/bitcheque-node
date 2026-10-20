@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use crate::block::{Block, Header};
@@ -29,10 +29,11 @@ const FRAME_MARGIN: usize = 4096;     // a frame may be this much longer than th
 const MAX_OUTBOUND: usize = 8;   // connections this node keeps dialling on its own
 const MAX_BOOK: usize = 1000;    // addresses remembered
 const ADDR_REPLY: usize = 50;    // addresses shared per GET_ADDR
-const GIVE_UP: u32 = 3;          // failed dials before an address is forgotten
+const GIVE_UP: u32 = 3;          // failed dials in a row before an address is forgotten...
+const GIVE_UP_TRIED: u32 = 10;   // ...or one that answered our dial before (our own refusals, a ban, are no failure)
 const MAX_INBOUND: usize = 125;  // inbound connections accepted (Bitcoin's default)
 const MAX_PER_IP: usize = 4;     // connections from one address
-const MAX_PER_GROUP: usize = 8;  // ...and from one /24 (IPv4) or /32 (IPv6)
+const MAX_PER_GROUP: usize = 8;  // ...and from one /24 (IPv4) or /48 (IPv6); eviction picks among /16s and /32s
 const PROTECT_OLD: usize = 8;    // inbound slots full: the longest-connected peers are never the ones dropped for a newcomer,
 const PROTECT_USEFUL: usize = 8; // ...nor those that last brought us new blocks
 const BOOK_PER_GROUP: usize = 8; // addresses remembered per /16 (IPv4) or /32 (IPv6): one network cannot fill the book
@@ -51,16 +52,26 @@ const STALL: Duration = Duration::from_secs(30);       // a sync source must rai
 const PROGRESS: u32 = 50;                              // has left) every STALL, or it is replaced: a trickle is not progress
 const BAR: Duration = Duration::from_secs(600);        // ...and not chosen again for this long
 const ASK_AGAIN: Duration = Duration::from_secs(10);   // a sync source silent this long is asked again (a batch cut short)
-const SYNC_AHEAD: u32 = 6;                             // no templates while a peer we dialled, or a delivering sync source,
-const DELIVERING: Duration = Duration::from_secs(10);  // is this far ahead (a source delivers if it sent a new block this recently)
+const SYNC_AHEAD: u32 = 6;                             // no templates while a peer delivering blocks new to us is this far
+const DELIVERING: Duration = Duration::from_secs(10);  // ahead (it delivers if it sent one this recently: a claim alone holds nothing)
 const BAN: Duration = Duration::from_secs(1800);       // a misbehaving peer's address is refused for this long
+const MAP_CAP: usize = 10_000;                         // entries in each map of bans, bars, strikes and shunned addresses
+const ORPHANS: usize = 64;                             // blocks with an unknown parent remembered per peer between our asks
+const REASKS: usize = 12;                              // steps back (to find a fork) per peer until it gives us a new block
+const REBROADCAST: Duration = Duration::from_secs(600); // our own waiting transactions are offered again this often...
+const REBROADCAST_MAX: usize = 500;                    // ...the oldest this many of them
+const OWN_MAX: usize = 10_000;                         // txids of transactions from our own RPC remembered for that
 const ADDR_GAP: Duration = Duration::from_secs(10);    // fastest a peer's ADDR messages are read
 const MEMPOOL_BYTES: usize = 64 << 20; // waiting transactions kept, in encoded bytes (Bitcoin keeps 300 MB); see set_mempool_cap
 const HTTP_MAX: usize = 32 << 20;      // largest reply the HTTP client reads
 const HTTP_DEADLINE: Duration = Duration::from_secs(60);   // ...and the longest it waits for one, in all
 const UPSTREAM_QUEUE: usize = 1000;    // posts waiting for one upstream; past this the newest are dropped (the pull catches up)
 const UPSTREAM_BYTES: usize = 16 << 20; // ...and bytes waiting for it
-const UPSTREAM_LINES: usize = 64;      // transactions per POST /tx (what an RPC takes in one request)
+const UPSTREAM_LINES: usize = 64;      // transactions per POST /tx (what an RPC takes in one request),
+const UPSTREAM_REGS: usize = 16;       // ...registrations among them (an edge node refuses a whole post with more),
+const UPSTREAM_POST: usize = 2 << 20;  // ...and about this many bytes of hex (one line may be more, alone)
+const UPSTREAM_GAP: Duration = Duration::from_millis(2500);   // between two POST /tx to one upstream (an edge node takes ~30 a minute)
+const UPSTREAM_RETRIES: u32 = 20;      // a post refused as too many or busy (429, 503) is sent again, waiting twice as long each time
 const PUSH_RECENT: u32 = 3600;         // a block from a peer goes up only if its time is this recent: not a whole initial sync
 const BAD_TXS: usize = 4096;           // txids that can never be valid (failed a stateless check), remembered
 const REJECTS: u32 = 200;              // refused transactions a peer may send per minute; past that its transactions are ignored
@@ -87,6 +98,42 @@ pub fn http_seeds(magic: &[u8; 4]) -> &'static [&'static str] {
         _ => &[],
     }
 }
+/// One upstream's poster: what is queued for it, in order, each post sent until it is taken. POST /tx bodies waiting are
+/// joined while they fit (whole: a batch stays in one post), and two of them go UPSTREAM_GAP apart at least, so a burst
+/// becomes a few posts an edge node takes instead of many it refuses. A post answered 429 (too many) or 5xx (busy), or
+/// not answered, is sent again, waiting twice as long each time (up to a minute): UPSTREAM_RETRIES times, three when
+/// nobody answers. Any other answer is final: a lone transaction refused is answered 400, and sending it again changes
+/// nothing (several are answered 200, a line each).
+fn upstream_posts(up: &str, rx: Receiver<(&'static str, String)>, bytes: &AtomicUsize) {
+    let (mut held, mut last_tx) = (None, Instant::now() - UPSTREAM_GAP);
+    loop {
+        let Some((path, mut body)) = held.take().or_else(|| rx.recv().ok()) else { return };
+        let mut taken = body.len();
+        if path == "/tx" {
+            if let Some(w) = UPSTREAM_GAP.checked_sub(last_tx.elapsed()) { std::thread::sleep(w); }
+            let step = |n: (usize, usize, usize), l: &str| (n.0 + 1, n.1 + is_reg(l) as usize, n.2 + l.len() + 1);
+            let mut n = body.lines().fold((0, 0, 0), step);
+            while let Ok((p, b)) = rx.try_recv() {
+                let mut m = n;
+                if p == "/tx" && b.lines().all(|l| { let ok = fits(m, l); m = step(m, l); ok }) { body.push('\n'); body.push_str(&b); taken += b.len(); n = m; } else { held = Some((p, b)); break; }
+            }
+        }
+        let mut wait = UPSTREAM_GAP;
+        for tries in 1.. {
+            let r = http_status(up, "POST", path, &body);
+            let again = match &r { Ok((c, _)) => (*c == 429 || *c >= 500) && tries <= UPSTREAM_RETRIES, Err(_) => tries <= 3 };
+            if !again {
+                match r { Ok((200, _)) => {} Ok((c, t)) => eprintln!("upstream {up}: {path}: {c} {}", clean(t.trim())), Err(e) => eprintln!("upstream {up}: {e}") }
+                break;
+            }
+            std::thread::sleep(wait);
+            wait = (wait * 2).min(Duration::from_secs(60));
+        }
+        if path == "/tx" { last_tx = Instant::now(); }
+        bytes.fetch_sub(taken, Ordering::Relaxed);
+    }
+}
+
 /// `from` for blocks pulled from an upstream: relayed to peers, never pushed back up.
 const FROM_UPSTREAM: u64 = u64::MAX - 1;
 const UPSTREAM_BATCH: u32 = 2000;   // blocks pulled from an upstream per round
@@ -96,6 +143,10 @@ const UPSTREAM_BATCH: u32 = 2000;   // blocks pulled from an upstream per round
 /// the status line. A reply is read up to HTTP_MAX bytes within HTTP_DEADLINE, so a hostile server cannot exhaust
 /// memory or hold the caller forever. Text from the server is cleaned of control characters before it is shown.
 pub fn http(addr: &str, method: &str, path: &str, body: &str) -> Result<String, String> {
+    match http_status(addr, method, path, body)? { (200, text) => Ok(text), (_, text) => Err(format!("{path}: {}", clean(text.trim()))) }
+}
+/// `http`, with the reply's status code (0 if it has none) and body whatever the status: the caller decides.
+pub fn http_status(addr: &str, method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
     let sa = addr.to_socket_addrs().map_err(|e| format!("{addr}: {e}"))?.next().ok_or(format!("{addr}: no address"))?;
     let mut s = TcpStream::connect_timeout(&sa, Duration::from_secs(10)).map_err(|e| format!("{addr}: {e}"))?;
     s.set_write_timeout(Some(Duration::from_secs(30))).ok();
@@ -109,7 +160,7 @@ pub fn http(addr: &str, method: &str, path: &str, body: &str) -> Result<String, 
     }
     let out = String::from_utf8_lossy(&out);
     let (head, text) = out.split_once("\r\n\r\n").ok_or("bad reply")?;
-    if head.split_whitespace().nth(1) == Some("200") { Ok(text.to_string()) } else { Err(format!("{path}: {}", clean(text.trim()))) }
+    Ok((head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0), text.to_string()))
 }
 
 /// Text from another machine, safe to print to a terminal: control characters (escape sequences) become '?', and
@@ -119,12 +170,14 @@ pub fn clean(s: &str) -> String {
         .map(|c| if c.is_control() && c != '\n' { '?' } else { c }).collect()
 }
 
-/// The network an address belongs to for diversity limits: /16 or /24 of IPv4 (`wide` picks the first), /32 of IPv6
-/// (one site can have a whole /32 for next to nothing).
+/// The network an address belongs to for diversity limits. Wide: /16 of IPv4, /32 of IPv6 (one provider has a whole /32
+/// for next to nothing), Bitcoin's netgroups: the address book, outbound picks and which inbound network gives up a slot.
+/// Narrow: /24 of IPv4, /48 of IPv6 (one site): the cap on inbound connections, so a large provider's many customers
+/// are not all held to the few slots of one site.
 fn group(ip: std::net::IpAddr, wide: bool) -> Vec<u8> {
     match ip.to_canonical() {
         std::net::IpAddr::V4(a) => a.octets()[..if wide { 2 } else { 3 }].to_vec(),
-        std::net::IpAddr::V6(a) => a.octets()[..4].to_vec(),
+        std::net::IpAddr::V6(a) => a.octets()[..if wide { 4 } else { 6 }].to_vec(),
     }
 }
 /// An address another node may pass us: a public IP literal (no names to look up, no private or loopback hosts).
@@ -142,9 +195,35 @@ fn public_ip(a: &str) -> Option<std::net::IpAddr> {
     };
     ok.then_some(ip)
 }
-/// What a ban applies to: an IPv4 address, or the /64 an IPv6 address is in (one machine has a whole /64).
+/// What a ban applies to: an IPv4 address, or the /48 an IPv6 address is in (a site is commonly given a /48, and its
+/// 65,536 /64s would otherwise each be a fresh start, and a fresh entry in the maps).
 fn ban_key(ip: std::net::IpAddr) -> std::net::IpAddr {
-    match ip { std::net::IpAddr::V6(a) if a.to_ipv4_mapped().is_none() => { let s = a.segments(); std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)) } x => x }
+    match ip.to_canonical() { std::net::IpAddr::V6(a) => { let s = a.segments(); std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], 0, 0, 0, 0, 0)) } x => x }
+}
+/// Room for one more entry in a map of expiring entries (`until`: when one expires): past MAP_CAP the expired go, then
+/// the soonest to expire, so no stream of addresses can grow it without bound.
+fn make_room<K: Clone + Eq + std::hash::Hash, V>(m: &mut HashMap<K, V>, until: impl Fn(&V) -> Instant) {
+    if m.len() < MAP_CAP { return; }
+    let now = Instant::now();
+    m.retain(|_, v| until(v) > now);
+    while m.len() >= MAP_CAP { let Some(k) = m.iter().min_by_key(|(_, v)| until(v)).map(|(k, _)| k.clone()) else { break }; m.remove(&k); }
+}
+/// A line of hex that is a registration (tag 1 or 2), as an edge node counts them.
+fn is_reg(line: &str) -> bool { line.starts_with("01") || line.starts_with("02") }
+/// Whether `line` may join a POST /tx holding `n` (lines, registrations, bytes) so far.
+fn fits(n: (usize, usize, usize), line: &str) -> bool {
+    n.0 == 0 || (n.0 < UPSTREAM_LINES && n.1 + is_reg(line) as usize <= UPSTREAM_REGS && n.2 + line.len() + 1 <= UPSTREAM_POST)
+}
+/// Lines of hex transactions cut into POST /tx bodies an upstream takes, in order.
+fn tx_posts(lines: impl Iterator<Item = String>) -> Vec<String> {
+    let (mut out, mut cur, mut n): (Vec<String>, Vec<String>, (usize, usize, usize)) = (Vec::new(), Vec::new(), (0, 0, 0));
+    for l in lines {
+        if !fits(n, &l) { out.push(cur.join("\n")); cur.clear(); n = (0, 0, 0); }
+        n = (n.0 + 1, n.1 + is_reg(&l) as usize, n.2 + l.len() + 1);
+        cur.push(l);
+    }
+    if !cur.is_empty() { out.push(cur.join("\n")); }
+    out
 }
 /// A cheap random number (no crypto needed): for picking which addresses to share, dial or evict.
 fn rand64() -> u64 {
@@ -209,7 +288,8 @@ struct Peer {
     id: u64,
     stream: Mutex<TcpStream>,          // kept to shut the connection down
     out: SyncSender<Arc<[u8]>>, queued: Arc<AtomicUsize>,
-    addr: Mutex<Option<String>>,       // dialled address, or what an inbound peer advertised from its own IP
+    addr: Mutex<Option<String>>,       // dialled address, or what an inbound peer advertised from its own IP (only a claim:
+                                       // another node may share that IP, so it never stands for that address being connected)
     outbound: bool, ip: Option<std::net::IpAddr>,   // (IPv4 written as IPv6 is kept as IPv4)
     since: Instant,                    // when it connected
     height: Mutex<u32>,                // the best height it told us, or reached while serving us
@@ -218,6 +298,9 @@ struct Peer {
     fresh: AtomicUsize,                // blocks new to us (main chain or side) from it since its sync window started
     heard: Mutex<Instant>,             // when we last asked it for blocks, or had one from it
     delivered: Mutex<Option<Instant>>, // when it last sent us a block new to us
+    next_want: Mutex<u32>,             // the height of the next block of our last batch request (only those count toward got)
+    orphans: Mutex<Vec<[u8; 32]>>,     // blocks with an unknown parent it sent since we last asked it: a resend is dropped undecoded
+    reasks: AtomicUsize,               // times we stepped back to find a fork with it since it last gave us a new block
 }
 
 /// An address book entry: its IP when it is a literal (names are looked up only when dialled), failed dials in a row, and
@@ -249,6 +332,7 @@ pub struct Node {
     upstream: Mutex<Vec<(SyncSender<(&'static str, String)>, Arc<AtomicUsize>)>>,   // per upstream: (path, body) to POST to it, in order; bytes waiting
     mempool_cap: AtomicUsize,
     tpl_cache: Mutex<Option<Tpl>>,
+    own: Mutex<VecDeque<[u8; 32]>>,    // txids that came in through our own RPC, oldest first: offered again until mined (rebroadcast)
 }
 
 fn frame(magic: &[u8; 4], kind: u8, payload: &[u8]) -> Arc<[u8]> {
@@ -306,7 +390,7 @@ impl Node {
                         sync: Mutex::new(None), rpc_limit: Mutex::default(), top_cache: Mutex::new(None),
                         next: Mutex::new(None), banned: Mutex::default(), strikes: Mutex::default(), bars: Mutex::default(), shunned: Mutex::default(), addr_sources: Mutex::default(), bad_txs: Mutex::default(),
                         mempool_text: Mutex::new(None), params, upstream: Mutex::new(Vec::new()),
-                        mempool_cap: AtomicUsize::new(MEMPOOL_BYTES), tpl_cache: Mutex::new(None) })
+                        mempool_cap: AtomicUsize::new(MEMPOOL_BYTES), tpl_cache: Mutex::new(None), own: Mutex::default() })
     }
     /// Keep at most this many bytes of waiting transactions (the edge node, with 128 MB in all, keeps far fewer).
     pub fn set_mempool_cap(&self, bytes: usize) { self.mempool_cap.store(bytes, Ordering::Relaxed); }
@@ -326,7 +410,14 @@ impl Node {
         }
         *self.book_path.lock().unwrap() = Some(path);
     }
-    pub fn known_addrs(&self) -> Vec<String> { self.book.lock().unwrap().keys().cloned().collect() }
+    /// Every address in the book, ours to dial (known_addrs is what we share).
+    pub fn book_addrs(&self) -> Vec<String> { self.book.lock().unwrap().keys().cloned().collect() }
+    /// The addresses we tell others about (GET_ADDR, /addrs): not a built-in seed that never answered us, and on a public
+    /// network only public IP literals (or names): a loopback or private address is no use to anyone else.
+    pub fn known_addrs(&self) -> Vec<String> {
+        let (seeds, devnet) = (seeds(&self.magic), self.magic[3] == 0x02);
+        self.book.lock().unwrap().iter().filter(|(a, e)| (e.tried || !seeds.contains(&a.as_str())) && (devnet || e.ip.is_none() || public_ip(a).is_some())).map(|(a, _)| a.clone()).collect()
+    }
     /// An address a peer told us about: only a public IP literal (a local devnet may use loopback, and `seen` marks one
     /// we saw the peer connect from), and only a few per network, so gossip can neither point us at private or
     /// arbitrary hosts nor fill the book from one network.
@@ -361,24 +452,33 @@ impl Node {
         let mut g = self.strikes.lock().unwrap();
         let (s, swept) = &mut *g;
         if every_minute(swept, now) { s.retain(|_, v| now < v.1 + BAN); self.banned.lock().unwrap().retain(|_, until| *until > now); }
+        if !s.contains_key(&k) { make_room(s, |v| v.1 + BAN); }
         let e = s.entry(k).or_insert((0, now));
         if now > e.1 + BAN { *e = (0, now); }
         e.0 += 1;
         if e.0 < STRIKES { return false; }
-        if !ip.is_loopback() { self.banned.lock().unwrap().insert(k, now + BAN); }
+        if !ip.is_loopback() { self.ban(k, now + BAN); }
         true
     }
+    /// Refuse an address (a ban_key) until then.
+    fn ban(&self, k: std::net::IpAddr, until: Instant) { let mut b = self.banned.lock().unwrap(); make_room(&mut b, |t| *t); b.insert(k, until); }
+    /// Addresses refused at the moment (for tests and the operator).
+    pub fn ban_count(&self) -> usize { self.banned.lock().unwrap().len() }
     fn is_banned(&self, ip: Option<std::net::IpAddr>) -> bool {
         let Some(ip) = ip else { return false };
         self.banned.lock().unwrap().get(&ban_key(ip.to_canonical())).is_some_and(|until| *until > Instant::now())
     }
+    /// Written aside, flushed and renamed over the old file: a crash mid-write leaves the old book, never half of one
+    /// (losing the tried addresses). A built-in seed is kept only once it answered.
     fn save_book(&self) {
-        if let Some(p) = self.book_path.lock().unwrap().clone() {
-            let text: String = self.book.lock().unwrap().iter().map(|(a, e)| format!("{a}{}\n", if e.tried { " tried" } else { "" })).collect();
-            let _ = std::fs::write(p, text);
-        }
+        let Some(p) = self.book_path.lock().unwrap().clone() else { return };
+        let seeds = seeds(&self.magic);
+        let text: String = self.book.lock().unwrap().iter().filter(|(a, e)| e.tried || !seeds.contains(&a.as_str())).map(|(a, e)| format!("{a}{}\n", if e.tried { " tried" } else { "" })).collect();
+        let tmp = PathBuf::from(format!("{}.tmp", p.display()));
+        let r = std::fs::File::create(&tmp).and_then(|mut f| { f.write_all(text.as_bytes())?; f.sync_all() }).and_then(|_| std::fs::rename(&tmp, &p));
+        if let Err(e) = r { eprintln!("address book {}: {e}", p.display()); let _ = std::fs::remove_file(&tmp); }
     }
-    /// Inbound slots are full: drop the newest connection of the network (/24, /32) holding the most of the rest, after
+    /// Inbound slots are full: drop the newest connection of the network (/16, /32) holding the most of the rest, after
     /// setting aside the longest-connected peers and those that last brought us new blocks, so connections made for free
     /// cannot push out established, useful ones. False when there is nobody to drop.
     fn evict_inbound(&self) -> bool {
@@ -391,7 +491,7 @@ impl Node {
             let useful = c.iter().take(PROTECT_USEFUL).take_while(|p| p.delivered.lock().unwrap().is_some()).count();
             c.drain(..useful);
             let mut groups: HashMap<Vec<u8>, Vec<&Arc<Peer>>> = HashMap::new();
-            for p in c { groups.entry(p.ip.map_or(Vec::new(), |ip| group(ip, false))).or_default().push(p); }
+            for p in c { groups.entry(p.ip.map_or(Vec::new(), |ip| group(ip, true))).or_default().push(p); }
             groups.into_values().max_by_key(|v| v.len()).and_then(|v| v.into_iter().max_by_key(|p| p.since)).cloned()
         };
         victim.map(|p| { let _ = p.stream.lock().unwrap().shutdown(std::net::Shutdown::Both); }).is_some()
@@ -416,8 +516,9 @@ impl Node {
     }
     pub fn connect(self: &Arc<Self>, addr: &str) -> std::io::Result<()> {
         let a = addr.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::other("no address"))?;
-        if !a.ip().to_canonical().is_loopback() && self.is_banned(Some(a.ip())) { return Err(std::io::Error::other("banned for a while")); }
-        if self.shunned.lock().unwrap().get(addr).is_some_and(|t| *t > Instant::now()) { return Err(std::io::Error::other("on a chain our rules reject, not dialled for a while")); }
+        // our own refusals (PermissionDenied) are no failure of the address: maintain does not count them against it
+        if !a.ip().to_canonical().is_loopback() && self.is_banned(Some(a.ip())) { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "banned for a while")); }
+        if self.shunned.lock().unwrap().get(addr).is_some_and(|t| *t > Instant::now()) { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "on a chain our rules reject, not dialled for a while")); }
         let s = TcpStream::connect_timeout(&a, DIAL_WAIT)?;
         self.add_peer_from(s, Some(addr.to_string()), true);
         Ok(())
@@ -427,8 +528,9 @@ impl Node {
     /// empty and nobody is connected, tries the compiled-in seeds. Runs every `every`.
     pub fn maintain(self: &Arc<Self>, pinned: Vec<String>, every: Duration) {
         let node = self.clone();
-        let r = spawn(move || { let mut tick = 0u64; loop {
-            let connected: Vec<String> = node.peers.lock().unwrap().iter().filter_map(|p| p.addr.lock().unwrap().clone()).collect();
+        let r = spawn(move || { let (mut tick, mut last_rebroadcast) = (0u64, Instant::now()); loop {
+            // connected: the addresses we dialled (an inbound peer's advertised address is only its claim)
+            let connected: Vec<String> = node.peers.lock().unwrap().iter().filter(|p| p.outbound).filter_map(|p| p.addr.lock().unwrap().clone()).collect();
             for a in &pinned {
                 if !connected.contains(a) { if let Err(e) = node.connect(a) { eprintln!("peer {a}: {e}"); } }
             }
@@ -439,7 +541,7 @@ impl Node {
                 // network (/16, /32), so neither a run of sorted keys nor one network's many addresses take every slot
                 type Cand = (String, Option<std::net::IpAddr>);
                 let (mut old, mut new): (Vec<Cand>, Vec<Cand>) = { let b = node.book.lock().unwrap();
-                    let (o, n): (Vec<_>, Vec<_>) = b.iter().filter(|(a, e)| e.fails < GIVE_UP && !connected.contains(a) && !pinned.contains(a)).partition(|(_, e)| e.tried);
+                    let (o, n): (Vec<_>, Vec<_>) = b.iter().filter(|(a, e)| e.fails < if e.tried { GIVE_UP_TRIED } else { GIVE_UP } && !connected.contains(a) && !pinned.contains(a)).partition(|(_, e)| e.tried);
                     (o.into_iter().map(|(a, e)| (a.clone(), e.ip)).collect(), n.into_iter().map(|(a, e)| (a.clone(), e.ip)).collect()) };
                 if old.is_empty() && new.is_empty() && node.peers.lock().unwrap().is_empty() && pinned.is_empty() {
                     new = seeds(&node.magic).iter().map(|s| (s.to_string(), None)).collect();
@@ -455,16 +557,25 @@ impl Node {
                 }
                 // dialled in parallel: a round takes one DIAL_WAIT at most, however many addresses are dead
                 let dials: Vec<_> = picks.into_iter().filter_map(|a| { let n = node.clone(); spawn(move || { let r = n.connect(&a); (a, r) }).ok() }).collect();
+                // only addresses already in the book are counted: a seed (or anything else) gets in by answering (HELLO)
                 for (a, r) in dials.into_iter().filter_map(|d| d.join().ok()) {
                     let mut b = node.book.lock().unwrap();
-                    match r {
-                        Ok(()) => { b.entry(a.clone()).or_insert_with(|| Entry::new(&a)).fails = 0; }
-                        Err(e) => { let f = &mut b.entry(a.clone()).or_insert_with(|| Entry::new(&a)).fails; *f += 1;
-                                    if *f == 1 { eprintln!("peer {a}: {e}"); } if *f >= GIVE_UP && !seeds(&node.magic).contains(&a.as_str()) { b.remove(&a); } }
+                    match (r, b.get_mut(&a)) {
+                        (Ok(()), Some(e)) => e.fails = 0,
+                        (Err(e), _) if e.kind() == std::io::ErrorKind::PermissionDenied => {}   // refused by us (banned, shunned)
+                        (Err(err), Some(e)) => {
+                            e.fails += 1;
+                            if e.fails == 1 { eprintln!("peer {a}: {err}"); }
+                            if e.fails >= if e.tried { GIVE_UP_TRIED } else { GIVE_UP } && !seeds(&node.magic).contains(&a.as_str()) { b.remove(&a); }
+                        }
+                        (Err(e), None) => eprintln!("peer {a}: {e}"),
+                        (Ok(()), None) => {}
                     }
                 }
             }
             node.keep_syncing();
+            node.store.lock().unwrap().flush_due();
+            if last_rebroadcast.elapsed() >= REBROADCAST { last_rebroadcast = Instant::now(); node.rebroadcast(); }
             if tick % 6 == 0 { node.save_book(); }
             tick += 1;
             std::thread::sleep(every);
@@ -495,7 +606,7 @@ impl Node {
                         *p.height.lock().unwrap() = my; *p.barred.lock().unwrap() = Some(Instant::now() + BAR);
                         if let Some(ip) = p.ip.filter(|a| !a.is_loopback()) {
                             let mut b = self.bars.lock().unwrap();
-                            b.retain(|_, t| *t > Instant::now());
+                            make_room(&mut b, |t| *t);
                             b.insert(ban_key(ip), Instant::now() + BAR);
                         }
                     }
@@ -547,7 +658,8 @@ impl Node {
         let barred = ip.and_then(|ip| self.bars.lock().unwrap().get(&ban_key(ip)).copied()).filter(|t| *t > Instant::now());
         let now = Instant::now();
         let peer = Arc::new(Peer { id, stream: Mutex::new(stream), out, queued, addr: Mutex::new(addr), outbound, ip, since: now, height: Mutex::new(0), barred: Mutex::new(barred),
-                                   got: AtomicUsize::new(0), got_bytes: AtomicUsize::new(0), fresh: AtomicUsize::new(0), heard: Mutex::new(now), delivered: Mutex::new(None) });
+                                   got: AtomicUsize::new(0), got_bytes: AtomicUsize::new(0), fresh: AtomicUsize::new(0), heard: Mutex::new(now), delivered: Mutex::new(None),
+                                   next_want: Mutex::new(0), orphans: Mutex::default(), reasks: AtomicUsize::new(0) });
         self.peers.lock().unwrap().push(peer.clone());
         let (node, p) = (self.clone(), peer.clone());
         let r = spawn(move || {
@@ -570,16 +682,19 @@ impl Node {
         v
     }
     /// A BLOCK frame: its header's proof of work is checked, and a block we already have is recognised, before the
-    /// transactions are decoded (decoding takes several times the frame's size in memory).
-    fn take_block(&self, payload: &[u8], from: u64) -> Result<bool, &'static str> {
+    /// transactions are decoded (decoding takes several times the frame's size in memory). `height` is set to the block's
+    /// height when it is known (stored, or decoded: its coinbase says).
+    fn take_block(&self, payload: &[u8], from: u64, height: &mut Option<u32>) -> Result<bool, &'static str> {
         let Some(head) = payload.get(..112) else { return Err("decode") };
         let h = Header::decode(head.try_into().unwrap());
         let p = &self.params;
         if crate::u256::U256::from_compact(h.bits) > crate::u256::U256::from_compact(p.min_bits.max(p.initial_bits)) { return Err("bits"); }
         if !h.meets_target() { return Err("pow"); }
         let hash = h.hash();
-        { let mut st = self.store.lock().unwrap(); if st.knows(&hash) { return Err("known"); } if st.bad_header(&h) { return Err("invalid chain"); } }
-        let r = self.submit_block(&Block::decode(payload).map_err(|_| "decode")?, Some(from));
+        { let mut st = self.store.lock().unwrap(); if st.knows(&hash) { *height = st.height_of(&hash); return Err("known"); } if st.bad_header(&h) { return Err("invalid chain"); } }
+        let b = Block::decode(payload).map_err(|_| "decode")?;
+        if let Some(Tx::Coinbase { height: ch, .. }) = b.txs.first() { *height = Some(*ch); }
+        let r = self.submit_block(&b, Some(from));
         // a failure our rules give every time (the store remembers the block as bad): the sender's chain is not ours
         if r.is_err() && self.store.lock().unwrap().bad_header(&h) { return Err("invalid chain"); }
         r
@@ -589,21 +704,22 @@ impl Node {
     /// dialled for BAN (one off loopback is banned outright); the caller drops the connection.
     fn shun(&self, peer: &Peer) {
         let until = Instant::now() + BAN;
-        if let Some(a) = peer.addr.lock().unwrap().clone() {
+        // only an address we dialled: an inbound peer's advertised one may be another node's on the same IP
+        if let Some(a) = peer.addr.lock().unwrap().clone().filter(|_| peer.outbound) {
             let mut s = self.shunned.lock().unwrap();
-            s.retain(|_, t| *t > Instant::now());
+            make_room(&mut s, |t| *t);
             s.insert(a, until);
         }
-        if let Some(ip) = peer.ip.filter(|a| !a.is_loopback()) { self.banned.lock().unwrap().insert(ban_key(ip), until); }
+        if let Some(ip) = peer.ip.filter(|a| !a.is_loopback()) { self.ban(ban_key(ip), until); }
     }
     fn serve(&self, peer: Arc<Peer>, mut reader: TcpStream, hello_by: Instant) -> std::io::Result<()> {
         send(&peer, &self.magic, HELLO, &self.hello());
-        let mut peer_height = 0u32;
         let mut last_get = std::time::Instant::now() - GET_BLOCKS_GAP;
         let mut last_addr = Instant::now() - ADDR_GAP;
         let mut last_backoff = (0u32, std::time::Instant::now() - Duration::from_secs(10), 100u32);   // (our height, when, how far) we last stepped back during sync
         let mut said_hello = false;
         let mut asked_addr = false;
+        let mut awaiting_addr = false;   // we sent GET_ADDR and its reply has not come
         let mut rejects = (0u32, Instant::now());   // transactions refused this minute, since when
         let (max, mut timeout) = (self.max_frame(), None);
         loop {
@@ -613,7 +729,7 @@ impl Node {
                 HELLO if payload.len() >= 36 && !said_hello => {
                     // once per connection: a peer cannot keep re-claiming a height to hold the sync slot
                     said_hello = true;
-                    peer_height = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                    let peer_height = u32::from_le_bytes(payload[..4].try_into().unwrap());
                     *peer.height.lock().unwrap() = peer_height;
                     // a peer we dialled answered: dial it again before new addresses, and keep it in the book
                     if peer.outbound { if let Some(a) = peer.addr.lock().unwrap().clone() {
@@ -631,7 +747,7 @@ impl Node {
                             peer.addr.lock().unwrap().get_or_insert_with(|| a.to_string());   // so we never dial a peer that is already connected to us
                             if self.add_addr(a, true) { self.relay(ADDR, a.as_bytes(), Some(peer.id)); }
                         } } }
-                    send(&peer, &self.magic, GET_ADDR, &[]);
+                    awaiting_addr = send(&peer, &self.magic, GET_ADDR, &[]);
                     if want_sync { self.request_from(&peer, self.height() + 1); }
                 }
                 // answered once per connection (a node asks once, after HELLO): each answer copies and shuffles the book
@@ -640,16 +756,21 @@ impl Node {
                     asked_addr = true;
                     // a random sample, so no address (chosen to sort first, say) spreads further than any other
                     let own = peer.addr.lock().unwrap().clone();
-                    let mut list: Vec<String> = self.book.lock().unwrap().keys().filter(|a| Some(a.as_str()) != own.as_deref()).cloned().collect();
+                    let mut list: Vec<String> = self.known_addrs().into_iter().filter(|a| Some(a.as_str()) != own.as_deref()).collect();
                     shuffle(&mut list);
                     list.truncate(ADDR_REPLY);
                     send(&peer, &self.magic, ADDR, list.join("\n").as_bytes());
                 }
                 ADDR => {
-                    if last_addr.elapsed() < ADDR_GAP { continue; }   // a peer may not flood the address book
-                    last_addr = Instant::now();
-                    // ...nor may many connections from one network: ADDR_PER_SOURCE new addresses per ADDR_PERIOD from it
                     let Ok(text) = std::str::from_utf8(&payload) else { continue };
+                    // the reply to our own GET_ADDR is read whenever it comes (once, and not a lone address: that is how
+                    // gossip passes one on); anything else is gossip, read at most every ADDR_GAP, so an unsolicited
+                    // message just before the reply cannot use up its turn
+                    if awaiting_addr && text.lines().nth(1).is_some() { awaiting_addr = false; } else {
+                        if last_addr.elapsed() < ADDR_GAP { continue; }   // a peer may not flood the address book
+                        last_addr = Instant::now();
+                    }
+                    // ...nor may many connections from one network: ADDR_PER_SOURCE new addresses per ADDR_PERIOD from it
                     let mut g = self.addr_sources.lock().unwrap();
                     let ((q, swept), now) = (&mut *g, Instant::now());
                     if every_minute(swept, now) { q.retain(|_, v| now < v.1 + ADDR_PERIOD); }
@@ -683,32 +804,50 @@ impl Node {
                     }
                 }
                 BLOCK => {
-                    let res = self.take_block(&payload, peer.id);
-                    if res.is_ok() { *peer.delivered.lock().unwrap() = Some(Instant::now()); }
+                    // a block with an unknown parent sent again before we asked this peer for anything: dropped undecoded
+                    // (otherwise one frame could be replayed forever, each time decoded and answered)
+                    let hash = payload.get(..112).map(|h| Header::decode(h.try_into().unwrap()).hash());
+                    if hash.is_some_and(|h| peer.orphans.lock().unwrap().contains(&h)) { continue; }
+                    let mut height = None;
+                    let res = self.take_block(&payload, peer.id, &mut height);
+                    if res.is_ok() { *peer.delivered.lock().unwrap() = Some(Instant::now()); peer.reasks.store(0, Ordering::Relaxed); }
+                    // what it sends tells us how far it has got (HELLO is said once, and a stalled source is reset to our
+                    // height): a peer found ahead of us is asked by keep_syncing, so a node never stays behind for good
+                    if let (Some(h), Ok(_) | Err("known" | "prev unknown")) = (height, res) { let mut ph = peer.height.lock().unwrap(); if *ph < h { *ph = h; } }
                     let from_source = self.sync.lock().unwrap().is_some_and(|(id, _, _)| id == peer.id);
-                    // a reply to our batch request counts whatever became of the block (new, side, already known)
+                    // a reply to our batch request: the block of the height we wait for next, whatever became of it (new,
+                    // side, already known). A block from an earlier request, sent twice or out of turn, is not counted, so
+                    // asking again never snowballs into batches of blocks we already have
                     if from_source && matches!(res, Ok(_) | Err("known")) {
                         *peer.heard.lock().unwrap() = Instant::now();
                         if res.is_ok() { peer.fresh.fetch_add(1, Ordering::Relaxed); }
-                        let got = peer.got.fetch_add(1, Ordering::Relaxed) + 1;
-                        let got_bytes = peer.got_bytes.fetch_add(payload.len(), Ordering::Relaxed) + payload.len();
-                        let my = self.height();
-                        { let mut ph = peer.height.lock().unwrap(); if *ph < my { *ph = my; } }
-                        let more = {
-                            // (the stall clock is maintain's: a block now and then does not hold the slot)
-                            let mut s = self.sync.lock().unwrap();
-                            if peer_height <= my { if let Some((id, _, _)) = *s { if id == peer.id { *s = None; } } }   // caught up with this source
-                            peer_height > my && (got >= BATCH || got_bytes >= BATCH_BYTES)
-                        };
-                        if more { self.request_from(&peer, my + 1); }
+                        let want = { let mut w = peer.next_want.lock().unwrap(); if height == Some(*w) { *w += 1; Some(*w) } else { None } };
+                        if let Some(want) = want {
+                            let got = peer.got.fetch_add(1, Ordering::Relaxed) + 1;
+                            let got_bytes = peer.got_bytes.fetch_add(payload.len(), Ordering::Relaxed) + payload.len();
+                            let my = self.height();
+                            let theirs = { let mut ph = peer.height.lock().unwrap(); if *ph < my { *ph = my; } *ph };
+                            let more = {
+                                // (the stall clock is maintain's: a block now and then does not hold the slot)
+                                let mut s = self.sync.lock().unwrap();
+                                if theirs <= my { if let Some((id, _, _)) = *s { if id == peer.id { *s = None; } } }   // caught up with this source
+                                theirs >= want && theirs > my && (got >= BATCH || got_bytes >= BATCH_BYTES)
+                            };
+                            if more { self.request_from(&peer, want); }   // on from the batch's end (a side branch moves no height)
+                        }
                     }
                     match res {
                             Ok(_) => { let my = self.height(); let mut ph = peer.height.lock().unwrap(); if *ph < my { *ph = my; } }
-                            Err("prev unknown") if self.sync.lock().unwrap().map_or(false, |(id, _, _)| id == peer.id) && (last_backoff.0 != self.height() || last_backoff.1.elapsed() > Duration::from_secs(1)) => {
-                                // our tip is on a fork: fetch from further back, twice as far each time the fork point is not yet reached
-                                let depth = if last_backoff.0 == self.height() { last_backoff.2.saturating_mul(2) } else { 100 };
-                                last_backoff = (self.height(), std::time::Instant::now(), depth);
-                                self.request_from(&peer, self.height().saturating_sub(depth).max(1));
+                            Err("prev unknown") => {
+                                if let Some(h) = hash { let mut o = peer.orphans.lock().unwrap(); if o.len() >= ORPHANS { o.remove(0); } o.push(h); }
+                                // our tip is on a fork: fetch from further back, twice as far each time the fork point is not yet
+                                // reached; REASKS times at most until the peer gives us a new block
+                                if from_source && peer.reasks.load(Ordering::Relaxed) < REASKS && (last_backoff.0 != self.height() || last_backoff.1.elapsed() > Duration::from_secs(1)) {
+                                    let depth = if last_backoff.0 == self.height() { last_backoff.2.saturating_mul(2) } else { 100 };
+                                    last_backoff = (self.height(), std::time::Instant::now(), depth);
+                                    peer.reasks.fetch_add(1, Ordering::Relaxed);
+                                    self.request_from(&peer, self.height().saturating_sub(depth).max(1));
+                                }
                             }
                             Err("invalid chain") => { self.shun(&peer); return Err(std::io::Error::other("peer on a chain our rules reject dropped")); }
                             // invalid, not merely unknown: a time too far ahead can be clock skew, one at or below the median cannot
@@ -726,7 +865,9 @@ impl Node {
                                 Ok(()) | Err("already in mempool" | "mempool full") => {}
                                 // never valid: no honest relay sends it (it was remembered as bad when first seen)
                                 Err(_) if self.bad_txs.lock().unwrap().0.contains_key(&id) => bad = true,
-                                Err(_) => { rejects.0 += 1; if rejects.0 == REJECTS { bad = true; } }
+                                // invalid only against our state or mempool: honest nodes disagree like this all the time (two
+                                // conflicting cheque pieces sent to different nodes), so it is no strike, only counted
+                                Err(_) => rejects.0 += 1,
                             }
                         }
                         Err(_) => bad = true,
@@ -739,6 +880,7 @@ impl Node {
     }
     fn request_from(&self, peer: &Peer, from: u32) -> bool {
         peer.got.store(0, Ordering::Relaxed); peer.got_bytes.store(0, Ordering::Relaxed); *peer.heard.lock().unwrap() = Instant::now();
+        *peer.next_want.lock().unwrap() = from; peer.orphans.lock().unwrap().clear();
         send(peer, &self.magic, GET_BLOCKS, &from.to_le_bytes())
     }
     fn relay(&self, kind: u8, payload: &[u8], except: Option<u64>) {
@@ -757,9 +899,23 @@ impl Node {
             if q.try_send((path, body.clone())).is_err() { bytes.fetch_sub(body.len(), Ordering::Relaxed); }
         }
     }
-    /// Transactions to the upstreams, UPSTREAM_LINES per POST (more in one request is refused there).
+    /// Transactions to the upstreams, in posts an edge node takes (see fits: lines, registrations, bytes).
     fn push_txs(&self, raws: &[Vec<u8>], from: Option<u64>) {
-        for c in raws.chunks(UPSTREAM_LINES) { self.push_up("/tx", c.iter().map(|r| crate::crypto::hex(r)).collect::<Vec<_>>().join("\n"), from); }
+        for post in tx_posts(raws.iter().map(|r| crate::crypto::hex(r))) { self.push_up("/tx", post, from); }
+    }
+    /// Offer the oldest REBROADCAST_MAX of our own waiting transactions (from this node's RPC) to every peer and upstream
+    /// again: a relay can be lost (a full queue, a peer gone, an upstream busy) and nothing else would send them again.
+    /// Mined or dropped ones are forgotten. maintain calls this every REBROADCAST.
+    pub fn rebroadcast(&self) {
+        let raws: Vec<Vec<u8>> = {
+            let m = self.mempool.lock().unwrap();
+            let mut own = self.own.lock().unwrap();
+            own.retain(|id| m.has(id));
+            let ids: HashSet<[u8; 32]> = own.iter().take(REBROADCAST_MAX).copied().collect();
+            m.iter().zip(&m.meta).filter(|(_, (id, _))| ids.contains(id)).map(|(t, _)| t.encode()).collect()
+        };
+        self.push_txs(&raws, None);
+        for r in raws { self.relay(TX, &r, None); }
     }
 
     /// Follow upstream nodes over their HTTP RPC (the edge nodes speak no TCP): every `every`, ask each for its height
@@ -773,7 +929,7 @@ impl Node {
             let (q, rx) = sync_channel::<(&'static str, String)>(UPSTREAM_QUEUE);
             let bytes = Arc::new(AtomicUsize::new(0));
             let b = bytes.clone();
-            match spawn(move || for (path, body) in rx { if let Err(e) = http(&up, "POST", path, &body) { eprintln!("upstream {up}: {e}"); } b.fetch_sub(body.len(), Ordering::Relaxed); }) {
+            match spawn(move || upstream_posts(&up, rx, &b)) {
                 Ok(_) => self.upstream.lock().unwrap().push((q, bytes)),
                 Err(e) => eprintln!("follow: {e}"),
             }
@@ -862,8 +1018,9 @@ impl Node {
         self.relay(BLOCK, &raw, from);
         // up only if new: one mined here, or a recent one from a peer, not every block of an initial sync
         if from.is_none() || b.header.time.saturating_add(PUSH_RECENT) >= now() { self.push_up("/block", crate::crypto::hex(&raw), from); }
-        self.push_txs(&back, from);
-        for t in back { self.relay(TX, &t, from); }
+        // the abandoned transactions to everyone, the sender of the winning block too (it may never have had them)
+        self.push_txs(&back, None);
+        for t in back { self.relay(TX, &t, None); }
         Ok(true)
     }
     /// Drop queued transactions the chain can no longer mine (their account moved on, their cheque
@@ -924,7 +1081,7 @@ impl Node {
     fn submit_ided(&self, txs: Vec<(Tx, [u8; 32])>, from: Option<u64>) -> Vec<Result<(), &'static str>> {
         let pre = self.prechecks(txs.iter().map(|(t, id)| (t, *id)));
         if pre.iter().all(|r| r.is_err()) { return pre.into_iter().map(|r| r.map(|_| ())).collect(); }   // no need for the store
-        let (mut out, mut accepted) = (Vec::with_capacity(txs.len()), Vec::new());
+        let (mut out, mut accepted, mut ids) = (Vec::with_capacity(txs.len()), Vec::new(), Vec::new());
         {
             let s = self.store.lock().unwrap(); let c = &s.chain;
             let mut m = self.mempool.lock().unwrap();
@@ -938,14 +1095,20 @@ impl Node {
                     Ok(_) => Self::next_state(c, &m, &mut next).apply(&c.params, &t).map(|_| ()),
                 };
                 match (r, pre) {
-                    (Ok(()), Ok(id)) => { m.put(t, id, raw.len()); accepted.push(raw); }
+                    (Ok(()), Ok(id)) => { m.put(t, id, raw.len()); accepted.push(raw); ids.push(id); }
                     (Err(e), Ok(id)) if NEVER_VALID.contains(&e) => self.never_valid(id, e),
                     _ => {}
                 }
                 out.push(r);
             }
         }
-        // to the upstreams as one request (as an RPC batch is at most UPSTREAM_LINES), so a batch lands in one block there too
+        // ours (from the RPC) are offered again until mined (rebroadcast)
+        if from.is_none() && !ids.is_empty() {
+            let mut own = self.own.lock().unwrap();
+            own.extend(ids);
+            while own.len() > OWN_MAX { own.pop_front(); }
+        }
+        // to the upstreams as one request where an edge node takes it (see fits), so a batch lands in one block there too
         self.push_txs(&accepted, from);
         for raw in accepted { self.relay(TX, &raw, from); }
         out
@@ -976,21 +1139,27 @@ impl Node {
     /// The next block to mine for `payee`, nonce 0: the tip, the time, and waiting transactions oldest
     /// first up to the block size limit. The node does not mine: miners fetch this over RPC
     /// (GET /template/<number>), search nonces themselves and send the block back (POST /block).
-    pub fn template(&self, payee: u32) -> Result<Block, &'static str> {
-        // never hand out a stale tip while we are catching up: a peer we dialled (until it is found not to deliver, and
-        // barred) or the sync source while it is delivering is well ahead. A claim from a peer that called us counts
-        // only once it sends new blocks, so connections that merely claim a height cannot hold templates back
+    pub fn template(&self, payee: u32) -> Result<Block, &'static str> { self.template_paid(payee, &mut || true) }
+    /// `template`, with `pay` asked only when a block has to be built (a template already made for this tip, mempool,
+    /// second and payee costs nothing), and the build refused ("busy") when it says no: the RPC's budget for costly work.
+    pub fn template_paid(&self, payee: u32, pay: &mut dyn FnMut() -> bool) -> Result<Block, &'static str> {
+        // never hand out a stale tip while we are catching up: while a peer that sent us a block new to us within
+        // DELIVERING (and is not barred) is well ahead. A claimed height alone, from a peer we dialled or one that called
+        // us, holds nothing back: it must be backed by blocks we did not have, and stops counting as soon as they stop
+        // coming (a liar delivering nothing never counts, however many of our outbound slots it holds)
         let my = self.height();
-        let src = self.sync.lock().unwrap().map(|s| s.0);
         if self.peers.lock().unwrap().iter().any(|p| *p.height.lock().unwrap() > my.saturating_add(SYNC_AHEAD) && p.barred.lock().unwrap().map_or(true, |t| t < Instant::now())
-            && (p.outbound || (Some(p.id) == src && p.delivered.lock().unwrap().is_some_and(|t| t.elapsed() < DELIVERING)))) { return Err("syncing"); }
+            && p.delivered.lock().unwrap().is_some_and(|t| t.elapsed() < DELIVERING)) { return Err("syncing"); }
         let st = self.store.lock().unwrap(); let c = &st.chain;
         let m = self.mempool.lock().unwrap();
         // for the same tip, mempool and second the transactions are chosen once, and a block is built once per payee
         // (a few payees kept): a flood of requests, or miners with different payees taking turns, costs one build each
         let key = (c.tip(), m.version, now().max(c.median_time() + 1));
         let mut cache = self.tpl_cache.lock().unwrap();
+        let mut paid = false;
         if cache.as_ref().map_or(true, |t| t.key != key) {
+            if !pay() { return Err("busy"); }
+            paid = true;
             let mut s = c.state.clone();
             s.begin_block(&c.params, c.height() + 1);
             // fill up to the block size limit (header and coinbase take well under the margin), oldest first
@@ -1004,9 +1173,32 @@ impl Node {
         }
         let t = cache.as_mut().unwrap();
         if let Some((_, b)) = t.made.iter().find(|(p, _)| *p == payee) { return Ok(b.clone()); }
+        if !paid && !pay() { return Err("busy"); }
         let b = c.template(key.2, payee, t.txs.clone())?;
         if t.made.len() >= TPL_PAYEES { t.made.remove(0); }
         t.made.push((payee, b.clone()));
         Ok(b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn groups_bans_and_posts() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(group(ip("2001:db8:1:2::1"), true), group(ip("2001:db8:ffff::1"), true));     // one /32: one netgroup
+        assert_ne!(group(ip("2001:db8:1:2::1"), false), group(ip("2001:db8:2:2::1"), false));    // ...of many /48 sites
+        assert_eq!(group(ip("2001:db8:1:2::1"), false), group(ip("2001:db8:1:ffff::1"), false));
+        assert_eq!(group(ip("::ffff:10.1.2.3"), true), group(ip("10.1.9.9"), true));
+        assert_eq!(ban_key(ip("2001:db8:1:2:3::1")), ip("2001:db8:1::"));
+        assert_eq!(ban_key(ip("::ffff:10.1.2.3")), ip("10.1.2.3"));
+        // 20 registrations and 50 other lines: never more than UPSTREAM_REGS registrations or UPSTREAM_LINES lines a post
+        let lines: Vec<String> = (0..70).map(|i| format!("{}{}", if i % 7 < 2 { "01" } else { "03" }, "ab".repeat(i))).collect();
+        let posts = tx_posts(lines.clone().into_iter());
+        assert!(posts.iter().all(|p| p.lines().filter(|l| is_reg(l)).count() <= UPSTREAM_REGS && p.lines().count() <= UPSTREAM_LINES));
+        assert_eq!(posts.join("\n"), lines.join("\n"), "in order, nothing lost");
+        let big: Vec<String> = (0..3).map(|_| "03".to_string() + &"ab".repeat(UPSTREAM_POST / 2)).collect();
+        assert_eq!(tx_posts(big.into_iter()).len(), 3, "a line over the byte cap goes alone");
     }
 }

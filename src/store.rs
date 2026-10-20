@@ -39,6 +39,7 @@ pub struct Store {
     file: Option<File>,
     file_len: u64,
     synced: Option<std::time::Instant>,   // when the data file was last flushed to the disk (None: not yet)
+    unsynced: bool,                       // blocks written since then (flushed by flush_due, so a lone block does not wait for the next)
     path: Option<PathBuf>,
     genesis: Block,
     snaps: Vec<Snap>,   // oldest first: every snapshot within max_reorg of the tip, and the newest one below that, so a reorg up to max_reorg deep starts from one
@@ -92,7 +93,7 @@ fn zeros_from(path: &Path, at: u64) -> std::io::Result<bool> {
 impl Store {
     pub fn open(p: Params, genesis: &Block, path: Option<&Path>) -> std::io::Result<Store> {
         let chain = Chain::new(p, genesis).map_err(std::io::Error::other)?;
-        let mut s = Store { chain, side: HashMap::new(), side_order: VecDeque::new(), side_bytes: 0, side_cap: SIDE_BYTES, index: HashMap::new(), file: None, file_len: 0, synced: None,
+        let mut s = Store { chain, side: HashMap::new(), side_order: VecDeque::new(), side_bytes: 0, side_cap: SIDE_BYTES, index: HashMap::new(), file: None, file_len: 0, synced: None, unsynced: false,
                             path: path.map(Path::to_path_buf), genesis: genesis.clone(), snaps: Vec::new(), host_snap: None, bad: HashMap::new(), bad_order: VecDeque::new() };
         s.index.insert(genesis.header.hash(), 0);
         if let Some(path) = path {
@@ -174,6 +175,18 @@ impl Store {
     pub fn accept(&mut self, b: &Block, now: u32) -> Result<Accepted, &'static str> { self.accept_inner(b, now, None) }
     /// Whether a block is already stored, on the main chain or off it (a resend can be dropped before it is decoded).
     pub fn knows(&self, h: &[u8; 32]) -> bool { self.index.contains_key(h) || self.side.contains_key(h) }
+    /// The height of a stored block, on the main chain (while its header is in memory) or off it.
+    pub fn height_of(&self, h: &[u8; 32]) -> Option<u32> {
+        self.index.get(h).copied().or_else(|| self.side.get(h).and_then(|(b, _, _)| match b.txs.first() { Some(Tx::Coinbase { height, .. }) => Some(*height), _ => None }))
+    }
+    /// Flush the data file to the disk if blocks written to it have waited 10 s or more (called now and then, so a
+    /// block that arrives alone reaches the disk within about that, not only when the next one is written).
+    pub fn unsynced(&self) -> bool { self.unsynced }
+    pub fn flush_due(&mut self) {
+        if !self.unsynced || self.synced.is_some_and(|t| t.elapsed().as_secs() < 10) { return; }
+        if let Some(f) = &self.file { let _ = f.sync_data(); }
+        self.synced = Some(std::time::Instant::now()); self.unsynced = false;
+    }
     /// Whether a block is known to break the rules, or builds on one that does (then it is remembered as bad too), told
     /// from its header alone.
     pub fn bad_header(&mut self, h: &crate::block::Header) -> bool {
@@ -247,7 +260,8 @@ impl Store {
         let loc = (self.file_len + 4, e.len() as u32);
         self.file_len += 4 + e.len() as u64;
         // to the disk now and then, so a crash loses at most the last few seconds' blocks (and leaves no zeros before them)
-        if self.synced.map_or(true, |t| t.elapsed().as_secs() >= 10) { let _ = f.sync_data(); self.synced = Some(std::time::Instant::now()); }
+        self.unsynced = true;
+        if self.synced.map_or(true, |t| t.elapsed().as_secs() >= 10) { let _ = f.sync_data(); self.synced = Some(std::time::Instant::now()); self.unsynced = false; }
         Ok(Some(loc))
     }
     /// Remove the block just appended (it failed validation), so junk does not pile up on disk.
@@ -393,7 +407,7 @@ impl Store {
     fn take_snapshot(&mut self, disk: bool) {
         let h = self.chain.height();
         // the blocks a disk snapshot stands on reach the disk first: a snapshot past the end of the data file is useless
-        if disk { if let Some(f) = &self.file { let _ = f.sync_data(); } }
+        if disk { if let Some(f) = &self.file { let _ = f.sync_data(); self.synced = Some(std::time::Instant::now()); self.unsynced = false; } }
         self.snaps.retain(|sn| sn.height < h);
         self.snaps.push(Snap { height: h, tip: self.chain.tip(), state: self.chain.state.clone(), index: self.chain.encode_index(), disk });
         // keep every snapshot a reorg of up to max_reorg could need (those above tip - max_reorg, and the newest at or

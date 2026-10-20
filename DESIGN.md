@@ -305,9 +305,16 @@ minute it pulls the blocks an upstream has above its own tip (`/height`,
 `/block/<n>`, walking back up to 200 blocks on a fork; every upstream's
 height is asked and the highest pulled from, the next if that brings nothing
 new) and it posts every transaction and block it accepts, from its RPC or
-from its TCP peers, to all of them (`POST /tx`, one request per batch of at
-most 64, and `POST /block`; a block from a peer only if its time is within
-the last hour, so an initial sync is not posted block by block). With no
+from its TCP peers, to all of them (`POST /tx` and `POST /block`; a block
+from a peer only if its time is within the last hour, so an initial sync is
+not posted block by block). A `POST /tx` carries at most 64 transactions, 16
+registrations among them (an edge node refuses a whole post with more) and
+about 2 MB of hex; posts waiting for one upstream are joined while they fit
+and go at least 2.5 s apart (an edge node takes about 30 heavy posts a
+minute), and one answered 429 or 5xx, or not answered, is sent again, waiting
+twice as long each time up to a minute, so nothing is dropped for being sent
+too fast. Our own transactions (from our RPC) not yet mined are offered to
+peers and upstreams again every 10 minutes. With no
 `--upstream` it follows the four seeds; `--no-upstream` turns this off. A
 node following them and talking TCP to others bridges the two. The edge
 nodes do not pull from it, so its own blocks reach them only by that push.
@@ -340,14 +347,24 @@ The book keeps one entry per IP (eight per /16), so one host on many ports
 cannot fill it. Outbound peers are chosen at random, addresses that
 answered a HELLO before ("tried", marked in the saved book) taking turns with
 new ones, at most one per /16 (/32 for IPv6), dialled in parallel with a 3 s
-timeout. Gossip never pushes a tried address out of a full book. Addresses
+timeout. An address is forgotten after 3 failed dials in a row, a tried one
+after 10; a dial we refuse ourselves (the address is banned or shunned for a
+while) is no failure. Gossip never pushes a tried address out of a full book.
+The book is saved by writing a new file, flushing it and renaming it over the
+old one, so a crash never leaves half a book. Addresses
 that carry an IPv4 address inside (NAT64, 6to4, Teredo, IPv4-compatible) are
-not taken from gossip.
+not taken from gossip. The reply to our own `getaddr` is read whenever it
+comes; other `addr` messages at most every 10 s. What a node shares (`addr`,
+`/addrs`) leaves out a built-in seed that never answered it and, off a devnet,
+loopback and private addresses. An address an inbound peer advertises is
+only its claim: it never counts as that address being connected, nor is it
+what gets shunned.
 
-Limits: 125 inbound connections, 4 per address and 8 per /24 (/32 for IPv6).
-When all are taken a newcomer is let in by dropping the newest connection of
-the network holding the most, never one of the 8 longest-connected or of the
-8 that last brought new blocks. A new connection must send
+Limits: 125 inbound connections, 4 per address and 8 per /24 (/48 for IPv6:
+a site, so a provider's /32 of customers is not held to 8). When all are
+taken a newcomer is let in by dropping the newest connection of the netgroup
+(/16, /32 for IPv6, Bitcoin's grouping) holding the most, never one of the 8
+longest-connected or of the 8 that last brought new blocks. A new connection must send
 its whole HELLO (at most 200 bytes, and the first frame must be one) within
 10 s of connecting; after that a frame may take at most 120 s once it has
 started, and none may be longer than the largest block (plus 4 KB). A
@@ -361,28 +378,48 @@ and one off loopback is refused, for 30 minutes. 3 bad messages (a block
 failing a cheaper check, such as its proof of work or transaction root, a
 repeated `getaddr`, a transaction that can never be valid, such
 as a cheque piece matching no commitment) drop a peer and refuse its
-address for 30 minutes; strikes are counted per address (an IPv6 /64)
-across connections, and loopback is dropped but never refused (devnets run
-many nodes on one machine). More than 200 refused transactions in a minute
-are a strike, and the rest of that minute's are ignored. A sync reply is 500
-blocks or about 8 MB of them, whichever comes first; the asker counts both
-the same way and asks again then, or when the source has been quiet for 10 s
-(a reply cut short by a full send queue, 16 MB per peer). The sync source is
+address for 30 minutes; strikes and bans are counted per address (an IPv6
+/48) across connections, each map of them holds at most 10,000 entries, and
+loopback is dropped but never refused (devnets run
+many nodes on one machine). A transaction refused only against our state or
+mempool is never a strike (honest nodes disagree like this all the time, as
+when two conflicting cheque pieces reach different nodes); past 200 refused
+in a minute the rest of that minute's are ignored. A sync reply is 500
+blocks or about 8 MB of them, whichever comes first; the asker counts only
+the block of the height it waits for next (a block sent twice, or from an
+earlier ask, is not counted), both ways, and asks on from there, or again
+when the source has been quiet for 10 s (a reply cut short by a full send
+queue, 16 MB per peer). A block with an unknown parent makes the asker step
+back to find the fork, twice as far each time and at most 12 times until
+that peer gives it a new block; one sent again before the next ask is dropped
+undecoded. Every block a peer sends also tells its height (HELLO is said only
+once), so a peer shown to be ahead is asked even after its claim was reset to
+ours. The sync source is
 a random peer that is ahead, one we dialled if there is one (a claimed height
 is not trusted to choose by); it must give us 50 blocks we did not have
 (main chain or side), or all it has left, every 30 s, or it is replaced and
 its address barred as a source for 10 minutes (not banned: it may be honest
 and slow), so a block now and then cannot hold the slot. Templates are
-refused ("syncing") only while a peer we dialled, or a sync source that has
-sent a new block in the last 10 s, is more than 6 blocks ahead: a claim from
-a peer that called us holds nothing back. A 64 MB mempool, with a txid set
-and a running byte count beside it.
+refused ("syncing") only while a peer that has sent us a block new to us in
+the last 10 s is more than 6 blocks ahead: a claim alone, from a peer we
+dialled or one that called us, holds nothing back. After a reorg the
+abandoned transactions go to every peer, the sender of the winning branch
+too. A 64 MB mempool, with a txid set and a running byte count beside it.
 
-The RPC limits each address (an IPv6 /48) to 120 requests a minute, and
-`/check`, `/proof` and `/template` to 100 a second from everyone together.
-Behind a proxy the last entry of the last `X-Forwarded-For` line is the
-client. The data file is flushed to the disk every 10 s and before each
-snapshot; a tail of zeros after a crash is cut off like a torn record.
+The RPC serves 256 requests at once; the last 32 threads only for clients
+holding no connection yet. One address holds at most 8 connections (an IPv4
+address or an IPv6 /56), one IPv6 /48 16 and one /32 64, and a request's
+line and headers must arrive within 5 s (the whole request within 20 s), so a
+slow client from one place cannot hold the threads. It limits each address
+(an IPv6 /48) to 120 requests a minute, and `/check`, `/proof` and
+`/template` to 100 a second from everyone together, 10 of them from one
+address; a template already built for that tip, mempool, second and payee is
+not charged. A path is routed and charged spelt one way (empty segments
+dropped). Behind a proxy the last entry of the last `X-Forwarded-For` line is
+the client. The data file is flushed to the disk within about 10 s of a
+block being written, and before each snapshot; a tail of zeros after a crash
+is cut off like a torn record, and other damage moves the file aside and
+stops the node with a plain error (exit code 2).
 
 A block that fails validation after its proof of work and transaction root
 have checked out is remembered (the last 4,096), with any block built on
