@@ -113,7 +113,7 @@ pub extern "C" fn cells() -> usize {
     let Some(b) = book(&i[..32]) else { return 0 };
     let cheque = u16::from_le_bytes([i[32], i[33]]);
     if i[34..].iter().any(|&x| x > 9) { return 0; }
-    out((0..18u8).map(|c| hex(&b.domains[0].cell(b.n(), cheque, c, i[34 + c as usize]))).collect::<Vec<_>>().join("\n"))
+    out((0..18u8).map(|c| hex(&b.domains[0].cell(&b.net, b.n(), cheque, c, i[34 + c as usize]))).collect::<Vec<_>>().join("\n"))
 }
 
 /// io = seed (32) || cheque (2, little-endian) -> io = that cheque's commitments in the format of the node's
