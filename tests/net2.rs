@@ -105,8 +105,8 @@ fn strikes_are_per_address_and_ban_public_ones() {
     assert!(!a.strike(ip) && !a.strike(ip) && a.strike(ip));
     assert_eq!(a.connect("192.0.2.1:1").err().map(|e| e.to_string()).as_deref(), Some("banned for a while"));
     let v6 = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
-    assert!(!a.strike(v6("2001:db8:1:2::1")) && !a.strike(v6("2001:db8:1:2::ffff")) && a.strike(v6("2001:db8:1:2:3::9")), "one /64 is one address");
-    assert!(!a.strike(v6("2001:db8:1:3::1")), "the next /64 is another");
+    assert!(!a.strike(v6("2001:db8:1:2::1")) && !a.strike(v6("2001:db8:1:2::ffff")) && a.strike(v6("2001:db8:1:7:3::9")), "one /48 is one address");
+    assert!(!a.strike(v6("2001:db8:2::1")), "the next /48 is another");
 }
 
 /// One flipped length prefix in the middle of the data file: the node refuses to start and keeps the file (moved aside)

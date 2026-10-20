@@ -165,9 +165,10 @@ fn a_spoofed_advertised_address_is_not_believed() {
     let mut t = TcpStream::connect(at).unwrap();
     t.write_all(&frame(&p.magic, 0, &[&0u32.to_le_bytes()[..], &[0u8; 32], b"127.0.0.1:9"].concat())).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(300));
-    let book = node.known_addrs();
+    let book = node.book_addrs();
     assert!(!book.contains(&"10.9.8.7:8731".to_string()));
     assert!(book.contains(&"127.0.0.1:9".to_string()));
+    assert!(node.known_addrs().is_empty(), "a loopback address is kept for our own dials, never shared on a public network");
 }
 
 #[test]

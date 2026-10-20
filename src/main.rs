@@ -47,7 +47,8 @@ fn main() {
         Some("node") => {
             let data = opt("--data");
             let p_magic = p.magic;
-            let store = Store::open(p, &g, data.as_deref().map(std::path::Path::new)).expect("open data file");
+            // a damaged data file (moved aside by Store::open) or one that cannot be read: said plainly, and exit code 2
+            let store = match Store::open(p, &g, data.as_deref().map(std::path::Path::new)) { Ok(s) => s, Err(e) => { eprintln!("error: data file: {e}"); std::process::exit(2) } };
             eprintln!("height {}", store.chain.height());
             let node = Node::new(store);
             if let Some(d) = &data { node.set_book_path(std::path::PathBuf::from(format!("{d}.peers"))); }

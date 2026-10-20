@@ -151,7 +151,7 @@ fn an_addr_flood_keeps_the_book() {
     std::fs::write(path.with_extension("peers"), lines).unwrap();
     v.set_book_path(path.with_extension("peers"));
     v.connect(&haddr.to_string()).unwrap();
-    assert!(wait(5, || v.known_addrs().contains(&haddr.to_string())), "dialled and answered: in the book, tried");
+    assert!(wait(5, || v.book_addrs().contains(&haddr.to_string())), "dialled and answered: in the book, tried");
     let mut conns = Vec::new();
     for c in 0..80u32 {
         let mut s = TcpStream::connect(vaddr).unwrap(); drain(s.try_clone().unwrap());
@@ -161,7 +161,7 @@ fn an_addr_flood_keeps_the_book() {
         conns.push(s);
     }
     std::thread::sleep(Duration::from_secs(1));
-    let book = v.known_addrs();
+    let book = v.book_addrs();
     let left = book.iter().filter(|a| a.starts_with("[2b")).count();
     assert!(left >= 899, "{left}/999 original entries left");
     let taken = book.iter().filter(|a| a.starts_with("[2c")).count();
@@ -224,7 +224,8 @@ fn rpc_limits_hold_behind_a_proxy() {
     let ok = (0..300u32).filter(|i| get("/height", &format!("X-Forwarded-For: 2001:db8:5:{:x}::1\r\n", i)).starts_with("HTTP/1.0 200")).count();
     assert_eq!(ok, 120, "300 /64s of one /48");
     let t = Instant::now();
-    let busy = (0..300u32).filter(|i| get("/template/0", &format!("X-Forwarded-For: 198.18.{}.{}\r\n", i / 250, i % 250)).starts_with("HTTP/1.0 503")).count();
+    // (each for another payee: a template already built for one is served without being charged)
+    let busy = (0..300u32).filter(|i| get(&format!("/template/{i}"), &format!("X-Forwarded-For: 198.18.{}.{}\r\n", i / 250, i % 250)).starts_with("HTTP/1.0 503")).count();
     if t.elapsed() < Duration::from_secs(2) { assert!(busy > 0, "300 /template requests from 300 addresses within 2 s: some refused"); }
     assert!(get("/height", "X-Forwarded-For: 198.18.9.9\r\n").starts_with("HTTP/1.0 200"), "cheap routes are not in that budget");
 }
@@ -270,7 +271,7 @@ fn recorder() -> (String, Arc<Mutex<Vec<(String, String)>>>) {
     (a, seen)
 }
 
-/// L6 and L7: transactions go up UPSTREAM_LINES per POST, and an old block from a peer (an initial sync) is not posted
+/// L6 and L7: transactions go up UPSTREAM_LINES per POST at most, and an old block from a peer (an initial sync) is not posted
 /// up, while a block mined here is.
 #[test]
 fn upstream_posts_are_chunked_and_skip_old_blocks() {
@@ -292,7 +293,7 @@ fn upstream_posts_are_chunked_and_skip_old_blocks() {
     let pieces: Vec<Tx> = books.iter().flat_map(|b| (1..=15u16).map(|n| b.opening(n, &[0u8; 18], 12)).chain(b.pieces(15, &[0u8; 18]).into_iter().skip(13).take(2))).collect();
     assert_eq!(pieces.len(), 68);
     assert!(v.submit_txs(pieces, None).iter().all(|r| r.is_ok()));
-    assert!(wait(5, || seen.lock().unwrap().iter().filter(|(p, _)| p == "/tx").count() == regs + 2));
+    assert!(wait(12, || seen.lock().unwrap().iter().filter(|(p, _)| p == "/tx").count() == regs + 2));   // (posts are UPSTREAM_GAP apart)
     std::thread::sleep(Duration::from_millis(300));
     let seen = seen.lock().unwrap();
     assert_eq!(seen.iter().filter(|(p, _)| p == "/block").count(), 1, "only the block mined here");
