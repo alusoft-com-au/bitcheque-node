@@ -137,20 +137,32 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
                 v.parse::<u16>().ok().filter(|&n| (n as u32) < size).map(Some).ok_or(format!("a node reports {what} {}, not a cheque of this book: try another node", clean(v)))
             };
             let list = |v: &str, what: &str| -> Result<Vec<u16>, String> { v.split(',').filter(|x| !x.trim().is_empty()).map(|x| num(x.trim(), what).map(Option::unwrap)).collect() };
-            // (nonce: the last cheque completed (or opened, on chains before v11), open: the half-sent one)
-            let state_at = |r: &str| -> Result<(Vec<(String, String)>, Option<u16>, Option<u16>), String> {
+            // nonce: the last cheque bound (a cell of both printed parts on chain); open: every cheque with cells on chain
+            // that is not finished, with the digits revealed so far
+            let state_at = |r: &str| -> Result<(Vec<(String, String)>, Option<u16>, Vec<u16>), String> {
                 let a = account_at(r)?;
                 if field(&a, "book_size") != size.to_string() { return Err(format!("{r} says this book has {} cheques, not {size}: try another node", clean(&field(&a, "book_size")))); }
-                let (nonce, open) = (num(&field(&a, "nonce"), "nonce")?, num(&field(&a, "open"), "open")?);
-                Ok((a, nonce, open))
+                let open = if field(&a, "open") == "none" { vec![] } else { list(&field(&a, "open"), "open")? };
+                Ok((num(&field(&a, "nonce"), "nonce")?, open)).map(|(nonce, open)| (a, nonce, open))
             };
+            // the digits an open cheque shows on chain, '.' (None) for a column not revealed yet
+            let revealed = |a: &[(String, String)], n: u16| -> [Option<u8>; COLS] {
+                let v = field(a, "revealed");
+                v.split(',').find_map(|e| e.strip_prefix(&format!("{n}:"))).filter(|d| d.len() == COLS)
+                    .map_or([None; COLS], |d| std::array::from_fn(|i| d.as_bytes()[i].checked_sub(b'0').filter(|&x| x <= 9)))
+            };
+            // someone else (a stolen or photographed part) revealed a column of this cheque with other digits: sending more
+            // would finish their cheque, not this one
+            let pinned = |a: &[(String, String)], n: u16| revealed(a, n).iter().zip(digits).any(|(r, d)| r.is_some_and(|r| r != d));
+            let tampered = |n: u16| format!("cheque {n} shows cells this machine never sent (someone holds a printed part of it?): nothing more is sent on it. \
+                Run `wallet void` to close it, and sweep to a new book: a part of this book's cheques may be exposed");
             let mut states = Vec::new();
             for r in &rpcs { states.push(state_at(r)?); }
             // cheque n is over on a node when its nonce reached n and it is not the open one: completed, or dead
-            let done = |nonce: Option<u16>, open: Option<u16>, n: u16| nonce.is_some_and(|x| x >= n) && open != Some(n);
+            let done = |nonce: Option<u16>, open: &[u16], n: u16| nonce.is_some_and(|x| x >= n) && !open.contains(&n);
             // the cheque this machine signed last, if some node does not show it over yet (cheque 0 as the honesty
             // check moves nothing and has nothing below it to void)
-            let live = used.filter(|&(n, d)| (n > 0 || d.is_some_and(|d| d != [0; COLS])) && !states.iter().all(|(_, nonce, open)| done(*nonce, *open, n)));
+            let live = used.filter(|&(n, d)| (n > 0 || d.is_some_and(|d| d != [0; COLS])) && !states.iter().all(|(_, nonce, open)| done(*nonce, open, n)));
             let resume = matches!(live, Some((_, Some(d))) if d == digits);
             let cheque = if let Some((n, _)) = live.filter(|_| resume) {
                 // the same cheque again (a lost reply, a half-sent cheque): finished, never re-written on another number
@@ -164,16 +176,19 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
                 // an open or queued cheque, so two that agree are needed, or the holder's word that the book is fresh
                 if used.map_or(true, |(n, _)| n == 0) && !flag("--fresh") {
                     if rpcs.len() < 2 { return Err("this machine has no record of the book's cheques: give two or more nodes that agree (--rpc A,B), or pass --fresh if this book has never signed a cheque anywhere else".into()); }
-                    if states.windows(2).any(|w| (w[0].1, w[0].2) != (w[1].1, w[1].2)) { return Err("the nodes disagree on this book's last cheque: wait a block and try again, or pass --fresh if this book has never signed a cheque anywhere else".into()); }
+                    if states.windows(2).any(|w| (w[0].1, &w[0].2) != (w[1].1, &w[1].2)) { return Err("the nodes disagree on this book's last cheque: wait a block and try again, or pass --fresh if this book has never signed a cheque anywhere else".into()); }
                 }
                 let (mut top, mut queued, mut unspent): (Option<u16>, Vec<u16>, Vec<Vec<u16>>) = (None, vec![], vec![]);
                 for (r, (a, nonce, open)) in rpcs.iter().zip(&states) {
-                    top = top.max(*nonce).max(*open);   // a half-submitted cheque is abandoned by starting a higher one
+                    top = top.max(*nonce);
+                    // an open cheque (half sent from elsewhere, or pinned by someone holding one printed part) is never
+                    // written again: skipped, it binds nothing and lower cheques stay usable
+                    queued.extend(open);
                     unspent.push(list(&field(a, "unspent"), "unspent")?);
                     // never two cheques with one number: skip those waiting in a node's queue (asked fresh, failing hard if a node will not say)
                     queued.extend(list(&http(r, "GET", &format!("/queued/{id}"), "")?, "queued")?);
                 }
-                // the lowest cheque above everything consumed, open, queued or signed here before (a node's answers may
+                // the lowest cheque above everything bound or signed here before, neither open nor queued (a node's answers may
                 // be a few seconds old), and never 0, the honesty check's number
                 let floor = [used.map(|u| u.0), top].iter().flatten().map(|&n| n + 1).max().unwrap_or(1).max(1);
                 let cheque = unspent[0].iter().copied().filter(|&n| n >= floor && !queued.contains(&n) && unspent.iter().all(|u| u.contains(&n))).min().ok_or("no unused cheques left")?;
@@ -215,6 +230,7 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
             let mut in_block = false;
             for (i, half) in halves.iter().enumerate() {
                 let last = i + 1 == halves.len();
+                for r in &rpcs { if state_at(r).is_ok_and(|(a, _, _)| pinned(&a, cheque)) { return Err(tampered(cheque)); } }
                 // dry run on every node first; a piece a node already has (an earlier run sent it) is not sent again
                 let mut send = Vec::new();
                 for r in &rpcs {
@@ -224,6 +240,7 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
                     if lines.len() != half.len() { return Err(format!("{r} gave a bad dry run\ncheque {cheque} may still be live: {again}")); }
                     for (t, l) in half.iter().zip(lines) {
                         if l == "ok" || l.starts_with("ok ") { if r == &rpc { send.push(t.clone()); } }
+                        else if l == "column revealed with other digits" { return Err(tampered(cheque)); }
                         else if l != "column already revealed" { return Err(format!("{r} refuses cheque {cheque}: {}\ncheque {cheque} may still be live: {again}", clean(l))); }
                     }
                 }
@@ -233,7 +250,9 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
                 in_block = loop {
                     let mut all = true;
                     for r in &rpcs {
-                        let ok = state_at(r).is_ok_and(|(_, nonce, open)| done(nonce, open, cheque) || (!last && open == Some(cheque)));
+                        // the recipient half counts once the chain shows exactly these 12 digits on this open cheque
+                        let ok = state_at(r).is_ok_and(|(a, nonce, open)| done(nonce, &open, cheque)
+                            || (!last && open.contains(&cheque) && revealed(&a, cheque)[..RECIPIENT].iter().zip(&digits).all(|(r, d)| *r == Some(*d))));
                         if !ok { all = false; break; }
                     }
                     if all { break true; }

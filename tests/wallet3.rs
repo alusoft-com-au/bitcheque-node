@@ -266,3 +266,27 @@ fn register_reads_the_seed_from_standard_input() {
     assert!(o.status.success() && out.contains("honesty check (cheque 0) sent") && !out.contains(SEED), "{out}");
     assert_eq!(cheques(&f), vec![0]);
 }
+
+/// Someone holding one printed part opened a cheque with their own digits: the wallet skips that cheque (it binds
+/// nothing) and never sends the other half onto a cheque pinned to digits it did not write.
+#[test]
+fn a_pinned_cheque_is_skipped_and_never_finished() {
+    let h = home("w3-pin");
+    let f = fake(reply("none", &first16()));
+    // cheque 1 is open on chain with a recipient column this book's holder never sent
+    f.set(|s| { s.chain.entry(1).or_default().insert(0); s.digits.insert((1, 0), 9); s.open = "1".into(); });
+    let to = num(7);
+    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5", "--fresh"]);
+    assert!(ok && out.contains("cheque 2 sent"), "{out}");
+    assert!(!cheques(&f).contains(&1));
+    // a half-sent cheque whose remaining column is then taken by another digit: nothing more goes out on it
+    f.set(|s| s.mining = false);
+    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5", "--wait", "1"]);
+    assert!(!ok && out.contains("cheque 3 is half sent"), "{out}");
+    let ours = digits_of(&f, 3).into_iter().find(|p| p.0 == 3).map(|p| digit(3, 3, &[p.1]).unwrap()).unwrap();
+    f.set(|s| { s.pool.clear(); s.chain.entry(3).or_default().insert(3); s.digits.insert((3, 3), (ours + 1) % 10); s.open = "3".into(); s.mining = true; });
+    let before = pieces(&f).len();
+    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5"]);
+    assert!(!ok && out.contains("cells this machine never sent") && out.contains("wallet void"), "{out}");
+    assert_eq!(pieces(&f).len(), before, "no piece of the amount half may go out");
+}
