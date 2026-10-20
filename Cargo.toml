@@ -6,3 +6,16 @@ description = "Bitcheque: hash-only, hand-signed cheque-book chain (see DESIGN.m
 license = "MIT"
 
 [dependencies]
+
+# The browser wallet is a member so its build never depends on where the repo is checked out (a path dependency
+# outside the workspace puts its absolute path into the code's symbol hashes). Built reproducibly with:
+# RUSTFLAGS="--remap-path-prefix=$PWD=. -C strip=symbols" cargo build --locked --profile wasm -p bitcheque-web --target wasm32-unknown-unknown
+[workspace]
+members = ["wallet-wasm"]
+exclude = ["edge"]
+
+[profile.wasm]
+inherits = "release"
+opt-level = 3
+lto = true
+panic = "abort"

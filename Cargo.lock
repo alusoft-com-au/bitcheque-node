@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "bitcheque"
 version = "0.1.0"
+
+[[package]]
+name = "bitcheque-web"
+version = "0.1.0"
+dependencies = [
+ "bitcheque",
+]

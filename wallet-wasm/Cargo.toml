@@ -11,8 +11,3 @@ path = "src/lib.rs"
 
 [dependencies]
 bitcheque = { path = ".." }
-
-[profile.release]
-opt-level = 3
-lto = true
-panic = "abort"
