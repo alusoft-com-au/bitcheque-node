@@ -321,9 +321,9 @@ fn account_text(c: &crate::block::Chain, id: &[u8]) -> String {
     let ready_at = c.state.numbers.get(&a.number).map_or(0, |(_, at)| at + c.params.number_maturity);
     let mature = ready_at <= c.height();
     let number = if mature { format!("number {}\n", a.number) } else { String::new() };
-    format!("id {}\n{number}balance {}\npending {}\nnonce {}\nbook_size {}\nunspent {}\nfunded {}\nmature {}\nready_at {}\nopen {}", hex(id), a.balance,
+    format!("id {}\n{number}balance {}\npending {}\nnonce {}\nbook_size {}\nunspent {}\nfunded {}\nmature {}\nready_at {}\nopen {}\nsalt {}", hex(id), a.balance,
             pending_of(c, a.number), a.nonce.map_or("none".into(), |x| x.to_string()), a.book_size, a.commits.keys().map(|k| k.to_string()).collect::<Vec<_>>().join(","),
-            a.funded, mature, ready_at, a.open.as_ref().map_or("none".into(), |o| o.n.to_string()))
+            a.funded, mature, ready_at, a.open.as_ref().map_or("none".into(), |o| o.n.to_string()), hex(&a.salt))
 }
 
 fn tx_line(t: &Tx) -> String {

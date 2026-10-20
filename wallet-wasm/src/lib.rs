@@ -115,6 +115,17 @@ pub extern "C" fn commits() -> usize {
     out(bitcheque::state::Commits::new(bitcheque::book::leaf_from_shares(&b.key(), b.n(), cheque, &b.shares(cheque)).1).lines(b.n()))
 }
 
+/// io = book salt (16, from GET /account) || cheque (2, little-endian) || column || row || cell (16) -> io = that cell's
+/// commitment in hex, as GET /commits lists it: the cheque page checks a written cell without the seed and before sending.
+#[no_mangle]
+pub extern "C" fn cell_commit() -> usize {
+    let i = io().clone();
+    if i.len() != 36 || i[18] > 17 || i[19] > 9 { return 0; }
+    let k = bitcheque::crypto::key(i[..16].try_into().unwrap(), &Params::testnet().magic);
+    let (q, c, r) = (u16::from_le_bytes([i[16], i[17]]), i[18], i[19]);
+    out(hex(&bitcheque::book::commit(&k, 16, q, c, r, &[bitcheque::book::share_hash(&k, 16, q, c, r, 0, &i[20..])])))
+}
+
 /// io = seed (32) -> the honesty check: cheque 0, zero coins, to nobody (as `bitcheque wallet register` sends).
 #[no_mangle]
 pub extern "C" fn honesty() -> usize {
@@ -144,4 +155,23 @@ pub extern "C" fn qr_read() -> usize {
     if i.len() < 8 { return 0; }
     let (w, h) = (u32::from_le_bytes(i[0..4].try_into().unwrap()) as usize, u32::from_le_bytes(i[4..8].try_into().unwrap()) as usize);
     match qrread::read(&i[8..], w, h) { Some(t) => { let b = io(); *b = t; b.len() } None => 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn call(f: extern "C" fn() -> usize, input: &[u8]) -> String { *io() = input.to_vec(); let n = f(); String::from_utf8(io()[..n].to_vec()).unwrap() }
+    #[test]
+    fn cell_commit_matches_the_cheque_commitments() {
+        let seed = [7u8; 32];
+        let b = book(&seed).unwrap();
+        for q in [1u16, 200] {
+            let lines = call(commits, &[&seed[..], &q.to_le_bytes()].concat());
+            let cm: Vec<Vec<&str>> = lines.lines().map(|l| l.split(' ').collect()).collect();
+            for c in 0..18u8 { for r in 0..10u8 {
+                let cell = b.domains[0].cell(16, q, c, r);
+                assert_eq!(call(cell_commit, &[&b.salt[..], &q.to_le_bytes(), &[c, r], &cell].concat()), cm[c as usize][r as usize]);
+            } }
+        }
+    }
 }

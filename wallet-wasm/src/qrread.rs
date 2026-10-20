@@ -63,9 +63,12 @@ fn finders(img: &Img) -> Vec<Pt> {
         let Some((cy, ty)) = cross(img, cx as i32, y as i32, 0, 1, total) else { return };
         let Some((cx2, tx)) = cross(img, cx as i32, cy as i32, 1, 0, total) else { return };
         let m = (tx + ty) as f32 / 14.0;
+        let room = found.len() < 64;
         match found.iter_mut().find(|p| (p.x - cx2).abs() < p.m * 2.0 && (p.y - cy).abs() < p.m * 2.0 && (p.m - m).abs() < p.m.max(m) * 0.5) {
             Some(p) => { let n = p.n as f32; p.x = (p.x * n + cx2) / (n + 1.0); p.y = (p.y * n + cy) / (n + 1.0); p.m = (p.m * n + m) / (n + 1.0); p.n += 1; }
-            None => found.push(Pt { x: cx2, y: cy, m, n: 1 }),
+            // a cap keeps this linear: a page of tiled codes has hundreds of finders, and one code needs only three
+            None if room => found.push(Pt { x: cx2, y: cy, m, n: 1 }),
+            None => {}
         }
     };
     for y in 0..img.h {
@@ -293,4 +296,30 @@ pub fn read(gray: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
         } } }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // draw a module matrix at `s` pixels per module with a 4-module quiet zone at (ox, oy) into a white image
+    fn draw(img: &mut [u8], w: usize, ox: usize, oy: usize, n: usize, m: &[bool], s: usize) {
+        for y in 0..n * s { for x in 0..n * s { if m[(y / s) * n + x / s] { img[(oy + 4 * s + y) * w + ox + 4 * s + x] = 0; } } }
+    }
+    #[test]
+    fn reads_a_code() {
+        let (n, m) = qr::encode(b"12.3.4:00112233445566778899AABBCCDDEEFF", Ecc::H).unwrap();
+        let (w, h) = (640, 480); let mut img = vec![255u8; w * h];
+        draw(&mut img, w, 150, 60, n, &m, 6);
+        assert_eq!(read(&img, w, h).as_deref(), Some(&b"12.3.4:00112233445566778899AABBCCDDEEFF"[..]));
+    }
+    #[test]
+    fn many_finders_stay_fast() {
+        // a frame tiled with finder patterns at 1 px per module with a 1-module gap: 14,400 of them (uncapped: ~0.5 s)
+        let (w, h) = (1280, 720); let mut img = vec![255u8; w * h];
+        for y in 0..h { for x in 0..w { let (px, py) = (x % 8, y % 8);
+            if px < 7 && py < 7 && (px as i32 - 3).abs().max((py as i32 - 3).abs()) != 2 { img[y * w + x] = 0; } } }
+        let t = std::time::Instant::now();
+        let _ = read(&img, w, h);
+        assert!(t.elapsed().as_millis() < if cfg!(debug_assertions) { 1500 } else { 150 }, "took {:?}", t.elapsed());
+    }
 }
