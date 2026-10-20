@@ -229,11 +229,27 @@ is how miners, pools and exchanges use the chain:
 - The command-line wallet (`bitcheque wallet`) drives one book from one
   seed: `register` registers the first 16 cheques (`--cheques N` for more),
   `more` the next ones. It keeps a locked, fsynced record of the last
-  cheque it signed (written before signing; cheque 0 is only ever the
-  honesty check), checks the message locally, never trusts a node's numbers
-  past the book or more than 3 cheques ahead (`--force-skip` burns the
-  skipped ones), and refuses to spend cheque 255 on anything but `sweep`
-  unless told `--last`.
+  cheque it signed and its 18 digits (written before signing, in an
+  absolute directory only its user can write; cheque 0 is only ever the
+  honesty check; `pieces`, the raw signer for tests, is recorded too),
+  checks the message locally, never trusts a node's numbers past the book
+  or more than 3 cheques ahead (`--force-skip` burns the skipped ones), and
+  refuses to spend cheque 255 on anything but `sweep` unless told `--last`.
+  `--to` is the recipient as printed, check digit included, verified and
+  never computed; coins to number 0 need `--burn`. With no record of a
+  payment signed on this machine it needs two nodes that agree on the
+  book's last cheque (`--rpc A,B`), or `--fresh`. Every node given
+  dry-runs each half (`POST /check`) and must know the recipient as final
+  before anything is posted. A payment goes in two halves (§10.12): the 12
+  recipient pieces, then, once they are in a block on every node, the 6
+  amount pieces; it reports "sent" only once the cheque is in a block.
+  While the last cheque it signed is not shown completed by every node,
+  it only finishes that same cheque (the same command again, the same
+  recorded digits) or voids it: `wallet void` confirms a zero-coin, fee
+  tier 0 cheque to number 0 on the next number and waits for its block
+  (§10.13, failed-broadcast rule). The RPC is plain HTTP, so anyone on the
+  path can withhold or forge replies (never a cheque): give nodes reached
+  over different paths.
 - The one-time nature remains. A software wallet restored from seed must
   start above the chain's consumed number; the first-piece rule (§10.12)
   bounds any mistake to sending more to a chosen recipient.
@@ -813,6 +829,9 @@ that remain:
   hold a live cheque. Before sending again: confirm a zero-coin cheque with
   the next number (voids the withheld one), then send with the number
   after. Never re-write the same transfer on the next number directly.
+  The command-line wallet enforces this: it refuses a new payment while
+  its last cheque is not completed, and `wallet void` sends the zero
+  cheque (§5).
 - **Signing exposure.** Both parts of one cheque are visible while
   signing. A camera over the desk captures a forgeable cheque number.
   Option: scratch-off coating over cells (print-shop only), so only the 18
@@ -990,7 +1009,8 @@ received, and its reply be taken within 60 s; bodies must be ASCII;
 derivation, registration mining, non-consensus), `main` (`bitcheque
 genesis | node | wallet`). Tests: `tests/chain.rs` (life of the chain),
 `tests/net.rs` (sync and relay), `tests/store.rs` (reorg, persistence,
-proofs, RPC), `tests/hardening.rs`, `tests/net2.rs` (network, storage and RPC abuse), plus the block 0 vector cross-checked
+proofs, RPC), `tests/hardening.rs`, `tests/net2.rs` (network, storage and RPC abuse),
+`tests/wallet2.rs` and `tests/wallet3.rs` (the command-line wallet against a fake RPC), plus the block 0 vector cross-checked
 by `genesis.py`. P2P ports: 8730 mainnet, 8731 research network; the RPC
 listens only where `--rpc` says. The research network's genesis is
 2026-10-17 14:00 UTC, so blocks are mined before mainnet launch.
