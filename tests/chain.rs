@@ -30,8 +30,8 @@ fn life_of_the_chain() {
 
     // miner: software book, m = 1, 16 cheques, PoW-paid. A number takes rewards only once final (number_maturity
     // blocks deep, as for a cheque's payee), so it mines to nobody until then (§12.2)
-    let miner = Book { salt: [1; 16], n256: false, book_size: 256, domains: vec![Domain([7; 32])] };
-    let reg = mine_registration(miner.register(0, 16, Payment::Pow(0)), p.reg_pow_target);
+    let miner = Book { salt: [1; 16], n256: false, book_size: 256, domains: vec![Domain([7; 32])], net: Params::mainnet().magic };
+    let reg = mine_registration(miner.register(0, 16, Payment::Pow([0; 32], 0)), net.chain.tip(), p.reg_pow_target);
     assert_eq!(net.chain.make_block(net.t + 600, 1, vec![reg.clone()]).err(), Some("coinbase payee not mature"));   // not even in its own block
     assert_eq!(net.chain.make_block(net.t + 600, 2, vec![]).err(), Some("coinbase payee unknown"));
     assert!(net.mine(0, vec![reg]).is_ok());           // height 1: number 1 assigned
@@ -44,8 +44,8 @@ fn life_of_the_chain() {
     assert_eq!(net.balance(&miner.id()), 50 * COIN);
 
     // user: a split book (two seeds), first 16 cheques registered; honesty check (cheque 0, zero coins, tier 0) in the same block
-    let user = Book { salt: [2; 16], n256: false, book_size: 256, domains: vec![Domain([8; 32]), Domain([9; 32])] };
-    let mut txs = vec![mine_registration(user.register(0, 16, Payment::Pow(0)), p.reg_pow_target)];
+    let user = Book { salt: [2; 16], n256: false, book_size: 256, domains: vec![Domain([8; 32]), Domain([9; 32])], net: Params::mainnet().magic };
+    let mut txs = vec![mine_registration(user.register(0, 16, Payment::Pow([0; 32], 0)), net.chain.tip(), p.reg_pow_target)];
     txs.extend(user.sign(0, &Message::new(0, 0, 0, 0)));
     net.mine(1, txs).unwrap();
     let u = &net.chain.state.accounts[&user.id()];
@@ -88,8 +88,8 @@ fn life_of_the_chain() {
     assert_eq!(net.balance(&user.id()), 0);
     assert_eq!(net.chain.state.accounts[&user.id()].commits.keys().copied().collect::<Vec<u16>>(), (11..16).collect::<Vec<u16>>());
     // and a book of any size but 256 is refused
-    let small = Book { salt: [6; 16], n256: false, book_size: 12, domains: vec![Domain([6; 32])] };
-    assert_eq!(net.chain.state.clone().apply(&p, &mine_registration(small.register(0, 16, Payment::Pow(0)), p.reg_pow_target)), Err("bad book parameters"));
+    let small = Book { salt: [6; 16], n256: false, book_size: 12, domains: vec![Domain([6; 32])], net: Params::mainnet().magic };
+    assert_eq!(net.chain.state.clone().apply(&p, &mine_registration(small.register(0, 16, Payment::Pow([0; 32], 0)), net.chain.tip(), p.reg_pow_target)), Err("bad book parameters"));
 }
 
 /// Block 0 of mainnet with the placeholder message and launch time must equal the Python
@@ -153,22 +153,22 @@ fn alternating_timestamps_earn_no_relief() {
     }
 }
 
-/// Registration difficulty follows demand both ways: no registrations in a window makes it four
-/// times easier, a window at the cap makes it four times harder (DESIGN.md §8).
+/// Registration difficulty follows demand both ways, every block: a burst at the cap hardens it within hours, quiet
+/// eases it back, and it is never easier than the genesis target (DESIGN.md §8).
 #[test]
 fn registration_target_tightens_and_loosens() {
     use bitcheque::state::State;
     let p = Params::mainnet();
     let mut s = State::new(&p);
     s.reg_target = p.reg_pow_target.div_u64(16);
-    s.reg_window_count = p.reg_pow_per_block_cap * p.reg_pow_window;   // every block full
-    s.begin_block(&p, p.reg_pow_window);
-    assert_eq!(s.reg_target, p.reg_pow_target.div_u64(64), "at the cap: four times harder");
-    s.reg_window_count = 0;
-    s.begin_block(&p, 2 * p.reg_pow_window);
-    assert_eq!(s.reg_target, p.reg_pow_target.div_u64(16), "no demand: four times easier");
-    s.reg_target = p.reg_pow_target;
-    s.begin_block(&p, 3 * p.reg_pow_window);
+    for h in 1..=144 { s.reg_block_count = p.reg_pow_per_block_cap; s.begin_block(&p, h); }   // 144 blocks at the cap
+    assert!(s.reg_target < p.reg_pow_target.div_u64(64) && s.reg_target > p.reg_pow_target.div_u64(128), "a burst: about 4.5 times harder in 144 blocks");
+    let hard = s.reg_target;
+    s.reg_block_count = 1; s.begin_block(&p, 145);
+    assert_eq!(s.reg_target.div_u64(1 << 20), hard.div_u64(1 << 20), "one a block: steady");
+    for h in 146..146 + p.reg_pow_window { s.begin_block(&p, h); }
+    assert!(s.reg_target > hard.mul_u64(2) && s.reg_target < hard.mul_u64(3), "a quiet day: about e times easier");
+    for h in 0..20_000 { s.begin_block(&p, 10_000 + h); }
     assert_eq!(s.reg_target, p.reg_pow_target, "never easier than the genesis target");
 }
 
@@ -178,10 +178,10 @@ fn a_book_grows_a_batch_at_a_time() {
     let p = params();
     let g = Chain::genesis(&p, 1000, b"test");
     let mut net = Net { chain: Chain::new(p.clone(), &g).unwrap(), t: 1000 };
-    let book = Book { salt: [3; 16], n256: false, book_size: bitcheque::wallet::BOOK_SIZE, domains: vec![Domain([4; 32])] };
+    let book = Book { salt: [3; 16], n256: false, book_size: bitcheque::wallet::BOOK_SIZE, domains: vec![Domain([4; 32])], net: Params::mainnet().magic };
     let first = book.registrations(0, 11);
     assert_eq!(first.len(), 1);
-    let mut txs = vec![mine_registration(first[0].clone(), p.reg_pow_target)];
+    let mut txs = vec![mine_registration(first[0].clone(), net.chain.tip(), p.reg_pow_target)];
     txs.extend(book.sign(0, &Message::new(0, 0, 0, 0)));
     net.mine(0, txs).unwrap();
     let number = net.chain.state.accounts[&book.id()].number;
@@ -191,17 +191,17 @@ fn a_book_grows_a_batch_at_a_time() {
     let more = book.registrations(16, 40);
     assert_eq!(more.len(), 2);
     let mut unpaid = more[0].clone();
-    while U256::from_le_bytes(&unpaid.txid()) < p.reg_pow_target { if let Tx::RegisterBatch { pay: Payment::Pow(n), .. } = &mut unpaid { *n += 1 } }
+    while U256::from_le_bytes(&unpaid.txid()) < p.reg_pow_target { if let Tx::RegisterBatch { pay: Payment::Pow(_, n), .. } = &mut unpaid { *n += 1 } }
     assert_eq!(net.chain.state.clone().apply(&p, &unpaid), Err("registration pow insufficient"));
-    net.mine(0, more.iter().map(|t| mine_registration(t.clone(), p.reg_pow_target)).collect()).unwrap();
+    net.mine(0, more.iter().map(|t| mine_registration(t.clone(), net.chain.tip(), p.reg_pow_target)).collect()).unwrap();
     let a = &net.chain.state.accounts[&book.id()];
     assert_eq!((a.number, a.commits.len()), (number, 15 + 32));
 
     // the same batch twice, and a batch past the 16-cheque limit, are refused
-    assert_eq!(net.chain.state.clone().apply(&p, &mine_registration(more[0].clone(), p.reg_pow_target)), Err("batch overlaps"));
+    assert_eq!(net.chain.state.clone().apply(&p, &mine_registration(more[0].clone(), net.chain.tip(), p.reg_pow_target)), Err("batch overlaps"));
     let mut big = book.registrations(64, 64).remove(0);
     if let Tx::RegisterBatch { batch, .. } = &mut big { batch.count = 32; }
-    assert_eq!(net.chain.state.clone().apply(&p, &mine_registration(big, p.reg_pow_target)), Err("batch not aligned"));
+    assert_eq!(net.chain.state.clone().apply(&p, &mine_registration(big, net.chain.tip(), p.reg_pow_target)), Err("batch not aligned"));
 
     // a cheque from a later batch spends like any other, and the last batch ends at cheque 255
     net.mine(0, book.sign(40, &Message::new(0, 0, 0, 0))).unwrap();

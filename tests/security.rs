@@ -24,7 +24,7 @@ impl Net {
         self.chain.add(&b, self.t)
     }
 }
-fn book(k: u8) -> Book { Book { salt: [k; 16], n256: false, book_size: 256, domains: vec![Domain([k; 32])] } }
+fn book(k: u8) -> Book { Book { salt: [k; 16], n256: false, book_size: 256, domains: vec![Domain([k; 32])], net: Params::mainnet().magic } }
 
 /// Renew carries no authority, so it is valid only near a batch's expiry, and only once; a block may not repeat a tx.
 #[test]
@@ -32,7 +32,7 @@ fn renew_cannot_drain_an_account() {
     let p = Params { batch_lifetime: 30, renew_window: 10, ..params() };
     let mut net = Net::new(&p);
     let victim = book(1);
-    net.mine(0, vec![mine_registration(victim.register(0, 16, Payment::Pow(0)), p.reg_pow_target)]).unwrap();
+    net.mine(0, vec![mine_registration(victim.register(0, 16, Payment::Pow([0; 32], 0)), net.chain.tip(), p.reg_pow_target)]).unwrap();
     for _ in 0..2 { net.mine(0, vec![]).unwrap(); }
     for _ in 0..4 { net.mine(1, vec![]).unwrap(); }   // the victim (number 1) earns rewards
     for _ in 0..3 { net.mine(0, vec![]).unwrap(); }
@@ -56,7 +56,7 @@ fn a_replayed_registration_keeps_used_cheques_used() {
     let p = params();
     let mut net = Net::new(&p);
     let u = book(2);
-    let reg = mine_registration(u.register(0, 16, Payment::Pow(0)), p.reg_pow_target);
+    let reg = mine_registration(u.register(0, 16, Payment::Pow([0; 32], 0)), net.chain.tip(), p.reg_pow_target);
     let mut txs = vec![reg.clone()]; txs.extend(u.sign(3, &Message::new(0, 0, 0, 0)));
     net.mine(0, txs).unwrap();
     for _ in 0..6 { net.mine(0, vec![]).unwrap(); }
@@ -74,7 +74,7 @@ fn a_zero_cheque_does_not_fund() {
     let p = params();
     let mut net = Net::new(&p);
     let (a, b) = (book(3), book(4));
-    net.mine(0, vec![mine_registration(a.register(0, 16, Payment::Pow(0)), p.reg_pow_target), mine_registration(b.register(0, 16, Payment::Pow(0)), p.reg_pow_target)]).unwrap();
+    net.mine(0, vec![mine_registration(a.register(0, 16, Payment::Pow([0; 32], 0)), net.chain.tip(), p.reg_pow_target), mine_registration(b.register(0, 16, Payment::Pow([0; 32], 0)), net.chain.tip(), p.reg_pow_target)]).unwrap();
     for _ in 0..2 { net.mine(0, vec![]).unwrap(); }
     let nb = net.chain.state.accounts[&b.id()].number;
     net.mine(0, a.sign(1, &Message::new(nb, 0, 0, 0))).unwrap();

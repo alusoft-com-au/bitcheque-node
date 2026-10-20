@@ -3,6 +3,7 @@
 //!   GET  /account/<number>    GET /id/<account id hex>   GET /lookup/<code> (start of the id after its scheme byte)
 //!   (a number appears in any output only once it is final, number_maturity blocks deep; /account/<n> of a
 //!   number not final yet answers only "pending" and its ready_at)
+//!   GET /commits/<account id hex>/<cheque> (a registered unspent cheque's commitments: 18 lines, one per column, of 10 hex, one per row)
 //!   GET /proof/<number>   GET /regtarget (4 LE limbs, hex)   GET /queued/<account id hex> (cheque numbers of that account waiting in the mempool, comma-separated)
 //!   GET  /history/<number>  (newest first, the last block::HISTORY_CAP events: height kind key=value...; a cheque to yourself is listed as receive, then send)
 //!   GET  /stats   (lifetime totals, and the reward schedule: reward of the next block, base, halving interval, next halving, maturity)
@@ -240,7 +241,7 @@ impl Node {
                 let n: usize = seg.get(1).and_then(|x| x.parse().ok()).unwrap_or(50).min(200);
                 // ranked once per block, whatever N is asked for (so alternating N cannot force a re-sort)
                 if let Some((h, head, rows)) = self.top_cache.lock().unwrap().as_ref() { if *h == c.height() { return Ok(head.clone() + &rows[..n.min(rows.len())].concat()); } }
-                let mut v: Vec<&crate::state::Account> = c.state.accounts.values().collect();
+                let mut v: Vec<&crate::state::Account> = c.state.accounts.values().map(|a| &**a).collect();
                 v.sort_by(|a, b| b.balance.cmp(&a.balance).then(a.number.cmp(&b.number)));
                 let total: u64 = v.iter().map(|a| a.balance).sum();
                 let pending: u64 = c.state.pending.values().flatten().map(|(_, amt)| amt).sum();
@@ -268,6 +269,11 @@ impl Node {
                 let mut ns: Vec<u16> = m.iter().filter_map(|t| match t { Tx::ChequePiece { account, cheque, .. } if *account == id => Some(*cheque), _ => None }).collect();
                 ns.sort_unstable(); ns.dedup();
                 Ok(ns.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","))
+            }
+            ("GET", ["commits", h, n]) => {
+                // a registered, unspent cheque's commitments: 18 lines (columns), 10 hex each (rows), so a wallet can check its cells before revealing them
+                let id = unhex(h).ok_or("bad hex")?;
+                c.state.accounts.get(&id).zip(n.parse::<u16>().ok()).and_then(|(a, n)| a.commits.get(&n)).map(|x| x.lines(crate::tx::id_n(&id))).ok_or("no such cheque")
             }
             ("GET", ["regtarget"]) => Ok(c.state.reg_target.0.iter().map(|l| format!("{l:016x}")).collect::<Vec<_>>().join(" ")),
             ("GET", ["proof", n]) => {

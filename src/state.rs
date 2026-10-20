@@ -1,9 +1,11 @@
 //! Chain state and transaction rules (DESIGN.md §2.1, §3.2 rows 6-10, §10.4, §10.11, §10.12).
 //! Every `apply_*` checks everything before mutating, so a rejected tx leaves no trace.
-use std::collections::BTreeMap;
-use std::sync::Arc;
+//! Accounts are shared between state copies (`Arc`, copied on write by `edit`), and each caches its leaf hash, so a
+//! copy per block costs one pointer per account and the root rehashes only the accounts a block changed.
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, OnceLock};
 use crate::book::{self, ChequeCommits};
-use crate::crypto::sha256;
+use crate::crypto::{key, sha256, Key};
 use crate::message::{self, COLS, ROWS};
 use crate::params::Params;
 use crate::tx::{account_id, id_m, id_n, AccountId, Batch, Payment, Tx, R, W};
@@ -12,12 +14,16 @@ use crate::u256::U256;
 #[derive(Clone, Debug)]
 pub struct OpenCheque { pub n: u16, pub digits: [Option<u8>; COLS], pub expiry: u32 }
 
-/// A registered cheque's commitments. They never change after registration (only get deleted), so
-/// they are shared between state copies, and their hash for the state root is computed once.
+/// A registered cheque's commitments, flat (`book::ChequeCommits`). They never change after registration (only get
+/// deleted), so they are shared between state copies, and their hash for the state root is computed once.
 #[derive(Clone, Debug)]
-pub struct Commits { pub cells: Arc<ChequeCommits>, pub digest: [u8; 32] }
+pub struct Commits { pub cells: Arc<[u8]>, pub digest: [u8; 32] }
 impl Commits {
-    fn new(c: ChequeCommits) -> Commits { let digest = sha256(&c.concat().concat()); Commits { cells: Arc::new(c), digest } }
+    pub fn new(c: ChequeCommits) -> Commits { Commits { digest: sha256(&c), cells: c.into() } }
+    /// The commitment of cell (col, row) of an `n`-byte book.
+    pub fn cell(&self, n: usize, col: usize, row: usize) -> &[u8] { &self.cells[(col * ROWS + row) * n..][..n] }
+    /// One line per column, each its ROWS commitments in lowercase hex, space-separated (GET /commits).
+    pub fn lines(&self, n: usize) -> String { (0..COLS).map(|c| (0..ROWS).map(|r| crate::crypto::hex(self.cell(n, c, r))).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join("\n") }
 }
 
 #[derive(Clone, Debug)]
@@ -32,6 +38,7 @@ pub struct Account {
     pub batches: BTreeMap<u32, (u32, u32)>,      // start -> (count, expiry height)
     pub commits: BTreeMap<u16, Commits>,          // unspent registered cheques
     pub open: Option<OpenCheque>,
+    pub leaf: OnceLock<[u8; 32]>,                 // cached account_leaf; reset by every change (State::edit)
 }
 
 /// What a block did to an account, for the node's history index (not consensus, not in the root).
@@ -45,43 +52,66 @@ pub enum Event {
 #[derive(Clone, Debug)]
 pub struct State {
     pub height: u32,
-    pub accounts: BTreeMap<AccountId, Account>,
+    pub accounts: BTreeMap<AccountId, Arc<Account>>,
     pub numbers: BTreeMap<u32, (AccountId, u32)>,   // number -> (id, assigning height)
     pub next_number: u32,
-    pub free: Vec<(u32, u32)>,                      // (release height, number)
+    pub free: VecDeque<(u32, u32)>,                 // (release height, number), in release order
     pub pending: BTreeMap<u32, Vec<(u32, u64)>>,    // credit height -> (number, amount)
     pub expiries: BTreeMap<u32, Vec<AccountId>>,    // unfunded PoW accounts to delete
     pub gone: BTreeMap<AccountId, u16>,             // deleted accounts that had used cheques -> their nonce: registered again, they keep it
     pub reg_target: U256,
-    pub reg_block_count: u32,
-    pub reg_window_count: u32,
+    pub reg_block_count: u32,                       // registrations in the current block
+    pub recent: VecDeque<[u8; 32]>,                 // hashes of the last reg_anchor_window blocks, oldest first (registration anchors)
+    pub wake: BTreeMap<u32, Vec<AccountId>>,        // height -> accounts whose open cheque or a batch may expire then (an index: rebuilt on decode)
+    pub net: [u8; 4],                               // Params::magic: part of every book's hash key
     pub log: Vec<Event>,                            // events of the block being applied; cleared by begin_block
 }
 
 type Res<T> = Result<T, &'static str>;
 
+/// The account to change, copied first if another state shares it, with its cached leaf cleared.
+fn edit<'a>(m: &'a mut BTreeMap<AccountId, Arc<Account>>, id: &[u8]) -> &'a mut Account {
+    let a = Arc::make_mut(m.get_mut(id).unwrap()); a.leaf = OnceLock::new(); a
+}
+
 impl State {
     pub fn new(p: &Params) -> State {
-        State { height: 0, accounts: BTreeMap::new(), numbers: BTreeMap::new(), next_number: 1, free: Vec::new(),
-                pending: BTreeMap::new(), expiries: BTreeMap::new(), gone: BTreeMap::new(),
-                reg_target: p.reg_pow_target, reg_block_count: 0, reg_window_count: 0, log: Vec::new() }
+        State { height: 0, accounts: BTreeMap::new(), numbers: BTreeMap::new(), next_number: 1, free: VecDeque::new(),
+                pending: BTreeMap::new(), expiries: BTreeMap::new(), gone: BTreeMap::new(), reg_target: p.reg_pow_target, reg_block_count: 0,
+                recent: VecDeque::new(), wake: BTreeMap::new(), net: p.magic, log: Vec::new() }
     }
+    /// Remember a block's hash as a registration anchor (called by the chain after each block, and for block 0).
+    pub fn push_hash(&mut self, p: &Params, h: [u8; 32]) {
+        self.recent.push_back(h);
+        while self.recent.len() > p.reg_anchor_window as usize { self.recent.pop_front(); }
+    }
+    fn key(&self, salt: &[u8; 16]) -> Key { key(salt, &self.net) }
 
-    /// Height-driven work at the start of a block: credit matured rewards, expire pieces,
+    /// Height-driven work at the start of a block: retarget registrations, credit matured rewards, expire pieces,
     /// batches and never-funded PoW accounts.
     pub fn begin_block(&mut self, p: &Params, height: u32) {
         self.height = height;
+        // §8 item 2: the registration target follows demand every block, aiming at one registration a block (a sixteenth
+        // of the cap): each block multiplies it by (W+1)/(W+k) for its k registrations, W = reg_pow_window. A block at the
+        // cap makes registering 1% harder (twice as hard in ~70 blocks), an empty one 0.07% easier (e-fold in a day).
+        let w = p.reg_pow_window as u64;
+        let t = self.reg_target.div_u64(w + self.reg_block_count as u64).mul_u64(w + 1);
+        self.reg_target = if t > p.reg_pow_target { p.reg_pow_target } else { t };
         self.reg_block_count = 0;
         self.log.clear();
         for (num, amt) in self.pending.remove(&height).unwrap_or_default() {
             if let Some((id, _)) = self.numbers.get(&num) {
-                let a = self.accounts.get_mut(id).unwrap();
+                let a = edit(&mut self.accounts, id);
                 a.balance += amt;
                 a.funded = true;
             }
         }
-        for a in self.accounts.values_mut() {
-            if a.open.as_ref().map_or(false, |o| o.expiry <= height) {
+        // only the accounts with something due now (the index may name some whose cheque or batch moved on: no-op)
+        for id in self.wake.remove(&height).unwrap_or_default() {
+            let Some(a) = self.accounts.get(&id) else { continue };
+            if !a.open.as_ref().is_some_and(|o| o.expiry <= height) && !a.batches.values().any(|&(_, e)| e <= height) { continue; }
+            let a = edit(&mut self.accounts, &id);
+            if a.open.as_ref().is_some_and(|o| o.expiry <= height) {
                 let n = a.open.take().unwrap().n;
                 a.commits.remove(&n);
             }
@@ -92,38 +122,30 @@ impl State {
             }
         }
         for id in self.expiries.remove(&height).unwrap_or_default() {
-            if self.accounts.get(&id).map_or(false, |a| !a.funded) {
+            if self.accounts.get(&id).is_some_and(|a| !a.funded) {
                 let a = self.accounts.remove(&id).unwrap();
                 // its revealed cells stay public: a replay of its registration must not make those cheques spendable again
                 if let Some(n) = a.nonce { self.gone.insert(id.clone(), n); }
                 self.numbers.remove(&a.number);
-                self.free.push((height + p.number_quarantine, a.number));
+                self.free.push_back((height + p.number_quarantine, a.number));
             }
-        }
-        if height % p.reg_pow_window == 0 && height > 0 {
-            // §8 item 2: scale the registration target to the observed demand, within 4x per window
-            // aim for one registration a block on average (a sixteenth of the cap): more demand raises the work, none lowers it
-            let want = p.reg_pow_window as u64;
-            let have = self.reg_window_count as u64;
-            let (lo, hi) = (self.reg_target.div_u64(4), self.reg_target.mul_u64(4));
-            let t = if have == 0 { hi } else { let scaled = self.reg_target.div_u64(have).mul_u64(want); if scaled > hi { hi } else if scaled < lo { lo } else { scaled } };
-            self.reg_target = if t > p.reg_pow_target { p.reg_pow_target } else { t };
-            self.reg_window_count = 0;
         }
     }
 
-    /// Everything consensus holds, as bytes (for snapshots). `log` is transient and not included.
+    /// Everything consensus holds, as bytes (for snapshots). `log` is transient and `wake` is rebuilt, so neither is
+    /// included. Commitments are written as flat blobs (their length follows from the account id).
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
-        w.u32(self.height); w.u32(self.next_number); w.u32(self.reg_block_count); w.u32(self.reg_window_count);
+        w.u32(self.height); w.u32(self.next_number); w.u32(self.reg_block_count); w.0.extend_from_slice(&self.net);
         for l in self.reg_target.0 { w.u64(l); }
+        w.u32(self.recent.len() as u32); for h in &self.recent { w.0.extend_from_slice(h); }
         w.u32(self.accounts.len() as u32);
         for (id, a) in &self.accounts {
             w.bytes(id); w.u32(a.number); w.u64(a.balance); w.u8(a.nonce.is_some() as u8); w.u16(a.nonce.unwrap_or(0)); w.u32(a.book_size);
             w.0.extend_from_slice(&a.salt); w.u8(a.pow_paid as u8); w.u8(a.funded as u8);
             w.u32(a.batches.len() as u32); for (s, (c, e)) in &a.batches { w.u32(*s); w.u32(*c); w.u32(*e); }
             w.u32(a.commits.len() as u32);
-            for (nn, c) in &a.commits { w.u16(*nn); w.u8(c.cells.len() as u8); for col in c.cells.iter() { w.u8(col.len() as u8); for cell in col { w.bytes(cell); } } }
+            for (nn, c) in &a.commits { w.u16(*nn); w.0.extend_from_slice(&c.cells); }
             w.u8(a.open.is_some() as u8);
             if let Some(o) = &a.open { w.u16(o.n); w.u32(o.expiry); for d in o.digits { w.u8(d.unwrap_or(255)); } }
         }
@@ -135,42 +157,43 @@ impl State {
         w.0
     }
     pub fn decode(r: &mut R) -> Res<State> {
-        let (height, next_number, reg_block_count, reg_window_count) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
+        let (height, next_number, reg_block_count) = (r.u32()?, r.u32()?, r.u32()?);
+        let net: [u8; 4] = r.take(4)?.try_into().unwrap();
         let reg_target = U256([r.u64()?, r.u64()?, r.u64()?, r.u64()?]);
-        let mut accounts = BTreeMap::new();
+        let mut recent = VecDeque::new(); for _ in 0..r.u32()? { recent.push_back(r.take(32)?.try_into().unwrap()); }
+        let (mut accounts, mut wake) = (BTreeMap::new(), BTreeMap::<u32, Vec<AccountId>>::new());
         for _ in 0..r.u32()? {
             let id = r.bytes()?; let number = r.u32()?; let balance = r.u64()?; let has_nonce = r.u8()? == 1; let nonce = r.u16()?; let book_size = r.u32()?;
             let salt: [u8; 16] = r.take(16)?.try_into().unwrap(); let pow_paid = r.u8()? == 1; let funded = r.u8()? == 1;
             let mut batches = BTreeMap::new(); for _ in 0..r.u32()? { let s = r.u32()?; batches.insert(s, (r.u32()?, r.u32()?)); }
             let mut commits = BTreeMap::new();
-            for _ in 0..r.u32()? { let nn = r.u16()?; let mut cols = Vec::new();
-                for _ in 0..r.u8()? { let mut cells = Vec::new(); for _ in 0..r.u8()? { cells.push(r.bytes()?); } cols.push(cells); }
-                commits.insert(nn, Commits::new(cols)); }
+            for _ in 0..r.u32()? { let nn = r.u16()?; commits.insert(nn, Commits::new(r.take(COLS * ROWS * id_n(&id))?.to_vec())); }
             let open = if r.u8()? == 1 { let n = r.u16()?; let expiry = r.u32()?; let mut digits = [None; COLS]; for d in digits.iter_mut() { let x = r.u8()?; *d = if x == 255 { None } else { Some(x) }; } Some(OpenCheque { n, digits, expiry }) } else { None };
-            accounts.insert(id, Account { number, balance, nonce: if has_nonce { Some(nonce) } else { None }, book_size, salt, pow_paid, funded, batches, commits, open });
+            for e in open.iter().map(|o| o.expiry).chain(batches.values().map(|&(_, e)| e)) { wake.entry(e).or_default().push(id.clone()); }
+            accounts.insert(id, Arc::new(Account { number, balance, nonce: if has_nonce { Some(nonce) } else { None }, book_size, salt, pow_paid, funded, batches, commits, open, leaf: OnceLock::new() }));
         }
         let mut numbers = BTreeMap::new(); for _ in 0..r.u32()? { let n = r.u32()?; let id = r.bytes()?; numbers.insert(n, (id, r.u32()?)); }
-        let mut free = Vec::new(); for _ in 0..r.u32()? { free.push((r.u32()?, r.u32()?)); }
+        let mut free = VecDeque::new(); for _ in 0..r.u32()? { free.push_back((r.u32()?, r.u32()?)); }
         let mut pending = BTreeMap::new(); for _ in 0..r.u32()? { let h = r.u32()?; let mut l = Vec::new(); for _ in 0..r.u32()? { l.push((r.u32()?, r.u64()?)); } pending.insert(h, l); }
         let mut expiries = BTreeMap::new(); for _ in 0..r.u32()? { let h = r.u32()?; let mut ids = Vec::new(); for _ in 0..r.u32()? { ids.push(r.bytes()?); } expiries.insert(h, ids); }
         let mut gone = BTreeMap::new(); for _ in 0..r.u32()? { let id = r.bytes()?; gone.insert(id, r.u16()?); }
-        Ok(State { height, accounts, numbers, next_number, free, pending, expiries, gone, reg_target, reg_block_count, reg_window_count, log: Vec::new() })
+        Ok(State { height, accounts, numbers, next_number, free, pending, expiries, gone, reg_target, reg_block_count, recent, wake, net, log: Vec::new() })
     }
 
+    /// A free number out of quarantine (the one released longest ago), else the next new one.
     fn assign_number(&mut self, id: &AccountId, height: u32) -> u32 {
-        let num = match self.free.iter().position(|&(rel, _)| rel <= height) {
-            Some(i) => self.free.swap_remove(i).1,
-            None => { let n = self.next_number; self.next_number += 1; n }
+        let num = match self.free.front() {
+            Some(&(rel, n)) if rel <= height => { self.free.pop_front(); n }
+            _ => { let n = self.next_number; self.next_number += 1; n }
         };
         self.numbers.insert(num, (id.clone(), height));
         num
     }
 
-    /// Verify a batch against `root` and return its (leaf index, commits) pairs. Pure.
-    fn check_batch(salt: &[u8; 16], m: usize, n: usize, book_size: u32, root: &[u8], b: &Batch, p: &Params) -> Res<Vec<(u16, ChequeCommits)>> {
-        if b.count == 0 || !b.count.is_power_of_two() || b.count > p.max_batch || b.start % b.count != 0 || b.start >= book_size {
-            return Err("batch not aligned");
-        }
+    /// Verify a batch against `root` and return its (leaf index, commits) pairs. Pure. Every batch is exactly
+    /// `max_batch` cheques, aligned, so a book is registered in fixed pieces nobody can split differently.
+    fn check_batch(k: &Key, m: usize, n: usize, book_size: u32, root: &[u8], b: &Batch, p: &Params) -> Res<Vec<(u16, ChequeCommits)>> {
+        if b.count != p.max_batch || b.start % b.count != 0 || b.start >= book_size { return Err("batch not aligned"); }
         let present = (book_size - b.start).min(b.count) as usize;
         if b.cheques.len() != present { return Err("batch cheque count"); }
         let mut leaves = Vec::with_capacity(b.count as usize);
@@ -180,14 +203,22 @@ impl State {
             if ch.len() != COLS || ch.iter().any(|c| c.len() != ROWS || c.iter().any(|r| r.len() != m || r.iter().any(|x| x.len() != n))) {
                 return Err("cheque hashes malformed");
             }
-            let (leaf, commits) = book::leaf_from_shares(salt, n, nn as u16, ch);
+            let (leaf, commits) = book::leaf_from_shares(k, n, nn as u16, ch);
             leaves.push(leaf);
             out.push((nn as u16, commits));
         }
         leaves.resize(b.count as usize, vec![0u8; n]);
-        let sub = book::subtree_root(salt, n, b.start, &leaves);
-        if book::climb(salt, n, b.start, b.count, &sub, &b.path, book_size)? != root { return Err("batch does not match root"); }
+        let sub = book::subtree_root(k, n, b.start, &leaves);
+        if book::climb(k, n, b.start, b.count, &sub, &b.path, book_size)? != root { return Err("batch does not match root"); }
         Ok(out)
+    }
+    /// A registration's proof of work: below the target, anchored to a recent block of this chain, within the block's cap.
+    fn check_pow(&self, p: &Params, tx: &Tx, pay: &Payment) -> Res<()> {
+        let Payment::Pow(anchor, _) = pay;
+        if U256::from_le_bytes(&tx.txid()) >= self.reg_target { return Err("registration pow insufficient"); }
+        if !self.recent.contains(anchor) { return Err("registration anchor not recent"); }
+        if self.reg_block_count >= p.reg_pow_per_block_cap { return Err("registration pow cap reached"); }
+        Ok(())
     }
 
     /// Apply a non-coinbase transaction. Returns the miner's income from it.
@@ -198,25 +229,26 @@ impl State {
             Tx::RegisterBook { salt, m, n256, book_size, root, batch, pay } => {
                 let (m, n) = (*m as usize, if *n256 { 32 } else { 16 });
                 if m == 0 || m > 7 || root.len() != n || *book_size != p.book_size { return Err("bad book parameters"); }
+                // a book starts at cheque 0: nobody can register a later batch of someone else's book first
+                if batch.start != 0 { return Err("book must start at cheque 0"); }
                 let id = account_id(m as u8, *n256, root);
                 if self.accounts.contains_key(&id) { return Err("account exists"); }
                 // the proof of work first: it costs one hash to check, the batch thousands
-                let Payment::Pow(_) = pay;
-                if U256::from_le_bytes(&tx.txid()) >= self.reg_target { return Err("registration pow insufficient"); }
-                if self.reg_block_count >= p.reg_pow_per_block_cap { return Err("registration pow cap reached"); }
-                let cheques = Self::check_batch(salt, m, n, *book_size, root, batch, p)?;
+                self.check_pow(p, tx, pay)?;
+                let cheques = Self::check_batch(&self.key(salt), m, n, *book_size, root, batch, p)?;
                 // ---- mutate ----
-                let pow = true;
-                if pow { self.reg_block_count += 1; self.reg_window_count += 1; self.expiries.entry(height + p.unfunded_pow_lifetime).or_default().push(id.clone()); }
+                self.reg_block_count += 1;
+                self.expiries.entry(height + p.unfunded_pow_lifetime).or_default().push(id.clone());
+                self.wake.entry(height + p.batch_lifetime).or_default().push(id.clone());
                 let number = self.assign_number(&id, height);
                 self.log.push(Event::Register { id: id.clone(), number });
                 // registered before and expired: the cheques it used stay used
                 let nonce = self.gone.remove(&id);
-                let mut a = Account { number, balance: 0, nonce, book_size: *book_size, salt: *salt, pow_paid: pow, funded: !pow,
-                                      batches: BTreeMap::new(), commits: BTreeMap::new(), open: None };
+                let mut a = Account { number, balance: 0, nonce, book_size: *book_size, salt: *salt, pow_paid: true, funded: false,
+                                      batches: BTreeMap::new(), commits: BTreeMap::new(), open: None, leaf: OnceLock::new() };
                 a.batches.insert(batch.start, (batch.count, height + p.batch_lifetime));
                 for (nn, c) in cheques { if nonce.map_or(true, |x| nn > x) { a.commits.insert(nn, Commits::new(c)); } }
-                self.accounts.insert(id, a);
+                self.accounts.insert(id, Arc::new(a));
                 Ok(0)
             }
             Tx::RegisterBatch { account, batch, pay } => {
@@ -224,25 +256,26 @@ impl State {
                 // so every 16 cheques of state cost the same however they arrive
                 let a = self.accounts.get(account).ok_or("no such account")?;
                 if a.batches.contains_key(&batch.start) || a.batches.iter().any(|(&s, &(c, _))| batch.start < s + c && s < batch.start + batch.count) { return Err("batch overlaps"); }
-                let Payment::Pow(_) = pay;
-                if U256::from_le_bytes(&tx.txid()) >= self.reg_target { return Err("registration pow insufficient"); }
-                if self.reg_block_count >= p.reg_pow_per_block_cap { return Err("registration pow cap reached"); }
-                let cheques = Self::check_batch(&a.salt, id_m(account) as usize, id_n(account), a.book_size, &account[1..], batch, p)?;
+                self.check_pow(p, tx, pay)?;
+                let cheques = Self::check_batch(&self.key(&a.salt), id_m(account) as usize, id_n(account), a.book_size, &account[1..], batch, p)?;
                 // ---- mutate ----
-                self.reg_block_count += 1; self.reg_window_count += 1;
-                let a = self.accounts.get_mut(account).unwrap();
+                self.reg_block_count += 1;
+                self.wake.entry(height + p.batch_lifetime).or_default().push(account.clone());
+                let a = edit(&mut self.accounts, account);
                 a.batches.insert(batch.start, (batch.count, height + p.batch_lifetime));
                 for (nn, c) in cheques { if a.nonce.map_or(true, |x| nn > x) { a.commits.insert(nn, Commits::new(c)); } }
                 Ok(0)
             }
             Tx::Renew { account, start } => {
-                let a = self.accounts.get_mut(account).ok_or("no such account")?;
-                let b = a.batches.get_mut(start).ok_or("no such batch")?;
+                let a = self.accounts.get(account).ok_or("no such account")?;
+                let b = a.batches.get(start).ok_or("no such batch")?;
                 // anyone may send a renewal (it carries no authority), so it is only valid near the end of a batch's life:
                 // a renewed batch is far from expiry again, so a second one (in the same block or later) is refused
                 if b.1 > height + p.renew_window { return Err("batch not near expiry"); }
                 if a.balance < p.renew_fee { return Err("insufficient balance for renew"); }
-                b.1 = height + p.batch_lifetime;
+                self.wake.entry(height + p.batch_lifetime).or_default().push(account.clone());
+                let a = edit(&mut self.accounts, account);
+                a.batches.get_mut(start).unwrap().1 = height + p.batch_lifetime;
                 a.balance -= p.renew_fee;
                 Ok(p.renew_fee)
             }
@@ -255,10 +288,10 @@ impl State {
         let (m, n) = (id_m(account) as usize, id_n(account));
         let a = self.accounts.get(account)?;
         if column as usize >= COLS || shares.len() != m { return None; }
-        let commits = a.commits.get(&nn)?;
+        let (commits, k) = (a.commits.get(&nn)?, self.key(&a.salt));
         (0..ROWS).find(|&row| {
-            let hs: Vec<Vec<u8>> = (0..m).map(|k| book::share_hash(&a.salt, n, nn, column, row as u8, k as u8, &shares[k])).collect();
-            book::commit(&a.salt, n, nn, column, row as u8, &hs) == commits.cells[column as usize][row]
+            let hs: Vec<Vec<u8>> = (0..m).map(|j| book::share_hash(&k, n, nn, column, row as u8, j as u8, &shares[j])).collect();
+            book::commit(&k, n, nn, column, row as u8, &hs) == commits.cell(n, column as usize, row)
         }).map(|r| r as u8)
     }
 
@@ -291,7 +324,8 @@ impl State {
             done = Some((amount, fee, msg.payee, d));
         }
         // ---- mutate ----
-        let a = self.accounts.get_mut(account).unwrap();
+        if done.is_none() { self.wake.entry(height + p.piece_lifetime).or_default().push(account.clone()); }
+        let a = edit(&mut self.accounts, account);
         if !continuing {
             if let Some(o) = a.open.take() { a.commits.remove(&o.n); }
             let dead: Vec<u16> = a.commits.range(..nn).map(|(&k, _)| k).collect();
@@ -309,9 +343,10 @@ impl State {
                     Ok(amount + fee)   // number 0 is nobody's: the coins go to the miner with the fee
                 } else {
                     let pid = self.numbers[&payee].0.clone();
-                    let pa = self.accounts.get_mut(&pid).unwrap();
+                    let pa = edit(&mut self.accounts, &pid);
                     pa.balance += amount;
-                    if amount > 0 { pa.funded = true; }   // a zero-coin cheque must not keep an unfunded account alive for free
+                    // permanence needs a real balance (min_fund), so dust cannot keep an unfunded account alive
+                    if pa.balance >= p.min_fund { pa.funded = true; }
                     Ok(fee)
                 }
             }
@@ -324,21 +359,22 @@ impl State {
     pub fn apply_coinbase(&mut self, p: &Params, height: u32, payee: u32, fees: u64) -> Res<()> {
         let reward = p.block_reward(height) + fees;
         if payee == 0 { return Ok(()); }
-        let &(_, assigned) = self.numbers.get(&payee).ok_or("coinbase payee unknown")?;
+        let (id, assigned) = self.numbers.get(&payee).ok_or("coinbase payee unknown")?;
         if assigned + p.number_maturity > height { return Err("coinbase payee not mature"); }
         // mined to: the account is kept (its reward is credited reward_maturity blocks later, and must find it there)
-        if let Some(a) = self.accounts.get_mut(&self.numbers[&payee].0.clone()) { a.funded = true; }
+        if self.accounts.get(id).is_some_and(|a| !a.funded) { edit(&mut self.accounts, id).funded = true; }
         self.pending.entry(height + p.reward_maturity).or_default().push((payee, reward));
         self.log.push(Event::Reward { number: payee, amount: reward });
         Ok(())
     }
 
-    /// Canonical bytes of one account record (the leaf a light client proves). Every list carries its length, so
-    /// no two different records encode the same.
-    fn account_leaf(id: &AccountId, a: &Account) -> [u8; 32] {
+    /// Canonical bytes of one account record (the leaf a light client proves), hashed. Every list carries its length,
+    /// so no two different records encode the same. `since` is the height its number was assigned: with `number` it
+    /// fixes the account's entry in `numbers` and `expiries`, which are therefore not hashed separately.
+    fn account_leaf(id: &AccountId, a: &Account, since: u32) -> [u8; 32] {
         let mut v = Vec::new();
         let u = |v: &mut Vec<u8>, x: u64| v.extend_from_slice(&x.to_le_bytes());
-        u(&mut v, id.len() as u64); v.extend_from_slice(id); v.extend_from_slice(&a.salt); u(&mut v, a.number as u64); u(&mut v, a.balance);
+        u(&mut v, id.len() as u64); v.extend_from_slice(id); v.extend_from_slice(&a.salt); u(&mut v, a.number as u64); u(&mut v, since as u64); u(&mut v, a.balance);
         u(&mut v, a.nonce.map_or(u64::MAX, |x| x as u64)); v.push(a.funded as u8); v.push(a.pow_paid as u8); u(&mut v, a.book_size as u64);
         u(&mut v, a.batches.len() as u64);
         for (s, (c, e)) in &a.batches { u(&mut v, *s as u64); u(&mut v, *c as u64); u(&mut v, *e as u64); }
@@ -348,46 +384,44 @@ impl State {
         for (nn, c) in &a.commits { u(&mut v, *nn as u64); v.extend_from_slice(&c.digest); }
         sha256(&v)
     }
+    /// Every account's leaf, in id order: cached, so only accounts changed since they were last hashed cost a hash.
+    fn leaves(&self) -> Vec<[u8; 32]> {
+        self.accounts.iter().map(|(id, a)| *a.leaf.get_or_init(|| Self::account_leaf(id, a, self.numbers.get(&a.number).map_or(0, |x| x.1)))).collect()
+    }
+    fn pair(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] { let mut b = [0u8; 64]; b[..32].copy_from_slice(l); b[32..].copy_from_slice(r); sha256(&b) }
     fn merkle(mut level: Vec<[u8; 32]>) -> [u8; 32] {
         if level.is_empty() { return [0u8; 32]; }
         while !level.len().is_power_of_two() { level.push([0u8; 32]); }
-        while level.len() > 1 { level = level.chunks(2).map(|p| sha256(&[p[0], p[1]].concat())).collect(); }
+        while level.len() > 1 { level = level.chunks(2).map(|p| Self::pair(&p[0], &p[1])).collect(); }
         level[0]
     }
-    /// SHA256 of everything outside the accounts, each list prefixed with its length.
+    /// SHA256 of everything outside the accounts that they do not determine, each list prefixed with its length.
     fn rest_hash(&self) -> [u8; 32] {
         let mut v = Vec::new();
         let u = |v: &mut Vec<u8>, x: u64| v.extend_from_slice(&x.to_le_bytes());
         u(&mut v, self.height as u64); u(&mut v, self.next_number as u64);
-        u(&mut v, self.numbers.len() as u64);
-        for (num, (id, h)) in &self.numbers { u(&mut v, *num as u64); u(&mut v, id.len() as u64); v.extend_from_slice(id); u(&mut v, *h as u64); }
         u(&mut v, self.free.len() as u64);
         for (r, num) in &self.free { u(&mut v, *r as u64); u(&mut v, *num as u64); }
         u(&mut v, self.pending.len() as u64);
         for (h, list) in &self.pending { u(&mut v, *h as u64); u(&mut v, list.len() as u64); for (num, amt) in list { u(&mut v, *num as u64); u(&mut v, *amt); } }
-        u(&mut v, self.expiries.len() as u64);
-        for (h, ids) in &self.expiries { u(&mut v, *h as u64); u(&mut v, ids.len() as u64); for id in ids { u(&mut v, id.len() as u64); v.extend_from_slice(id); } }
         u(&mut v, self.gone.len() as u64);
         for (id, n) in &self.gone { u(&mut v, id.len() as u64); v.extend_from_slice(id); u(&mut v, *n as u64); }
         for limb in self.reg_target.0 { u(&mut v, limb); }
-        u(&mut v, self.reg_window_count as u64);
+        u(&mut v, self.reg_block_count as u64);
         sha256(&v)
     }
     /// state_root = SHA256(merkle(account leaves in id order) || rest_hash).
-    pub fn root(&self) -> [u8; 32] {
-        let leaves: Vec<[u8; 32]> = self.accounts.iter().map(|(id, a)| Self::account_leaf(id, a)).collect();
-        sha256(&[Self::merkle(leaves), self.rest_hash()].concat())
-    }
+    pub fn root(&self) -> [u8; 32] { sha256(&[Self::merkle(self.leaves()), self.rest_hash()].concat()) }
     /// Merkle proof of one account: (leaf, sibling path bottom-up, and the `rest` hash is the last element), and the
-    /// state root, computed from the same leaves (one pass over the accounts).
+    /// state root, computed from the same (cached) leaves.
     pub fn account_proof(&self, id: &AccountId) -> Option<([u8; 32], Vec<[u8; 32]>, [u8; 32])> {
         let pos = self.accounts.keys().position(|k| k == id)?;
-        let mut level: Vec<[u8; 32]> = self.accounts.iter().map(|(id, a)| Self::account_leaf(id, a)).collect();
+        let mut level = self.leaves();
         while !level.len().is_power_of_two() { level.push([0u8; 32]); }
         let (leaf, mut path, mut i) = (level[pos], Vec::new(), pos);
         while level.len() > 1 {
             path.push(level[i ^ 1]);
-            level = level.chunks(2).map(|p| sha256(&[p[0], p[1]].concat())).collect();
+            level = level.chunks(2).map(|p| Self::pair(&p[0], &p[1])).collect();
             i /= 2;
         }
         let rest = self.rest_hash();

@@ -11,21 +11,22 @@ fn main() {
     let node = Node::new(Store::open(p.clone(), &g, None).unwrap());
     println!("rpc on {}", node.serve_rpc("127.0.0.1:8732").expect("port 8732 busy"));
     let mine = |n: u32| loop { let mut b = node.template(n).expect("template"); b.header.mine(); if node.submit_block(&b, None).is_ok() { println!("block {}", node.height()); break; } };
-    let miner = Book { salt: [1; 16], n256: false, book_size: 256, domains: vec![Domain([7; 32])] };
-    let saver = Book { salt: [2; 16], n256: false, book_size: 256, domains: vec![Domain([8; 32])] };   // one seed
-    let shop = Book { salt: [3; 16], n256: false, book_size: 256, domains: vec![Domain([10; 32])] };  // one seed
+    let miner = Book { salt: [1; 16], n256: false, book_size: 256, domains: vec![Domain([7; 32])], net: p.magic };
+    let saver = Book { salt: [2; 16], n256: false, book_size: 256, domains: vec![Domain([8; 32])], net: p.magic };   // one seed
+    let shop = Book { salt: [3; 16], n256: false, book_size: 256, domains: vec![Domain([10; 32])], net: p.magic };  // one seed
+    let tip = || node.store.lock().unwrap().chain.tip();
     let submit = |txs: Vec<bitcheque::tx::Tx>| for t in txs { node.submit_tx(t, None).unwrap(); };
 
-    submit(miner.registrations(0, 63).into_iter().map(|t| mine_registration(t, p.reg_pow_target)).collect());   // 64 cheques, 16 per batch
+    submit(miner.registrations(0, 63).into_iter().map(|t| mine_registration(t, tip(), p.reg_pow_target)).collect());   // 64 cheques, 16 per batch
     mine(0); mine(0);                                                     // number 1 is final from block 3: until then, mine to nobody
     mine(1); mine(1); mine(1);                                            // the block-3 reward matures
-    submit(vec![mine_registration(saver.register(0, 16, Payment::Pow(0)), p.reg_pow_target)]);
+    submit(vec![mine_registration(saver.register(0, 16, Payment::Pow([0; 32], 0)), tip(), p.reg_pow_target)]);
     mine(1);
     submit(saver.sign(0, &Message::new(1, 0, 0, 0)));                     // honesty check (zero coins, any number)
     mine(1); mine(1);
     submit(miner.sign(0, &Message::new(2, 2500, 5, 1)));                  // 2.5 coins to the saver
     mine(1);
-    submit(vec![mine_registration(shop.register(0, 16, Payment::Pow(0)), p.reg_pow_target)]);
+    submit(vec![mine_registration(shop.register(0, 16, Payment::Pow([0; 32], 0)), tip(), p.reg_pow_target)]);
     mine(1); mine(1); mine(1);
     let pieces = saver.sign(1, &Message::new(3, 4000, 4, 2));             // saver pays the shop 0.4 coins, in two parts
     submit(pieces[..12].to_vec()); mine(1);

@@ -3,6 +3,8 @@
 use crate::u256::U256;
 
 pub const COIN: u64 = 100_000_000;
+/// Cheques per registration: every batch has exactly this many (also the decoder's cap).
+pub const MAX_BATCH: u32 = 16;
 
 #[derive(Clone, Debug)]
 pub struct Params {
@@ -20,11 +22,13 @@ pub struct Params {
     pub max_block_bytes: usize,
     pub max_future_seconds: u32,
     pub reg_pow_target: U256,
-    pub reg_pow_window: u32,
+    pub reg_pow_window: u32,   // the registration target's time constant: it moves by (window+1)/(window+registrations) every block
+    pub reg_anchor_window: u32, // a registration's proof of work names one of the last this many block hashes
     pub reg_pow_per_block_cap: u32,
     pub fee_unit: u64,
     pub reg_fee: u64,
     pub renew_fee: u64,
+    pub min_fund: u64,         // a balance this large makes an account permanent (funded)
     pub renew_window: u32,     // a batch may be renewed only this close to its expiry (so a renewal, which anyone may send, costs its owner one fee per lifetime at most)
     pub max_reorg: u32,        // reorgs deeper than this need twice the work of what they replace (and snapshots are kept to cover this deep)
     pub unfunded_pow_lifetime: u32,
@@ -58,18 +62,20 @@ impl Params {
             max_block_bytes: 1_000_000,    // about 1 MB a minute: well within what home connections relay
             max_future_seconds: 720,       // twelve blocks, as Bitcoin's two hours are twelve of its blocks
             reg_pow_target: U256::one_shl(228), // 2^256 / 2^28
-            reg_pow_window: 1_440,         // a day: the target follows demand within days, not weeks
+            reg_pow_window: 1_440,         // a day: a block at the cap makes registering 1% harder, an empty one 0.07% easier
+            reg_anchor_window: 144,        // a mined registration must be mined into a block within about 2.4 hours
             reg_pow_per_block_cap: 16,     // about what fits in a block (a registration of 16 cheques is ~58 KB)
             fee_unit: 1000,
             reg_fee: 100 * 1000,
             renew_fee: 10 * 1000,
+            min_fund: COIN,                // permanence costs a coin held, not one base unit
             renew_window: 43_200,          // the last 30 days of a batch's life
             max_reorg: 100,                // as deep as number_maturity: replacing a final number takes twice the work
             unfunded_pow_lifetime: 43_200, // 30 days
             number_quarantine: 525_600,    // a year
             batch_lifetime: 2_100_000,     // about four years
             piece_lifetime: 10_000,        // about a week
-            max_batch: 16,                 // every registration covers at most 16 cheques and pays its own proof of work
+            max_batch: MAX_BATCH,           // every registration covers exactly 16 cheques and pays its own proof of work
             book_size: 256,                // every book: 256 cheques on one account number, registered 16 at a time
             stall_relief: false,
             magic: [0xBC, 0x4E, 0x51, 0x00],

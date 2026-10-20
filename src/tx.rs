@@ -21,12 +21,14 @@ fn account(r: &mut R) -> Result<AccountId, &'static str> { let a = r.bytes()?; i
 #[derive(Clone, Debug, PartialEq)]
 pub struct Batch {
     pub start: u32,
-    pub count: u32,             // power of two, aligned
+    pub count: u32,             // always Params::max_batch (16), aligned
     pub cheques: Vec<ChequeShares>, // cheques start.. (those below book_size)
     pub path: Vec<Bytes>,       // siblings from the subtree root to the account root
 }
 #[derive(Clone, Debug, PartialEq)]
-pub enum Payment { Pow(u64) }   // registrations are paid by proof of work only
+/// Registrations are paid by proof of work only: (anchor, nonce). The anchor is the hash of a recent block (one of the
+/// last `reg_anchor_window`), so the work is done for one place on one chain and cannot be replayed later.
+pub enum Payment { Pow([u8; 32], u64) }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tx {
@@ -69,7 +71,7 @@ impl<'a> R<'a> {
     pub fn share(&mut self, n: usize) -> Result<Vec<u8>, &'static str> { let k = self.u32()? as usize; if k != n { return Err("bad share length"); } Ok(self.take(k)?.to_vec()) }
     pub fn batch(&mut self, m: usize, n: usize) -> Result<Batch, &'static str> {
         let start = self.u32()?; let count = self.u32()?; let nch = self.u32()?;
-        if nch > 256 { return Err("batch too large"); }
+        if nch > crate::params::MAX_BATCH { return Err("batch too large"); }
         let mut cheques = Vec::with_capacity(nch as usize);
         for _ in 0..nch {
             let mut ch = Vec::with_capacity(18);
@@ -91,11 +93,11 @@ impl Tx {
             Tx::Coinbase { height, payee, message } => { w.u8(0); w.u32(*height); w.u32(*payee); w.bytes(message) }
             Tx::RegisterBook { salt, m, n256, book_size, root, batch, pay } => {
                 w.u8(1); w.0.extend_from_slice(salt); w.u8(*m); w.u8(*n256 as u8); w.u32(*book_size); w.bytes(root); w.batch(batch);
-                match pay { Payment::Pow(nonce) => { w.u8(0); w.u64(*nonce) } }
+                match pay { Payment::Pow(anchor, nonce) => { w.u8(0); w.0.extend_from_slice(anchor); w.u64(*nonce) } }
             }
             Tx::RegisterBatch { account, batch, pay } => {
                 w.u8(2); w.bytes(account); w.batch(batch);
-                match pay { Payment::Pow(nonce) => { w.u8(0); w.u64(*nonce) } }
+                match pay { Payment::Pow(anchor, nonce) => { w.u8(0); w.0.extend_from_slice(anchor); w.u64(*nonce) } }
             }
             Tx::ChequePiece { account, cheque, column, shares } => {
                 w.u8(3); w.bytes(account); w.u16(*cheque); w.u8(*column); w.u8(shares.len() as u8); for h in shares { w.bytes(h) }
@@ -104,22 +106,24 @@ impl Tx {
         }
         w.0
     }
+    /// Decode one transaction; `r` must hold exactly its bytes (anything left over is refused, so one tx has one encoding).
     pub fn decode(r: &mut R) -> Result<Tx, &'static str> {
-        Ok(match r.u8()? {
+        let pay = |r: &mut R| -> Result<Payment, &'static str> { match r.u8()? { 0 => Ok(Payment::Pow(r.take(32)?.try_into().unwrap(), r.u64()?)), _ => Err("bad payment") } };
+        let t = match r.u8()? {
             0 => Tx::Coinbase { height: r.u32()?, payee: r.u32()?, message: r.bytes()? },
             1 => {
                 let salt: [u8; 16] = r.take(16)?.try_into().unwrap();
-                let m = r.u8()?; let n256 = r.u8()? != 0; let book_size = r.u32()?; let root = r.bytes()?;
+                let m = r.u8()?; let n256 = match r.u8()? { 0 => false, 1 => true, _ => return Err("bad n256") }; let book_size = r.u32()?; let root = r.bytes()?;
                 if !(1..=7).contains(&m) { return Err("bad m"); }
                 let n = if n256 { 32 } else { 16 };
                 if root.len() != n { return Err("bad root"); }
                 let batch = r.batch(m as usize, n)?;
-                let pay = match r.u8()? { 0 => Payment::Pow(r.u64()?), _ => return Err("bad payment") };
+                let pay = pay(r)?;
                 Tx::RegisterBook { salt, m, n256, book_size, root, batch, pay }
             }
             2 => {
                 let account = account(r)?; let batch = r.batch(id_m(&account) as usize, id_n(&account))?;
-                let pay = match r.u8()? { 0 => Payment::Pow(r.u64()?), _ => return Err("bad payment") };
+                let pay = pay(r)?;
                 Tx::RegisterBatch { account, batch, pay }
             }
             3 => { let account = account(r)?; let cheque = r.u16()?; let column = r.u8()?; let k = r.u8()?; if k != id_m(&account) { return Err("bad share count"); }
@@ -127,7 +131,9 @@ impl Tx {
                    Tx::ChequePiece { account, cheque, column, shares } }
             4 => Tx::Renew { account: account(r)?, start: r.u32()? },
             _ => return Err("unknown tx type"),
-        })
+        };
+        if r.i != r.b.len() { return Err("trailing bytes"); }
+        Ok(t)
     }
     pub fn txid(&self) -> [u8; 32] { sha256d(&self.encode()) }
 }

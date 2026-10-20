@@ -42,11 +42,14 @@ pub fn midstate(prefix: &[u8]) -> [u32; 8] {
 /// SHA-256 of `prefix || tail`, given `mid = midstate(prefix)` and `prefix_len`.
 pub fn finish(mid: [u32; 8], prefix_len: usize, tail: &[u8]) -> [u8; 32] {
     let mut h = mid;
-    let mut data = tail.to_vec();
-    data.push(0x80);
-    while data.len() % 64 != 56 { data.push(0); }
-    data.extend_from_slice(&(((prefix_len + tail.len()) as u64) * 8).to_be_bytes());
-    for chunk in data.chunks(64) { compress(&mut h, chunk); }
+    let full = tail.len() / 64 * 64;
+    for chunk in tail[..full].chunks(64) { compress(&mut h, chunk); }
+    // the last partial chunk, the 0x80 marker and the bit length, in one or two chunks on the stack
+    let (rest, mut buf) = (&tail[full..], [0u8; 128]);
+    buf[..rest.len()].copy_from_slice(rest); buf[rest.len()] = 0x80;
+    let end = if rest.len() < 56 { 64 } else { 128 };
+    buf[end - 8..end].copy_from_slice(&(((prefix_len + tail.len()) as u64) * 8).to_be_bytes());
+    for chunk in buf[..end].chunks(64) { compress(&mut h, chunk); }
     let mut out = [0u8; 32];
     for i in 0..8 { out[4 * i..4 * i + 4].copy_from_slice(&h[i].to_be_bytes()); }
     out

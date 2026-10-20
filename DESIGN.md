@@ -75,7 +75,7 @@ Account {
   nonce        u16 or none           highest cheque number consumed
   book_size    u32                   always 256, registered 16 at a time (cheque 0 never printed)
   salt         16 B                  book salt (§3.1)
-  funded       bool                  has ever received coins; an unfunded PoW account expires (§2.2)
+  funded       bool                  has held at least min_fund (1 coin) or been mined to; an unfunded PoW account expires (§2.2)
   batches      map                   registered cheque ranges and their expiry
   commits      map                   commitments of registered, unspent cheques
   open         cheque or none        the cheque being submitted piece by piece (§10.12)
@@ -91,8 +91,8 @@ outputs.
 
 | Type | Signed by | Fee | Purpose |
 |---|---|---|---|
-| `RegisterBook { salt, m, n256, book_size, root, first batch, PoW nonce }` | nobody; self-verifying | anti-spam proof of work only (§8 item 2) | creates the account, assigns its number, registers the first batch (cheques 0–15) |
-| `RegisterBatch { account, batch, PoW nonce }` | nobody; self-verifying | the same proof of work as `RegisterBook` | makes the next 16 cheques of a book spendable (printing more, §10.10) |
+| `RegisterBook { salt, m, n256, book_size, root, first batch, PoW anchor + nonce }` | nobody; self-verifying | anti-spam proof of work only (§8 item 2) | creates the account, assigns its number, registers the first batch (cheques 0–15) |
+| `RegisterBatch { account, batch, PoW anchor + nonce }` | nobody; self-verifying | the same proof of work as `RegisterBook` | makes the next 16 cheques of a book spendable (printing more, §10.10) |
 | `ChequePiece { account, cheque, column, shares }` | the paper | encoded in the cheque (fee tier) | one column of a cheque; a cheque is 18 pieces (§10.12) |
 | `Renew { account, start }` | nobody | 10,000 base units from the account balance | resets a batch's expiry (§10.11); valid only in the batch's last 43,200 blocks, so it costs its owner at most one fee per lifetime |
 | Coinbase `{ height, number, message }` | — | — | credits the block reward plus fees to a final account number (or 0, nobody), 100 blocks later |
@@ -102,14 +102,20 @@ falsified: every hash must match the committed root through a Merkle path.
 A third party can only register your true hashes, which helps you. A
 `RegisterBook` or `RegisterBatch` is paid only by proof of work over its txid (no coins
 needed), so every 16 cheques of node state cost the same work however they arrive: initial target 2^228 (≈ 2^28 hashes), at most 16 per block (about what fits), the
-target adjusting every 1,440 blocks (§8 item 2). A PoW account that has
-received no coins after 43,200 blocks (~30 days) is deleted and its number
+target adjusting every block (§8 item 2). The work is anchored: the payment is `(anchor, nonce)`, where
+`anchor` is the hash of one of the last 144 blocks (`reg_anchor_window`) of the chain it is mined into, and
+the txid covers it. So the work is done at mining time for one chain and one moment: it cannot be replayed
+after the account expires, on another network, or a day later. Registration files made offline carry a
+zero anchor; the online wallet sets the tip as the anchor when it mines. A PoW account that has
+not been funded after 43,200 blocks (~30 days) is deleted and its number
 quarantined for 525,600 blocks (~a year) before reuse; once funded it is
-permanent (a zero-coin cheque does not count as funding; a block reward does). An account
-deleted after using cheques leaves a record of its last cheque number, so a replay of its
-registration brings it back with those cheques still used. A batch is a power-of-two count of cheques aligned to its start,
-at most 16, and a book holds at most 256 cheques. Duplicates (an existing account, an overlapping batch) are
-rejected.
+permanent. Funded means a balance of at least `min_fund` (1 coin) after a cheque arrives, or a block reward
+mined to it; dust does not count. An account
+deleted after using cheques leaves a record of its last cheque number, so a re-registration (with fresh work)
+brings it back with those cheques still used. Every batch is exactly 16 cheques (`max_batch`) aligned to its
+start, and `RegisterBook` always carries cheques 0–15: a third party who sees a registration can neither register
+a fragment of it nor a later batch first. A book holds 256 cheques. Duplicates (an existing account, an
+overlapping batch) are rejected.
 
 Fee tier `0` (zero fee) is valid only for zero-amount cheques, so the
 honesty check (§10.6) can run before the account is funded. Number 0 is
@@ -131,12 +137,21 @@ cell per column.
 ### 3.1 Hash primitive
 
 Tweakable SHA-256 in the SLH-DSA-SHA2 construction:
-`H(addr, x) = SHA256(book_salt || 48 zero bytes || addr || x)` truncated to
+`H(addr, x) = SHA256(book_salt || net || 44 zero bytes || addr || x)` truncated to
 n = 16 B (category 1, default) or 32 B (category 5, `n256` flag; cells
 become 24 words, everything doubles). `book_salt` is a public 16-byte value
 carried in `RegisterBook`; the reference wallets derive it from the seed
 (`SHA256("bitcheque/salt" || seed)[..16]`), so seed and book size recreate
-the book. `addr` is 8 bytes: (tag, cheque u16, column, index, extra, 0, 0),
+the book. `net` is the network's 4-byte magic (`Params::magic`: mainnet, the research network, a local
+devnet), so the same seed and salt give different commitments, roots and account ids on each network:
+a registration or a piece made for one is invalid on another. Testnet books keep their ids across testnet
+resets (same magic), which is intended. Caveats: (1) the paper cells themselves come from the seed alone, so a
+seed used on two networks reveals on one the cells of the same cheque number on the other, and anyone can
+then send that same cheque (same payee number, same amount) there: never use one seed on two networks
+(binding the cell derivation to the network needs a print-page change and is left for mainnet). (2) After a
+testnet reset a re-registered book has the same commitments as before, so pieces of cheques it revealed on
+the old chain can be replayed on the new one if those cheque numbers are registered and unused again; hold
+such a book's old cheques as used (spend above the old nonce) or start a new book. `addr` is 8 bytes: (tag, cheque u16, column, index, extra, 0, 0),
 the tag separating shares, commitments, column nodes, cheque leaves and
 account nodes. The address prefix removes multi-target attacks. There is no
 encryption anywhere in consensus: only one-way hashing and equality.
@@ -208,7 +223,7 @@ is how miners, pools and exchanges use the chain:
 
 - The same 256-cheque book as the website's, from the same seed: `RegisterBook`
   carries the root and the first batch, later batches come via `RegisterBatch`.
-- Batches are 16 cheques (aligned powers of two, at most 16), each with its own proof of work.
+- Batches are exactly 16 cheques, aligned, each with its own proof of work.
 - `m = 1`, as in the standard book: the machine holding the seed is
   trusted, the ordinary hot-wallet position.
 - The command-line wallet (`bitcheque wallet`) drives one book from one
@@ -237,6 +252,17 @@ simply drives a cheque book.
   ≈ 740 KB of node state while unspent.
 - 1 MB block ≈ 1,100 cheques a minute ≈ 18 cheques/s.
 - Light clients: headers + `state_root` proofs for balance, nonce, number.
+- In memory a registered cheque's 180 commitments are one flat 2,880-byte blob shared between state copies
+  (≈ 3.1 KB per cheque all told); snapshots write them as raw blobs. Accounts are shared between the
+  per-block state copies (copy on write) and each caches its leaf hash, so a block copies one pointer per
+  account and rehashes only the accounts it changed (100,000 accounts × 16 cheques: copy ≈ 50 ms, root
+  ≈ 80 ms, against ≈ 350 ms and ≈ 930 ms before). Expiries of open cheques and batches are kept in an
+  index by height, so `begin_block` touches only what is due.
+- State root: `SHA256(merkle(account leaves in id order) || rest)`. An account leaf hashes its record and
+  the height its number was assigned (which fixes its entries in `numbers` and the unfunded-expiry list, so
+  those are not hashed again); `rest` hashes the height, the next new number, the free-number queue, pending
+  rewards, deleted accounts' nonces, the registration target and this block's registration count. The last
+  144 block hashes (registration anchors) are state too, but follow from the header chain and are not hashed.
 
 ## 7. Network layer (non-consensus)
 
@@ -281,10 +307,13 @@ every 10 s when the mempool has changed.
    SHA-256 tries over the txid, using a midstate so each try costs a few
    blocks), a minute or two in a browser running the WebAssembly wallet on
    all cores; per-call JavaScript is far too slow, so wallets use WASM or
-   native code. The target adjusts every 1,440 blocks (a day) toward one
-   registration a block on average (the cap is 16 per block, §2.2): four
-   times the demand or more makes the work four times harder, a window with
-   no registrations four times easier, never easier than the initial target.
+   native code. The target adjusts every block toward one registration a
+   block on average (the cap is 16 per block, §2.2): a block with k
+   registrations multiplies it by (W+1)/(W+k), W = 1,440 (a day). A block at
+   the cap makes registering about 1% harder (twice as hard in ~70 blocks,
+   4.5 times in 144), so a burst hardens within hours; an empty block makes it
+   0.07% easier (about e times easier per quiet day); never easier than the
+   initial target.
    Open: whether the level is right with real demand.
 3. **`FEE_UNIT`** adjustment rule and whether tiers scale with a
    fee-market signal.
@@ -386,7 +415,8 @@ The website's cheque page: enter the recipient, amount and fee tier; the
 lit box in each column is the one to copy or scan. Each box takes its 12
 words (grey autocomplete suggestion, four letters complete a word) or its
 QR code; "Scan cheque" scans every box in one camera session. Verify checks
-all 18 cells against the chain, "In plain words" reads the cheque back, and
+all 18 cells against the chain (`GET /commits/<id>/<cheque>` gives the cheque's 180 commitments, so the
+page checks each cell locally before revealing any), "In plain words" reads the cheque back, and
 a pop-up warns if the recipient number is unknown or not yet final; then
 the 18 pieces are sent.
 
@@ -400,9 +430,9 @@ On-chain structure. The book's public hash lists are registered on chain
 when the account is created, so a cheque carries only the revealed secrets:
 
 ```
-RegisterBook   { salt, m, n256, book_size, root, first batch, PoW nonce }   once, PoW only
+RegisterBook   { salt, m, n256, book_size, root, first batch, PoW anchor + nonce }   once, PoW only
 RegisterBatch  { account, batch: start, count, per cheque all share hashes,
-                 Merkle path from the batch subtree to the root, PoW nonce }  ≈ 3.6 KB × m per cheque,
+                 Merkle path from the batch subtree to the root, PoW anchor + nonce }  ≈ 3.6 KB × m per cheque,
                                                                          PoW only
 ChequePiece × 18 {
   account     scheme 0x03 | m<<4 | n256<<7, root
@@ -438,7 +468,8 @@ confirms.
 ### 10.4 Sequential account numbers
 
 Every account receives a number at its `RegisterBook`, in block and
-transaction order: the oldest number out of quarantine if one is free,
+transaction order: the oldest number out of quarantine if one is free (freed
+numbers queue in release order),
 otherwise the next value of a global counter (starting at 1). The mapping
 `number → AccountId` is node state and is committed under `state_root`.
 
@@ -661,8 +692,9 @@ advance. Consensus does not implement it.
   offline computer saves them, with the lookup code, as a public
   registration file (never the seed), then the print files are deleted and
   the machines switched off. The file is opened on the website on any
-  online computer, which mines the proof of work on all cores (Rust
-  compiled to WebAssembly) and sends the registration and cheque 0. The
+  online computer, which takes the node's tip as the registration's anchor,
+  mines the proof of work on all cores (Rust compiled to WebAssembly) and
+  sends the registration and cheque 0 (the work is good for 144 blocks). The
   number is not shown until final (100 blocks); the lookup code finds it
   (§10.4), and the honesty check is confirmed from the chain.
 - One 24-word seed (from the computer's randomness, or made entirely from
@@ -781,11 +813,12 @@ is unspendable, as in Bitcoin.
 | Proof-of-work | SHA-256d over the 112-byte header | AuxPoW (merge-mining) not implemented, §8 item 1 |
 | Header | version 4 B, prev 32 B, tx root 32 B, state root 32 B, time 4 B, bits 4 B, nonce 4 B | 112 B |
 | Block limit | 1,000,000 bytes (encoded block) | §6 |
-| Registration PoW | target 2^228 initially, adjusting every 1,440 blocks; at most 16 PoW registrations per block | §8 item 2 |
+| Registration PoW | target 2^228 initially, adjusting every block (time constant 1,440 blocks); anchored to one of the last 144 block hashes; at most 16 PoW registrations per block | §8 item 2 |
+| Funding | an account becomes permanent once it holds 1 coin (`min_fund`) after a cheque, or is mined to | §2.2 |
 | Unfunded PoW account | deleted after 43,200 blocks (~30 days); number quarantined 525,600 blocks (~a year) | §2.2 |
 | Batch lifetime | 2,100,000 blocks (~4 years); `Renew` costs 10,000 base units, `RegisterBatch` the registration proof of work | §10.11 |
 | Piece lifetime | 10,000 blocks (~a week) | §10.12 |
-| Book size | exactly 256 cheques; batches ≤ 16, aligned powers of two, each paid by proof of work | §2.2, §10.10; a 16-cheque batch (≈ 58 KB) fits any block |
+| Book size | exactly 256 cheques; every batch exactly 16, aligned, the first (`RegisterBook`) at cheque 0, each paid by proof of work | §2.2, §10.10; a 16-cheque batch (≈ 58 KB) fits any block |
 | `FEE_UNIT` | 1,000 base units (0.00001 coin) initially | adjustment rule: §8 item 3 |
 | Account number 0 | reserved: nobody; coins and fee of a cheque to it go to the block's miner | §2.2 |
 | Account maturity | 100 blocks before a number can receive a cheque | §10.4 |
@@ -814,9 +847,8 @@ The first blocks have no accounts, so three rules make block 1 possible:
   miner falls back to 0 until its configured number is final.)
 - A coinbase may name number 0, which burns the reward. The genesis
   coinbase does.
-- Registration PoW in the first 1,440 blocks uses the fixed 2^228 target
-  before the first adjustment, so early registrations cannot be priced out
-  by a single burst.
+- Registration PoW starts at the fixed 2^228 target and never gets easier;
+  a burst at the cap hardens it about 1% a block, quiet blocks ease it back.
 
 Blocks must be timestamped after the median of the previous 11, so nobody
 can mine before the genesis timestamp (the published launch time), and the

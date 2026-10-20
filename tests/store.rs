@@ -1,6 +1,6 @@
 //! Reorg to the heavier branch, persistence across restart, account proofs, and the RPC.
 mod common;
-use common::mine;
+use common::{mine, tip};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use bitcheque::block::Chain;
@@ -14,7 +14,7 @@ use bitcheque::u256::U256;
 use bitcheque::wallet::{mine_registration, Book, Domain};
 
 fn params() -> Params { Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, reg_pow_target: U256::MAX.shr(4), launch_blocks: 0, reward_maturity: 1, number_maturity: 1, ..Params::mainnet() } }
-fn miner() -> Book { Book { salt: [1; 16], n256: false, book_size: 256, domains: vec![Domain([7; 32])] } }
+fn miner() -> Book { Book { salt: [1; 16], n256: false, book_size: 256, domains: vec![Domain([7; 32])], net: Params::mainnet().magic } }
 
 #[test]
 fn reorg_and_persist() {
@@ -25,7 +25,7 @@ fn reorg_and_persist() {
 
     // branch A: 2 blocks with a registration; branch B: 3 blocks, no txs
     let a = Node::new(Store::open(p.clone(), &g, Some(&path)).unwrap());
-    a.submit_tx(mine_registration(miner().register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
+    a.submit_tx(mine_registration(miner().register(0, 16, Payment::Pow([0; 32], 0)), tip(&a), p.reg_pow_target), None).unwrap();
     mine(&a, 0).unwrap();   // number 1 is final from the next block (number_maturity 1)
     mine(&a, 1).unwrap();
     let mut b = Store::open(p.clone(), &g, None).unwrap();
@@ -65,7 +65,7 @@ fn proof_and_rpc() {
     let g = Chain::genesis(&p, now() - 100_000, b"rpc test");
     let n = Node::new(Store::open(p.clone(), &g, None).unwrap());
     let m = miner();
-    n.submit_tx(mine_registration(m.register(0, 16, Payment::Pow(0)), p.reg_pow_target), None).unwrap();
+    n.submit_tx(mine_registration(m.register(0, 16, Payment::Pow([0; 32], 0)), tip(&n), p.reg_pow_target), None).unwrap();
     mine(&n, 0).unwrap();   // number 1 assigned; final from the next block
     mine(&n, 1).unwrap();
     mine(&n, 1).unwrap();   // the height-2 reward credited
@@ -122,7 +122,7 @@ fn snapshot_restart_and_reorg() {
     let mut blk = |maker: &mut Chain, txs: Vec<bitcheque::tx::Tx>| { let b = maker.make_block(maker.headers.last().unwrap().time + 600, 1, txs).unwrap(); maker.add(&b, now()).unwrap(); b };
     {
         let mut st = Store::open(p.clone(), &g, Some(&path)).unwrap();
-        let reg = mine_registration(miner().register(0, 16, Payment::Pow(0)), p.reg_pow_target);
+        let reg = mine_registration(miner().register(0, 16, Payment::Pow([0; 32], 0)), maker.tip(), p.reg_pow_target);
         let b1 = { let b = maker.make_block(t0 + 600, 0, vec![reg]).unwrap(); maker.add(&b, now()).unwrap(); b };
         st.accept(&b1, now()).unwrap();
         for _ in 1..n { let b = blk(&mut maker, vec![]); st.accept(&b, now()).unwrap(); }
@@ -176,7 +176,7 @@ fn host_store_restore_and_reorg() {
     let mut maker = Chain::new(p.clone(), &g).unwrap();
     let blk = |maker: &mut Chain| { let b = maker.make_block(maker.headers.last().unwrap().time + 600, 1, vec![]).unwrap(); maker.add(&b, now()).unwrap(); b };
     let mut st = Store::open_host(p.clone(), &g, host_io(), None, &[], 100, host_snap).unwrap();
-    let reg = mine_registration(miner().register(0, 16, Payment::Pow(0)), p.reg_pow_target);
+    let reg = mine_registration(miner().register(0, 16, Payment::Pow([0; 32], 0)), maker.tip(), p.reg_pow_target);
     let b1 = maker.make_block(t0 + 600, 0, vec![reg]).unwrap(); maker.add(&b1, now()).unwrap(); st.accept(&b1, now()).unwrap();
     for _ in 1..251 { let b = blk(&mut maker); st.accept(&b, now()).unwrap(); }
     assert_eq!(st.chain.height(), 251);

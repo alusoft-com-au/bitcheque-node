@@ -46,6 +46,7 @@ impl Block {
         let mut r = R::new(b); r.i = 112;
         let n = r.u32()?; let mut txs = Vec::new();
         for _ in 0..n { let e = r.bytes()?; txs.push(Tx::decode(&mut R::new(&e))?); }
+        if r.i != b.len() { return Err("trailing bytes"); }   // one block, one encoding
         Ok(Block { header, txs })
     }
 }
@@ -245,7 +246,8 @@ impl Chain {
     }
     pub fn new(p: Params, genesis: &Block) -> Result<Chain, &'static str> {
         if !genesis.header.meets_target() || genesis.header.bits != p.initial_bits { return Err("bad genesis"); }
-        let state = State::new(&p);
+        let mut state = State::new(&p);
+        state.push_hash(&p, genesis.header.hash());
         Ok(Chain { params: p, blocks: Blocks::Mem(vec![genesis.clone()]), headers: vec![genesis.header.clone()], hashes: vec![genesis.header.hash()], state, history: HashMap::new(), totals: Totals::default(), base: 0, keep: None })
     }
     pub fn height(&self) -> u32 { self.base + self.headers.len() as u32 - 1 }
@@ -311,6 +313,7 @@ impl Chain {
             }
         }
         self.state = s;
+        self.state.push_hash(&self.params, b.header.hash());   // a registration anchor for the next reg_anchor_window blocks
         self.blocks.push(b, loc);
         self.push_header(b.header.clone());
         Ok(())

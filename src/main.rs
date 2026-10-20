@@ -49,7 +49,7 @@ fn main() {
             loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
         }
         Some("mine") => if let Err(e) = mine(&opt) { eprintln!("error: {e}"); std::process::exit(1) },
-        Some("wallet") => if let Err(e) = wallet(&args, &opt) { eprintln!("error: {e}"); std::process::exit(1) },
+        Some("wallet") => if let Err(e) = wallet(&args, &opt, p.magic) { eprintln!("error: {e}"); std::process::exit(1) },
         _ => eprintln!("usage: bitcheque genesis [--mainnet|--local] | bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR] [--upstream HOST:PORT] [--no-upstream]\n       bitcheque mine --rpc ADDR --to NUMBER [--threads N]\n       bitcheque wallet new | info|register|more|send|sweep --seed-file FILE --rpc ADDR [--cheques N] [--to NUMBER --amount COINS [--fee TIER]]"),
     }
 }
@@ -58,7 +58,7 @@ fn main() {
 /// `register` registers the first cheques (16 by default, `--cheques` for more), `more` the next ones, 16 per proof of work.
 /// The book salt is derived from the seed, so the seed alone recreates the book. Talks to a node's RPC; keeps one
 /// small file per book (~/.config/bitcheque/used-<id>: the last cheque number it signed), so a number is never used twice.
-fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
+fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>, net: [u8; 4]) -> Result<(), String> {
     let cmd = args.get(2).map(String::as_str).unwrap_or("");
     if cmd == "new" {
         let mut seed = [0u8; 32];
@@ -80,7 +80,7 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
     let size = BOOK_SIZE;
     let cheques: u32 = opt("--cheques").map_or(Ok(BATCH), |v| v.parse()).map_err(|_| "bad --cheques")?;
     if !(1..=size).contains(&cheques) { return Err(format!("--cheques must be 1 to {size}")); }
-    let book = Book { salt, n256: false, book_size: size, domains: vec![Domain(seed)] };
+    let book = Book { salt, n256: false, book_size: size, domains: vec![Domain(seed)], net };
     let id = hex(&book.id());
     let account = || -> Result<Vec<(String, String)>, String> {
         Ok(http(&rpc, "GET", &format!("/id/{id}"), "")?.lines().filter_map(|l| l.split_once(' ').map(|(k, v)| (clean(k), clean(v)))).collect())
@@ -117,8 +117,10 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
             let target = U256(limbs.try_into().map_err(|_| "bad regtarget")?);
             // a node can only make registration harder, never impossible: a target this low would never be met
             if target < U256::one_shl(192) { return Err("the node's registration target is implausibly hard: try another node".into()); }
+            // the proof of work names the node's tip, so it is valid for the next reg_anchor_window blocks only
+            let anchor: [u8; 32] = unhex(&http(&rpc, "GET", "/tip", "")?).and_then(|v| v.try_into().ok()).ok_or("bad tip")?;
             let regs = book.registrations(first, first + cheques - 1);
-            let mut txs: Vec<_> = regs.iter().map(|reg| mine_registration(reg.clone(), target)).collect(); // each batch of 16 pays its own proof of work
+            let mut txs: Vec<_> = regs.iter().map(|reg| mine_registration(reg.clone(), anchor, target)).collect(); // each batch of 16 pays its own proof of work
             if cmd == "register" { txs.extend(book.sign(0, &Message::new(0, 0, 0, 0))); } // honesty check: cheque 0, zero coins, to nobody
             post_all(&txs)?;
             let last = ((first / BATCH + regs.len() as u32) * BATCH).min(size) - 1;
