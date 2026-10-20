@@ -9,8 +9,10 @@
 // CHAIN_VERSION wipes every region's database once, on its next wake: a network reset. Peers prove themselves to each
 // other with the secret EDGE_SECRET (wrangler secret) in X-Edge-Peer and name their chain version in X-Edge-Chain (a
 // peer on another one, such as an old node after a reset, is neither pulled from nor pushed to); without the secret
-// nobody is a peer. The public's requests are rate limited (RL, and RL_HEAVY too for /check, /tx and /template; a
-// registration in a /tx counts once more for each), and all of a region's together (RL_REGION, keyed by the region).
+// nobody is a peer. The public's requests are rate limited per address (RL; RL_HEAVY too for /check, /tx and /template,
+// where a registration in a /tx counts once more), and all of a region's together (RL_REGION, keyed by the region), in
+// two tiers: each address's first RL_FAIR requests a minute draw on a pool of their own (see `limited`). Posts (/tx,
+// /block, /check) have budgets of their own, so a flood of reads never starves them.
 import { DurableObject } from 'cloudflare:workers';
 import WASM from './bitcheque_edge.wasm';
 
@@ -32,12 +34,12 @@ const FALLBACK_S = 120;          // each further region in MINE_REGIONS waits th
 const RERELAY_MAX = 50;          // waiting transactions offered again to each other region per wake
 const RERELAY_TIMES = 2;         // ...each only if the public sent it here, after it waited a wake, and at most this often
 const POOL_MAX = 1000;           // waiting transactions kept in the database across unloads (all offered again on load)
-const POOL_BYTES = 16 << 20;     // ...and at most this many bytes of them (the oldest go first)
+const POOL_BYTES = 16 << 20;     // ...and at most this many bytes of them (past either, the newest rows of whoever holds most go)
 const BODY_MAX = 4 << 20;        // request body bytes (16 registrations of 16 cheques and a cheque are under 2 MB of hex)
 const ROW_MAX = 1_900_000;       // a SQLite row holds at most 2 MB: a bigger pool batch is kept a line per row
 const PEER_MS = 10_000;          // a peer that has not answered by then is given up on
 const BUSY_MS = 30_000;          // ...and left alone this long (it may only be busy)
-const DOWN_MS = 180_000;         // one on another chain version is left alone this long
+const DOWN_MS = 180_000;         // one on another chain version (it said so: its X-Edge-Chain, or a 409) is left alone this long
 const SKIP_MS = 600_000;         // an upstream that sent a refused block, or nothing that moved the chain, is not pulled from this long
 const START_TRIES = 5;           // starts again after a stored block or waiting transaction trapped the node (it is dropped)
 const FRESH = new Set(['height', 'tip', 'template']);   // miners and the status page need these nearly fresh
@@ -50,7 +52,11 @@ const GETS = new RegExp(`^/(?:height|peers|addrs|tip|regtarget|stats|mempool|edg
 const POSTS = /^\/(?:tx|check|block)$/;
 const HEAVY = /^\/(?:check$|tx$|template\/)/;   // the public's costlier requests: RL_HEAVY's lower limit applies too
 const TOP_MAX = 200;             // the most accounts /top/N lists (rpc.rs)
-const TX_REGS = 16;              // registrations in one of the public's /tx (a whole book: 16 batches of 16, sent with cheque 0)
+const TX_REGS = 16;              // registrations taken from one of the public's /tx (a whole book: 16 batches of 16, sent with
+                                 // cheque 0); the rest of its registrations are answered 429, to be sent again
+const STATE_MAX = 40 << 20;      // past this many bytes of serialized state (the last snapshot, plus registrations taken since)
+const MEM_MAX = 88 << 20;        // ...or of wasm memory, no new registration is taken (503 "edge full"): a Durable Object has
+                                 // 128 MB in all, and a snapshot is serialized beside the live state (so ~2x it at the peak)
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
 // every reply: plain text, never sniffed as anything else, loading nothing; and the chain version this node is on
 const HDRS = { ...CORS, 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'", 'X-Edge-Chain': CHAIN_VERSION };
@@ -69,13 +75,31 @@ async function readBody(req, max = BODY_MAX) {
   const all = new Uint8Array(n); let o = 0; for (const p of parts) { all.set(p, o); o += p.length; }
   return dec.decode(all);
 }
-// the rate-limit key: an IPv4 address, or the /48 of an IPv6 one (one machine has a whole /64, and anyone can get a /48)
-const limitKey = ip => { if (!ip.includes(':')) return ip; const [a, b = ''] = ip.split('::'); const l = a ? a.split(':') : [], r = b ? b.split(':') : [];
-  return [...l, ...Array(8 - l.length - r.length).fill('0'), ...r].slice(0, 3).join(':') + '::/48'; };
+// the rate-limit key: an IPv4 address, or the /48 of an IPv6 one (one machine has a whole /64, and anyone can get a /48),
+// spelt one way only: lowercase, :: expanded, each group four digits (2001:DB8::1, 2001:db8:0:0::1 and 2001:0db8::1 are
+// one key). An IPv4-mapped address (::ffff:1.2.3.4, or in hex) is that IPv4 address. Anything unparsable is its own key.
+const limitKey = ip => {
+  ip = ip.trim().toLowerCase().replace(/%.*$/, '');   // a zone id (fe80::1%eth0) is no part of the address
+  if (!ip.includes(':')) return ip;
+  const v4 = ip.match(/^(.*:)(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);   // a dotted tail is the last two groups
+  if (v4) ip = v4[1] + ((v4[2] << 8 | v4[3]) & 0xffff).toString(16) + ':' + ((v4[4] << 8 | v4[5]) & 0xffff).toString(16);
+  const halves = ip.split('::'); if (halves.length > 2) return ip;
+  const l = halves[0] ? halves[0].split(':') : [], r = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const g = [...l, ...Array(Math.max(0, 8 - l.length - r.length)).fill('0'), ...r].map(x => x.padStart(4, '0'));
+  if (g.length !== 8 || (halves.length === 1 && l.length !== 8) || !g.every(x => /^[0-9a-f]{4}$/.test(x))) return ip;
+  if (g.slice(0, 5).every(x => x === '0000') && g[5] === 'ffff') return [g[6].slice(0, 2), g[6].slice(2), g[7].slice(0, 2), g[7].slice(2)].map(x => parseInt(x, 16)).join('.');
+  return g.slice(0, 3).join(':') + '::/48';
+};
 const text = (body, status = 200, extra = {}) => new Response(body, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8', ...HDRS, ...extra } });
 const unhex = s => { s = s.trim(); if (!/^([0-9a-f]{2})*$/i.test(s)) return null; const b = new Uint8Array(s.length / 2); for (let i = 0; i < b.length; i++) b[i] = parseInt(s.substr(2 * i, 2), 16); return b; };
-const tips = {};   // region -> the height its Durable Object last told this isolate (X-Edge-Height), and when
 const hashOf = s => s.match(/^hash ([0-9a-f]+)$/m)?.[1];
+const linesOf = s => s.split('\n').map(l => l.trim()).filter(Boolean);   // a /tx body's transactions, as the RPC reads them
+const isReg = l => /^0[12]/.test(l);   // a registration (its tag, 1 or 2, is its first byte)
+// the answer to all of a /tx body's lines when only `kept` (their indices) went to the node, which answered `reply` (one
+// line each, or for one line alone its single answer); the rest are answered `why`
+const merge = (all, kept, reply, why) => { const rs = kept.length === 1 ? [reply.trim()] : reply.trim().split('\n'), m = new Map(kept.map((i, k) => [i, rs[k] ?? '']));
+  return all.map((_, i) => m.has(i) ? m.get(i) : why).join('\n'); };
+const FULL = 'edge full: this node takes no new registrations for now (its state is at its limit); try another node, or again later';
 
 export class EdgeNode extends DurableObject {
   constructor(ctx, env) {
@@ -85,11 +109,12 @@ export class EdgeNode extends DurableObject {
                    CREATE TABLE IF NOT EXISTS hdr (chunk INTEGER PRIMARY KEY, data BLOB NOT NULL);
                    CREATE TABLE IF NOT EXISTS snap (part INTEGER PRIMARY KEY, data BLOB NOT NULL);
                    CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
-                   CREATE TABLE IF NOT EXISTS pool (id INTEGER PRIMARY KEY AUTOINCREMENT, tx TEXT NOT NULL UNIQUE, own INTEGER NOT NULL DEFAULT 0, age INTEGER NOT NULL DEFAULT 0)`);
-    // older layouts: pool rows without their origin (own: from the public) and wakes waited (age); headers 1000 to a row
-    // in `headers` (split into rows of HDR_CHUNK in `hdr`)
+                   CREATE TABLE IF NOT EXISTS pool (id INTEGER PRIMARY KEY AUTOINCREMENT, tx TEXT NOT NULL UNIQUE, own INTEGER NOT NULL DEFAULT 0, age INTEGER NOT NULL DEFAULT 0, src TEXT NOT NULL DEFAULT '')`);
+    // older layouts: pool rows without their origin (own: from the public), wakes waited (age) or sender (src: the address's
+    // limitKey, carried along by the peers that pass it on); headers 1000 to a row in `headers` (split into rows of HDR_CHUNK in `hdr`)
     const cols = this.sql.exec("SELECT name FROM pragma_table_info('pool')").toArray().map(r => r.name);
     for (const c of ['own', 'age']) if (!cols.includes(c)) this.sql.exec(`ALTER TABLE pool ADD COLUMN ${c} INTEGER NOT NULL DEFAULT 0`);
+    if (!cols.includes('src')) this.sql.exec("ALTER TABLE pool ADD COLUMN src TEXT NOT NULL DEFAULT ''");
     if (this.sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'headers'").toArray().length) {
       for (const r of this.sql.exec('SELECT chunk, data FROM headers').toArray()) { const d = new Uint8Array(r.data), n = HDR_CHUNK * 112;
         for (let i = 0; i * n < d.length; i++) this.sql.exec('INSERT OR REPLACE INTO hdr VALUES (?, ?)', r.chunk * (1000 / HDR_CHUNK) + i, d.subarray(i * n, (i + 1) * n)); }
@@ -100,6 +125,7 @@ export class EdgeNode extends DurableObject {
     this.pushed = 0;                    // when a block sent here last moved the chain
     this.pool = null;                   // the pool's rows and bytes, at most (poolTrim)
     this.from = null;                   // a peer that pushed a block on a branch we do not have: the next wake pulls from it first
+    this.state = 0;                     // bytes of serialized state: the last snapshot's, plus registrations taken since (full)
     if (this.meta('chain_version') !== CHAIN_VERSION) {   // a network reset: start again from block 0
       this.sql.exec('DELETE FROM blocks; DELETE FROM hdr; DELETE FROM snap; DELETE FROM pool');
       this.sql.exec('DELETE FROM meta WHERE k != ?', 'region');   // keep the region: an alarm may wake it before any request
@@ -124,29 +150,32 @@ export class EdgeNode extends DurableObject {
     this.ready = false;
     // the callbacks use their own instance (x), not this.x: that may be a newer one by the time they run
     let x;
-    const bytes = (p, n) => new Uint8Array(x.memory.buffer, p, n).slice();
+    const bytes = (p, n) => new Uint8Array(x.memory.buffer, p, n).slice(), view = (p, n) => new Uint8Array(x.memory.buffer, p, n);
     const env = {
       host_get: h => { const r = this.sql.exec('SELECT data FROM blocks WHERE h = ?', h).toArray()[0]; if (!r) return 0;
                        const b = new Uint8Array(r.data), p = x.buf_reserve(b.length); new Uint8Array(x.memory.buffer, p, b.length).set(b); return b.length; },
       // a replayed block is stored already: nothing to write
       host_put: (h, p, n) => { if (this.replaying) return; const b = bytes(p, n); this.sql.exec('INSERT OR REPLACE INTO blocks VALUES (?, ?)', h, b); this.header(h, b.subarray(0, 112)); },
       // nor while replaying: the snapshot was taken when the block first came (if that was lost, the next one is at
-      // most SNAP_EVERY blocks on, and a cold start replays from the one before)
-      host_snap: (p, n) => { if (this.replaying) return; const b = bytes(p, n); this.sql.exec('DELETE FROM snap');
-                             for (let i = 0; i * PART < b.length; i++) this.sql.exec('INSERT INTO snap VALUES (?, ?)', i, b.subarray(i * PART, (i + 1) * PART)); },
+      // most SNAP_EVERY blocks on, and a cold start replays from the one before). Stored straight from wasm memory, a
+      // part at a time (no copy of the whole: it may be tens of MB, beside the state it was serialized from)
+      host_snap: (p, n) => { this.state = n; if (this.replaying) return; this.sql.exec('DELETE FROM snap');
+                             for (let i = 0; i * PART < n; i++) this.sql.exec('INSERT INTO snap VALUES (?, ?)', i, view(p + i * PART, Math.min(PART, n - i * PART))); },
     };
     x = this.x = (await WebAssembly.instantiate(WASM, { env })).exports;
     let at = null;   // the stored block ({ h }) or pool row ({ id }) being fed in
     try {
     this.now();
-    // restore: the snapshot, the headers up to it, then every stored block above it
-    const parts = this.sql.exec('SELECT data FROM snap ORDER BY part').toArray().map(r => new Uint8Array(r.data));
-    const snap = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)); parts.reduce((o, p) => (snap.set(p, o), o + p.length), 0);
-    const sh = snap.length >= 8 ? new DataView(snap.buffer).getUint32(4, true) : 0;
+    // restore: the snapshot, the headers up to it, then every stored block above it. The snapshot goes straight into the
+    // node's input buffer a row at a time (not gathered in JavaScript first: that was three more copies of it)
+    const sn = this.sql.exec('SELECT COALESCE(SUM(length(data)), 0) AS n FROM snap').toArray()[0].n;
+    const top = sn >= 8 ? new Uint8Array(this.sql.exec('SELECT substr(data, 1, 8) AS d FROM snap WHERE part = 0').toArray()[0]?.d ?? new ArrayBuffer(0)) : null;
+    const sh = top?.length === 8 ? new DataView(top.buffer, top.byteOffset).getUint32(4, true) : 0;
     const hdr = this.headers(sh, HDR_KEEP);
-    const io = new Uint8Array(4 + snap.length + hdr.length);
-    new DataView(io.buffer).setUint32(0, snap.length, true); io.set(snap, 4); io.set(hdr, 4 + snap.length);
-    this.put(io);
+    const io = x.io_reserve(4 + sn + hdr.length), mem = new Uint8Array(x.memory.buffer);   // after the reserve: it may grow memory
+    new DataView(x.memory.buffer).setUint32(io, sn, true);
+    let o = io + 4; for (const r of this.sql.exec('SELECT data FROM snap ORDER BY part')) { const d = new Uint8Array(r.data); mem.set(d, o); o += d.length; }
+    mem.set(hdr, io + 4 + sn); this.state = sn;
     if (!x.open(+(this.env.NET ?? 0), SNAP_EVERY)) throw new Error('edge node failed to start');
     this.replaying = true;
     for (const r of this.sql.exec('SELECT h, data FROM blocks WHERE h > ? ORDER BY h', x.height())) { at = { h: r.h }; this.put(new Uint8Array(r.data)); this.now(); if (x.add_block() !== 1) break; }
@@ -160,6 +189,7 @@ export class EdgeNode extends DurableObject {
     for (const r of this.sql.exec('SELECT id, tx FROM pool ORDER BY id')) {   // a row at a time, not all of them at once
       at = { id: r.id };
       const [code, why] = this.rpc('POST', '/tx', r.tx);
+      for (const l of linesOf(r.tx)) if (isReg(l)) this.state += l.length / 2;
       const live = why.trim().split('\n').some(x => x === 'ok' || x === 'already in mempool');
       if (!(code === 200 && live) && why.trim() !== 'already in mempool') this.sql.exec('DELETE FROM pool WHERE id = ?', r.id);
     }
@@ -200,15 +230,26 @@ export class EdgeNode extends DurableObject {
     this.sql.exec('DELETE FROM blocks WHERE h > ?', h);
     this.sql.exec('DELETE FROM hdr WHERE chunk > ?', Math.floor((h - 1) / HDR_CHUNK));
   }
-  // the pool within POOL_MAX rows and POOL_BYTES bytes, the oldest dropped first. this.pool is an upper bound on its size
-  // (inserts add to it, deletes do not take away; null: not counted yet): only past a limit are the rows counted again
+  // the pool within POOL_MAX rows and POOL_BYTES bytes. Past either, rows go from the sender (src) holding the largest
+  // share of them (of rows or of bytes, whichever is the larger fraction of its limit), its newest first: a flood of cheap
+  // valid transactions pushes out only its own, not everyone else's older ones (nor what the flood's own early rows
+  // depend on). this.pool is an upper bound on its size (inserts add to it, deletes do not take away; null: not counted
+  // yet): only past a limit are the rows counted again
   poolTrim() {
     if (this.pool && this.pool.n <= POOL_MAX && this.pool.bytes <= POOL_BYTES) return;
-    let n = 0, bytes = 0, cut = 0;
-    for (const r of this.sql.exec('SELECT id, length(tx) AS len FROM pool ORDER BY id DESC')) { if (n >= POOL_MAX || bytes + r.len > POOL_BYTES) { cut = r.id; break; } n++; bytes += r.len; }
-    if (cut) this.sql.exec('DELETE FROM pool WHERE id <= ?', cut);
+    let n = 0, bytes = 0; const by = new Map(), cut = [];   // src -> { n, bytes, rows: [[id, len]] oldest first }
+    for (const r of this.sql.exec('SELECT id, src, length(tx) AS len FROM pool ORDER BY id')) {
+      const s = by.get(r.src) || by.set(r.src, { n: 0, bytes: 0, rows: [] }).get(r.src); s.n++; s.bytes += r.len; s.rows.push([r.id, r.len]); n++; bytes += r.len; }
+    const share = s => Math.max(s.n / POOL_MAX, s.bytes / POOL_BYTES);
+    while (n > POOL_MAX || bytes > POOL_BYTES) {
+      let top = null; for (const s of by.values()) if (s.n && (!top || share(s) > share(top))) top = s;
+      const [id, len] = top.rows.pop(); top.n--; top.bytes -= len; n--; bytes -= len; cut.push(id);
+    }
+    for (let i = 0; i < cut.length; i += 100) { const ids = cut.slice(i, i + 100); this.sql.exec(`DELETE FROM pool WHERE id IN (${ids.map(() => '?').join(',')})`, ...ids); }
     this.pool = { n, bytes };
   }
+  // no new registration is taken past STATE_MAX bytes of state or MEM_MAX of wasm memory (blocks still are: that is consensus)
+  full() { return this.state > STATE_MAX || !!this.x && this.x.memory.buffer.byteLength > MEM_MAX; }
   add(b) { return this.guard(() => { this.put(b); this.now(); const r = this.x.add_block(); return r ? { r } : { r, why: this.out(this.x.io_len()) }; }); }
   rpc(method, path, body = '') { return this.guard(() => { this.put(enc.encode(`${method} ${path}\n${body}`)); this.now(); const s = this.out(this.x.rpc()); const i = s.indexOf('\n'); return [+s.slice(0, i), s.slice(i + 1)]; }); }
 
@@ -220,22 +261,26 @@ export class EdgeNode extends DurableObject {
   leave(up, ms) { this.down[up] = Date.now() + ms; this.meta('down', JSON.stringify(this.down)); }
   // a peer in this Worker ("do:eu", made in its own region if this call creates it), or another node's RPC ("https://host"),
   // reached through the service binding SERVICES names for its host (a Worker may not fetch another on its own zone).
-  // X-Edge-Peer tells it not to pass this on, X-Edge-From who sent it; a reply without our X-Edge-Chain is from another
-  // chain. One that fails or times out (it may only be busy) is left alone for BUSY_MS; one on another chain for DOWN_MS.
+  // X-Edge-Peer tells it not to pass this on, X-Edge-From who sent it (and X-Edge-Src, extra, whose transactions they
+  // are). A peer on another chain says so (an X-Edge-Chain not ours, or a 409): left alone for DOWN_MS. Anything else that
+  // fails is left alone for BUSY_MS: a timeout, a network error, or a reply with no X-Edge-Chain at all (a 5xx from Cloudflare
+  // or the service binding is no node's answer: it may only be busy, and a pull a moment later should not be blocked).
   // With no binding for its host (and not on this machine) it is not called: the secret never crosses the public internet.
-  async call(up, path, init) {
+  async call(up, path, init, extra = {}) {
     if (!secret(this.env)) throw new Error('no EDGE_SECRET');
     if ((this.down[up] || 0) > Date.now()) throw new Error('left alone for now');
     const via = up.startsWith('do:') ? null : this.env[JSON.parse(this.env.SERVICES || '{}')[new URL(up).host]] || this.env.UPSTREAM_SVC
       || (/^http:\/\/(?:localhost|127\.0\.0\.1)[:/]/.test(up + '/') ? globalThis : null);   // wrangler dev with a local devnet node
     if (!up.startsWith('do:') && !via) throw new Error(`${up}: no service binding`);
-    const peer = { ...init, headers: { 'X-Edge-Peer': this.env.EDGE_SECRET, 'X-Edge-Chain': CHAIN_VERSION, 'X-Edge-From': this.meta('region') || '' } };
+    const peer = { ...init, headers: { ...extra, 'X-Edge-Peer': this.env.EDGE_SECRET, 'X-Edge-Chain': CHAIN_VERSION, 'X-Edge-From': this.meta('region') || '' } };
     let r, t, ms = BUSY_MS;
     try {
       if (up.startsWith('do:')) { const g = up.slice(3);
         r = await timeout(this.env.NODE.get(this.env.NODE.idFromName(g), { locationHint: regions(this.env)[g] }).fetch(`https://edge${path}?region=${g}`, peer), PEER_MS); }
       else r = await via.fetch(up.replace(/\/$/, '') + path, { ...peer, signal: AbortSignal.timeout(PEER_MS) });
-      if (r.headers.get('X-Edge-Chain') !== CHAIN_VERSION) { ms = DOWN_MS; throw new Error(`${up}: chain version ${r.headers.get('X-Edge-Chain')}`); }
+      const chain = r.headers.get('X-Edge-Chain');
+      if (r.status === 409 || chain !== null && chain !== CHAIN_VERSION) { ms = DOWN_MS; throw new Error(`${up}: chain version ${chain} (${r.status})`); }
+      if (chain === null) throw new Error(`${up}${path}: ${r.status}, not a node's reply`);
       t = await timeout(r.text(), PEER_MS);
     } catch (e) { this.leave(up, ms); throw e; }
     if (!r.ok) throw new Error(`${up}${path}: ${r.status}`);
@@ -331,7 +376,7 @@ export class EdgeNode extends DurableObject {
   async rerelay() {
     // first against our own chain: a row the chain now refuses (mined, or no longer valid) is dropped, not re-sent
     const live = [];
-    for (const r of this.sql.exec('SELECT id, tx, own, age FROM pool ORDER BY id')) {   // a row at a time
+    for (const r of this.sql.exec('SELECT id, tx, own, age, src FROM pool ORDER BY id')) {   // a row at a time
       let why;
       // a trap here means this row broke the node: never again (any other error is not the row's doing)
       try { why = this.rpc('POST', '/tx', r.tx)[1]; } catch (e) { if (e instanceof WebAssembly.RuntimeError) this.sql.exec('DELETE FROM pool WHERE id = ?', r.id); throw e; }
@@ -340,10 +385,12 @@ export class EdgeNode extends DurableObject {
     }
     this.sql.exec('UPDATE pool SET age = 1 WHERE own = 1 AND age = 0');
     for (const r of live) this.sql.exec('UPDATE pool SET age = age + 1 WHERE id = ?', r.id);
-    // each peer gets them as batched requests (at most 64 transactions each, the RPC's limit), all peers at once
-    const lines = live.flatMap(r => r.tx.split('\n')), batches = [];
-    for (let i = 0; i < lines.length; i += 64) batches.push(lines.slice(i, i + 64).join('\n'));
-    if (batches.length) await Promise.allSettled(this.upstreams().map(async up => { for (const body of batches) { try { await this.call(up, '/tx', { method: 'POST', body }); } catch (_) {} } }));
+    // each peer gets them as batched requests (at most 64 transactions each, the RPC's limit), a sender's apart from
+    // another's (X-Edge-Src: the peer keeps them as that sender's), all peers at once
+    const by = new Map(), batches = [];
+    for (const r of live) by.set(r.src, [...(by.get(r.src) || []), ...r.tx.split('\n')]);
+    for (const [src, lines] of by) for (let i = 0; i < lines.length; i += 64) batches.push([src, lines.slice(i, i + 64).join('\n')]);
+    if (batches.length) await Promise.allSettled(this.upstreams().map(async up => { for (const [src, body] of batches) { try { await this.call(up, '/tx', { method: 'POST', body }, { 'X-Edge-Src': src }); } catch (_) {} } }));
   }
   // every SYNC_S; straight away again while catching up (a wake that fetched its fill and raised the height) or when a
   // peer pushed a block on another branch meanwhile. A failure is logged, not thrown: a thrown alarm is retried at once.
@@ -364,25 +411,41 @@ export class EdgeNode extends DurableObject {
     if (!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now() + 1000);
     await this.node();
     // the sync and mining details help nobody but the operator (and an attacker timing a fork): peers only. Block bodies
-    // are never pruned (they are what peers and new nodes sync from): db_bytes shows how far the database has grown
+    // are never pruned (they are what peers and new nodes sync from): db_bytes shows how far the database has grown;
+    // state_bytes and wasm_bytes how near the node is to full (STATE_MAX, MEM_MAX)
     if (url.pathname === '/edge') return text(`region ${this.meta('region')}\nchain ${CHAIN_VERSION}\nheight ${this.x.height()}\nupstreams ${this.upstreams().join(' ')}\n` +
-      (peer ? `last_sync ${this.meta('last_sync') ?? 'never'}\nlast_mined ${this.meta('last_mined') ?? 'never'}\ndb_bytes ${this.sql.databaseSize}\ndown ${JSON.stringify(this.down)}\n` : ''));
-    const body = req.method === 'POST' ? await readBody(req) : '';
+      (peer ? `last_sync ${this.meta('last_sync') ?? 'never'}\nlast_mined ${this.meta('last_mined') ?? 'never'}\ndb_bytes ${this.sql.databaseSize}\n` +
+              `state_bytes ${Math.round(this.state)}${this.full() ? ' (full)' : ''}\nwasm_bytes ${this.x.memory.buffer.byteLength}\ndown ${JSON.stringify(this.down)}\n` : ''));
+    let body = req.method === 'POST' ? await readBody(req) : '';
     if (body === null) return text('request too large', 413);
-    const [code, reply] = this.rpc(req.method, url.pathname, body);
+    // whose transactions these are (the front worker's limitKey of the sender, or what the peer passing them on said)
+    const src = (req.headers.get('X-Edge-Src') || '').slice(0, 64);
+    // past its state limit the node takes no new registration (from anyone: they would all grow the state): a request of
+    // nothing else is refused, 503; of a batch, the rest goes in and its registrations are answered FULL
+    let all = null, kept = null;
+    if (req.method === 'POST' && url.pathname === '/tx' && this.full()) {
+      const ls = linesOf(body), k = ls.flatMap((l, i) => isReg(l) ? [] : [i]);
+      if (!k.length && ls.length) return text(FULL, 503, { 'Retry-After': '3600' });
+      if (k.length < ls.length) { all = ls; kept = k; body = k.map(i => ls[i]).join('\n'); }
+    }
+    let [code, reply] = this.rpc(req.method, url.pathname, body);
     if (req.method === 'POST' && url.pathname === '/tx' && code === 200) {
       // keep what was accepted (for a batch, the lines whose result is "ok"), together, as one row (a line per row if too big),
       // marked as the public's (own) or a peer's
       const lines = body.trim().split(/\s*\n\s*/), res = reply.trim().split('\n');
       const ok = lines.length === 1 ? lines : lines.filter((_, i) => res[i] === 'ok');
       const rows = ok.join('\n').length > ROW_MAX ? ok : ok.length ? [ok.join('\n')] : [];
-      for (const row of rows) { try { this.sql.exec('INSERT OR IGNORE INTO pool (tx, own) VALUES (?, ?)', row, peer ? 0 : 1); if (this.pool) { this.pool.n++; this.pool.bytes += row.length; } } catch (_) {} }
+      for (const row of rows) { try { this.sql.exec('INSERT OR IGNORE INTO pool (tx, own, src) VALUES (?, ?, ?)', row, peer ? 0 : 1, src); if (this.pool) { this.pool.n++; this.pool.bytes += row.length; } } catch (_) {} }
+      for (const l of ok) if (isReg(l)) this.state += l.length / 2;   // the state grows by about each registration taken
       this.poolTrim();
     }
     if (req.method === 'POST' && url.pathname === '/block' && reply.trim() === 'accepted') this.pushed = Date.now();
     // a peer pushed a block on a branch we do not have (a push carries only the tip): pull from that peer now
     if (req.method === 'POST' && url.pathname === '/block' && peer && reply.trim() === 'prev unknown') {
       const f = req.headers.get('X-Edge-From') || '', up = this.upstreams().find(u => u === 'do:' + f || u.startsWith(`https://node-${f}.`));
+      // it just reached us, on our chain: a busy or chain-version breaker on it is lifted, so the pull is not skipped
+      // (not one for a refused block)
+      if (up && this.down[up] && this.down[up] - Date.now() <= DOWN_MS) { delete this.down[up]; this.meta('down', JSON.stringify(this.down)); }
       if (f && up && !this.from) { this.from = up; const a = await this.ctx.storage.getAlarm(); if (!a || a > Date.now() + 1000) await this.ctx.storage.setAlarm(Date.now() + 1000); }
     }
     // a new transaction or a block that moved the main chain goes on to the other regions and upstream nodes at once
@@ -393,11 +456,12 @@ export class EdgeNode extends DurableObject {
     const fwd = url.pathname !== '/tx' ? body : (() => { const ls = body.trim().split(/\s*\n\s*/), rs = reply.trim().split('\n'); return ls.length === 1 ? body : ls.filter((_, i) => rs[i] === 'ok').join('\n'); })();
     // in the background, one after another in the order accepted: the reply does not wait for a slow peer
     if (req.method === 'POST' && (url.pathname === '/tx' || url.pathname === '/block') && code === 200 && moved && fwd && !peer) {
-      this.relayed = this.relayed.then(() => Promise.allSettled(this.upstreams().map(up => this.call(up, url.pathname, { method: 'POST', body: fwd }))));
+      this.relayed = this.relayed.then(() => Promise.allSettled(this.upstreams().map(up => this.call(up, url.pathname, { method: 'POST', body: fwd }, src ? { 'X-Edge-Src': src } : {}))));
       this.ctx.waitUntil?.(this.relayed);
     }
     if (req.method === 'POST' && url.pathname === '/block') this.trim();
-    return text(reply, code, { 'X-Edge-Height': String(this.x.height()) });   // for the front worker (it bounds /block/<n>)
+    if (all) { reply = merge(all, kept, reply, FULL); code = 200; }
+    return text(reply, code, { 'X-Edge-Height': String(this.x.height()) });   // for the front worker (what of a 400 it may cache)
   }
 }
 
@@ -417,35 +481,55 @@ export default {
     // X-Edge-Peer from a peer carries the shared secret; anyone else's is dropped (it would stop their transactions
     // being passed on at once). Its X-Edge-Chain goes on for the Durable Object to check, and X-Edge-From (its region).
     const peer = isPeer(env, req.headers.get('X-Edge-Peer'));
-    // a block well above the tip this isolate last heard of is not there: answered here, without waking a Durable Object
-    // (peers always ask the node itself)
-    const above = path.match(/^\/(?:block|summary)\/(\d+)$/)?.[1];
-    const tip = tips[region];
-    if (above && !peer && tip && Date.now() - tip.at < 60_000 && +above > tip.h + 10) return text('no such block', 400, { 'Cache-Control': `public, max-age=${FRESH_S}` });
-    const fwd = peer ? { 'X-Edge-Peer': '1', 'X-Edge-Chain': req.headers.get('X-Edge-Chain') || '', 'X-Edge-From': req.headers.get('X-Edge-From') || '' } : {};
+    // whether a block is there only the region knows: this isolate's idea of its height may be minutes old (a region
+    // catching up climbs hundreds a minute), so /block/<n> above it is asked of the region like anything else
+    const key = limitKey(req.headers.get('CF-Connecting-IP') || '');
+    // X-Edge-Src: whose transactions they are (the Durable Object keeps its pool fair between senders)
+    const fwd = peer ? { 'X-Edge-Peer': '1', 'X-Edge-Chain': req.headers.get('X-Edge-Chain') || '', 'X-Edge-From': req.headers.get('X-Edge-From') || '', 'X-Edge-Src': req.headers.get('X-Edge-Src') || '' }
+                     : { 'X-Edge-Src': key };
     // the public's uncached requests are rate limited per address (cache hits cost nothing and are not counted), and all
     // of them together per region (RL_REGION, generous): a farm of addresses cannot swamp one Durable Object either.
-    // (Cloudflare counts each limit per location, so this caps what one location sends it.) heavy(n): n units of RL_HEAVY
-    const key = limitKey(req.headers.get('CF-Connecting-IP') || '');
-    const heavy = async n => HEAVY.test(path) && !!env.RL_HEAVY && (await Promise.all(Array.from({ length: n }, () => env.RL_HEAVY.limit({ key })))).some(r => !r.success);
-    const limited = async () => !peer && (env.RL && !(await env.RL.limit({ key })).success || await heavy(1) || env.RL_REGION && !(await env.RL_REGION.limit({ key: region })).success);
+    // (Cloudflare counts each limit per location, so this caps what one location sends it.) Reads and posts are counted
+    // apart (keys get: and post:), so a flood of reads never locks out a miner's block or anyone's transaction. And the
+    // region's budget is in two tiers: an address's first RL_FAIR requests a minute draw on a pool of their own
+    // (<region>:<kind>:fair), the rest on the main one; a farm of addresses that drains the main pool (6000 a minute is
+    // 20 /48s at RL's limit) leaves everyone else their fair share, unless it has some 200 /48s at one location.
+    const kind = req.method === 'POST' ? 'post' : 'get';
+    const limited = async () => { if (peer) return false; const k = `${kind}:${key}`;
+      if (env.RL && !(await env.RL.limit({ key: k })).success || HEAVY.test(path) && env.RL_HEAVY && !(await env.RL_HEAVY.limit({ key })).success) return true;
+      if (!env.RL_REGION) return false;
+      const fair = !!env.RL_FAIR && (await env.RL_FAIR.limit({ key: k })).success;
+      return !(await env.RL_REGION.limit({ key: `${region}:${kind}${fair ? ':fair' : ''}` })).success; };
+    const heavy = async n => !env.RL_HEAVY ? n : (await Promise.all(Array.from({ length: n }, () => env.RL_HEAVY.limit({ key })))).filter(r => r.success).length;   // of n units, those granted
+    const busy = () => text('too many requests', 429, { 'Retry-After': '60' });
     // an edge node has no TCP peers: its peers are the other regions and the upstream nodes it syncs with
     if (path === '/peers') return text(String(Object.keys(R).length - 1 + (env.UPSTREAMS || '').split(',').filter(s => s.trim()).length));
     const stub = env.NODE.get(env.NODE.idFromName(region), { locationHint: R[region] });
-    // a reply from the Durable Object, its X-Edge-Height noted (for the check above) and taken off
-    const seen = res => { const out = new Response(res.body, res), h = res.headers.get('X-Edge-Height');
-      if (h !== null) { tips[region] = { h: +h, at: Date.now() }; out.headers.delete('X-Edge-Height'); } return out; };
+    // a reply from the Durable Object, its X-Edge-Height (for the cache below) taken off
+    const seen = res => { const out = new Response(res.body, res); out.headers.delete('X-Edge-Height'); return out; };
     const inner = new URL(path + `?region=${region}`, 'https://edge');
     if (req.method === 'POST') {
-      if (await limited()) return text('too many requests', 429);
+      if (await limited()) return busy();
       const body = await readBody(req);
       if (body === null) return text('request too large', 413);
       // each registration in the public's /tx (its line starts with tag 1 or 2) costs work to check, like one in /check:
-      // at most TX_REGS in one request, each counted once more against RL_HEAVY
-      const regs = !peer && path === '/tx' ? body.split('\n').filter(l => /^\s*0[12]/.test(l)).length : 0;
-      if (regs > TX_REGS) return text('too many registrations in one request', 400);
-      if (regs && await heavy(regs)) return text('too many requests', 429);
-      return seen(await stub.fetch(inner, { method: 'POST', body, headers: fwd }));   // a peer's forward is not passed on again
+      // each is counted once more against RL_HEAVY, and at most TX_REGS of a request are taken. The rest of the request goes
+      // in; registrations past either limit are answered 429 (Retry-After; X-Edge-Taken and the body say how many lines
+      // were taken, one answer per line), for the sender to send again. So a native node relaying 64 transactions a post
+      // loses none: from one address its posts plus their registrations may come to 30 a minute (RL_HEAVY), so 30 posts
+      // of 64 (1,920 transactions) without registrations, or two carrying 28 (the chain itself takes far fewer)
+      const ls = !peer && path === '/tx' ? linesOf(body) : [], regs = ls.flatMap((l, i) => isReg(l) ? [i] : []);
+      const most = Math.min(regs.length, TX_REGS), take = most ? await heavy(most) : 0, skip = new Set(regs.slice(take));
+      if (!skip.size) return seen(await stub.fetch(inner, { method: 'POST', body, headers: fwd }));   // a peer's forward is not passed on again
+      const kept = ls.flatMap((_, i) => skip.has(i) ? [] : [i]), wait = take < most ? 60 : 1;
+      const why = `not taken, send it again: ${kept.length} of ${ls.length} lines taken (at most ${TX_REGS} registrations in one request` +
+        (wait > 1 ? ', and this address has sent its registrations for the minute)' : ')');
+      const extra = { 'Retry-After': String(wait), 'X-Edge-Taken': String(kept.length) };
+      if (!kept.length) return text(merge(ls, [], '', why), 429, extra);
+      const res = await stub.fetch(inner, { method: 'POST', body: kept.map(i => ls[i]).join('\n'), headers: fwd }), reply = await res.text();
+      // a refusal of the whole request (edge full, a bad line in a batch) stands as it is
+      if (res.status >= 500 || res.status !== 200 && kept.length > 1) return seen(new Response(reply, res));
+      return text(merge(ls, kept, reply, why), 429, extra);
     }
     // GET and HEAD share the cache (HEAD answers with the headers only)
     const head = r => req.method === 'HEAD' ? new Response(null, r) : r;
@@ -455,10 +539,13 @@ export default {
     const cached = !peer && path !== '/edge' && !path.startsWith('/queued/');
     const hit = cached ? await cache.match(ck) : null;
     if (hit) return head(hit);
-    if (await limited()) return text('too many requests', 429);
-    const res = await stub.fetch(inner, { headers: fwd }), out = seen(res);
-    // a refusal (400: no such block, account...) is kept briefly too, so asking again and again costs nothing
-    if ((res.ok || res.status === 400) && cached) { out.headers.set('Cache-Control', `public, max-age=${fresh || !res.ok ? FRESH_S : CACHE_S}`); ctx.waitUntil(cache.put(ck, out.clone())); }
+    if (await limited()) return busy();
+    const res = await stub.fetch(inner, { headers: fwd }), out = seen(res), h = +(res.headers.get('X-Edge-Height') ?? NaN);
+    // a refusal (400: no account...) is kept briefly too, so asking again and again costs nothing; but not "no such block"
+    // for one above the region's height (as it answered just now): that one is due within minutes, and is not kept at all
+    const soon = res.status === 400 && +(path.match(/^\/(?:block|summary)\/(\d+)$/)?.[1] ?? -1) > (Number.isFinite(h) ? h : -1);
+    if (soon) out.headers.set('Cache-Control', 'no-store');
+    else if ((res.ok || res.status === 400) && cached) { out.headers.set('Cache-Control', `public, max-age=${fresh || !res.ok ? FRESH_S : CACHE_S}`); ctx.waitUntil(cache.put(ck, out.clone())); }
     return head(out);
   },
   // a watchdog: wake each region so its alarm keeps running even if nothing has called it

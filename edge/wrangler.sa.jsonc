@@ -11,12 +11,15 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["EdgeNode"] }],
   "services": [{ "binding": "NODE_MAIN", "service": "bitcheque-node" }, { "binding": "NODE_OC", "service": "bitcheque-node-oc" }],
   "triggers": { "crons": ["*/30 * * * *"] },
-  // the public's uncached requests: at most 300 a minute per address (an IPv6 /48; peers, with EDGE_SECRET, are not
-  // limited); /check, /tx and /template (the costliest) also at most 30 a minute (a registration in a /tx counts once
-  // more); and at most 6000 a minute to each region from everyone together
+  // the public's uncached requests: at most 300 reads and 300 posts a minute per address (an IPv6 /48; peers, with
+  // EDGE_SECRET, are not limited); /check, /tx and /template (the costliest) also at most 30 a minute together (a
+  // registration in a /tx counts once more: a relaying node's 64-transaction posts, 30 a minute, are 1,920 transactions);
+  // and to each region from everyone together at most 6000 reads and 6000 posts a minute, beside a pool of 6000 more of
+  // each for every address's first 30 a minute (RL_FAIR), so a farm of addresses cannot lock everyone else out
   "ratelimits": [{ "name": "RL", "namespace_id": "1001", "simple": { "limit": 300, "period": 60 } },
                  { "name": "RL_HEAVY", "namespace_id": "1002", "simple": { "limit": 30, "period": 60 } },
-                 { "name": "RL_REGION", "namespace_id": "1003", "simple": { "limit": 6000, "period": 60 } }],
+                 { "name": "RL_REGION", "namespace_id": "1003", "simple": { "limit": 6000, "period": 60 } },
+                 { "name": "RL_FAIR", "namespace_id": "1004", "simple": { "limit": 30, "period": 60 } }],
   "routes": [{ "pattern": "node-sa.bitcheque.org", "custom_domain": true }],
   "vars": { "NET": "0", "REGIONS": "{\"sa\":\"sam\"}",
             "UPSTREAMS": "https://node-us.bitcheque.org,https://node-eu.bitcheque.org,https://node-ap.bitcheque.org,https://node-oc.bitcheque.org",
