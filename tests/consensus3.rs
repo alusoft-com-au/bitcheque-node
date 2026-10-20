@@ -1,6 +1,6 @@
-//! Regression tests for the third consensus audit: an opening from one printed part binds nothing (no burning or
-//! freezing a book from a stolen part or one leaked cell), several open cheques, a cheque's expiry fixed by its first
-//! piece, a cheque to an unknown number voided, block 0 no anchor, the batch overlap test, cells bound to the network,
+//! Regression tests for the third consensus audit, on the audit 4 rules: a cheque opens only from both printed parts at
+//! once (no burning or freezing a book from a stolen part or one leaked cell), one open cheque, a cheque's expiry fixed
+//! by its opening, a cheque to an unknown number voided, block 0 no anchor, the batch overlap test, cells bound to the network,
 //! and the snapshot codec at every height.
 use bitcheque::block::Chain;
 use bitcheque::crypto::sha256;
@@ -24,7 +24,7 @@ impl Net {
         let b = self.chain.make_block(self.t, payee, txs)?;
         self.chain.add(&b, self.t)
     }
-    fn pow(&self, tx: Tx) -> Tx { mine_registration(tx, self.chain.tip(), self.chain.state.reg_target) }
+    fn pow(&self, tx: Tx) -> Tx { mine_registration(tx, self.chain.tip(), self.chain.state.next_reg_target(&self.chain.params)) }
     fn reg(&mut self, b: &Book) { let r = self.pow(b.register(0, 16, Payment::Pow([0; 32], 0))); self.mine(0, vec![r]).unwrap(); }
     fn acct(&self, b: &Book) -> &bitcheque::state::Account { &self.chain.state.accounts[&b.id()] }
 }
@@ -46,112 +46,102 @@ fn funded(p: &Params, owner: &Book, all: bool) -> (Net, Book) {
     (net, miner)
 }
 
-/// Audit finding 1: one leaked cell (one QR code) of the highest cheque used to consume that number and delete every
-/// lower cheque, freezing a fully registered book. Now it opens cheque 255 and nothing else; the owner keeps sending,
-/// and once the opening expires cheque 255 is spendable again.
+/// Audit finding 1 (and audit 4): a leaked cell (one QR code) of any cheque does nothing at all: a piece is only
+/// valid on an open cheque, and only an opening with both printed parts opens one.
 #[test]
-fn one_leaked_cell_neither_burns_nor_freezes() {
+fn one_leaked_cell_does_nothing() {
     let p = params();
     let owner = bk(7, p.magic);
     let (mut net, _) = funded(&p, &owner, true);
     let piece = Tx::ChequePiece { account: owner.id(), cheque: 255, column: 3, shares: vec![Domain([7; 32]).cell(&p.magic, 16, 255, 3, 5)] };
-    net.mine(0, vec![piece]).unwrap();
-    let a = net.acct(&owner);
-    assert_eq!((a.nonce, a.commits.len(), a.open[&255].bound()), (None, 256, false));
-    // the owner sends with cheque 1 as the wallet does: recipient columns, then the amount once they are in a block
-    let pieces = owner.sign(1, &Message::new(1, 1000, 5, 1));
-    net.mine(0, pieces[..12].to_vec()).unwrap();
-    assert_eq!(net.acct(&owner).nonce, None, "recipient columns alone bind nothing");
-    net.mine(0, pieces[12..].to_vec()).unwrap();
+    assert_eq!(net.mine(0, vec![piece]), Err("cheque not open"));
+    // the owner sends with cheque 1 as the wallet does: the opening, then the amount once it is deep enough
+    let (open, rest) = owner.halves(1, &Message::new(1, 1000, 5, 1).digits());
+    net.mine(0, vec![open]).unwrap();
+    assert_eq!(net.acct(&owner).nonce, Some(1), "an opening uses its number at once");
+    net.mine(0, rest).unwrap();
     let a = net.acct(&owner);
     assert_eq!((a.balance, a.nonce, a.commits.len()), (9 * COIN - p.fee_unit, Some(1), 254));
-    for _ in 0..p.piece_lifetime { net.mine(0, vec![]).unwrap(); }
-    assert!(net.acct(&owner).open.is_empty() && net.acct(&owner).commits.contains_key(&255), "cheque 255 is untouched");
     net.mine(0, owner.sign(255, &Message::new(1, 0, 9, 1))).unwrap();   // and sweeps
     assert_eq!(net.acct(&owner).balance, 0);
 }
 
-/// A thief with all of part A pins one cheque to its own number, one with part B another: neither binds, the owner's
-/// cheque goes through, a thief's recipient cells cannot displace the owner's once those are on chain, and both
-/// pinned cheques are usable again after expiry.
+/// A holder of one printed part cannot open anything (an opening needs every recipient column and an amount column);
+/// once the owner's opening is on chain a thief's other recipient cells or a second opening do not fit.
 #[test]
-fn one_part_holders_cannot_burn_or_steal() {
+fn one_part_holders_cannot_open_burn_or_steal() {
     let p = Params { piece_lifetime: 20, ..params() };
     let owner = bk(7, p.magic);
     let (mut net, _) = funded(&p, &owner, false);
     let to_thief = Message::new(1, 9999, 9, 9).digits();   // a part-A thief chooses the recipient, a part-B thief the amount
-    let mut txs = owner.pieces(15, &to_thief)[..12].to_vec();
-    txs.extend(owner.pieces(14, &to_thief)[12..].to_vec());
-    net.mine(0, txs).unwrap();
-    let a = net.acct(&owner);
-    assert_eq!((a.nonce, a.commits.len(), a.open.len()), (None, 16, 2));
-    assert!(a.open.values().all(|o| !o.bound()));
-    let pieces = owner.sign(1, &Message::new(1, 1000, 5, 1));
-    net.mine(0, pieces[..12].to_vec()).unwrap();
-    // the part-A thief racing the owner's amount pieces: its recipient cells no longer fit
+    let part_a = Tx::ChequeOpen { account: owner.id(), cheque: 15, pieces: (0..12u8).map(|c| (c, vec![Domain([7; 32]).cell(&p.magic, 16, 15, c, to_thief[c as usize])])).collect() };
+    let part_b = Tx::ChequeOpen { account: owner.id(), cheque: 14, pieces: (12..18u8).map(|c| (c, vec![Domain([7; 32]).cell(&p.magic, 16, 14, c, to_thief[c as usize])])).collect() };
+    for t in [&part_a, &part_b] {
+        assert_eq!(net.chain.state.clone().apply(&p, t), Err("bad opening columns"));
+        assert_eq!(Tx::decode(&mut R::new(&t.encode())), Err("bad opening columns"));
+    }
+    for t in owner.pieces(15, &to_thief) { assert_eq!(net.chain.state.clone().apply(&p, &t), Err("cheque not open")); }
+    let (open, rest) = owner.halves(1, &Message::new(1, 1000, 5, 1).digits());
+    net.mine(0, vec![open]).unwrap();
+    // the part-A thief racing the owner's amount pieces: its recipient cells no longer fit, nor does a second opening
     let race = owner.pieces(1, &Message::new(2, 0, 9, 1).digits());
     assert_eq!(net.chain.state.clone().apply(&p, &race[10]), Err("column already revealed"));
-    net.mine(0, pieces[12..].to_vec()).unwrap();
-    assert_eq!((net.acct(&owner).nonce, net.acct(&owner).open.keys().copied().collect::<Vec<_>>()), (Some(1), vec![14, 15]));
-    for _ in 0..p.piece_lifetime { net.mine(0, vec![]).unwrap(); }
-    assert!(net.acct(&owner).open.is_empty());
+    assert_eq!(net.chain.state.clone().apply(&p, &owner.opening(1, &Message::new(2, 1000, 5, 1).digits(), 12)), Err("cheque already open"));
+    net.mine(0, rest).unwrap();
+    assert_eq!((net.acct(&owner).nonce, net.acct(&owner).open.len()), (Some(1), 0));
     assert_eq!(keys(&owner, &net), (2..16).collect::<Vec<u16>>());
-    net.mine(0, owner.sign(14, &Message::new(1, 0, 9, 1))).unwrap();
-    assert_eq!(net.acct(&owner).balance, 0);
 }
 
-/// Cells of both parts bind: the first amount piece after the recipient columns consumes the number and every lower
-/// cheque; if the cheque is then left unfinished, its number stays used when it expires.
+/// An opening binds at once: it consumes the number and every lower cheque; if the cheque is then left unfinished,
+/// it goes at expiry and its number stays used.
 #[test]
-fn both_parts_bind_and_an_unfinished_bound_cheque_stays_used() {
+fn an_opening_binds_and_an_unfinished_cheque_stays_used() {
     let p = params();
     let owner = bk(7, p.magic);
     let (mut net, _) = funded(&p, &owner, false);
-    let pieces = owner.sign(5, &Message::new(1, 1000, 5, 1));
-    net.mine(0, pieces[..12].to_vec()).unwrap();
-    assert_eq!((net.acct(&owner).nonce, net.acct(&owner).commits.len()), (None, 16));
-    net.mine(0, vec![pieces[12].clone()]).unwrap();
+    let (open, rest) = owner.halves(5, &Message::new(1, 1000, 5, 1).digits());
+    net.mine(0, vec![open]).unwrap();
     assert_eq!(net.acct(&owner).nonce, Some(5));
     assert_eq!(keys(&owner, &net), (5..16).collect::<Vec<u16>>());
-    assert!(net.acct(&owner).open[&5].bound());
     while !net.acct(&owner).open.is_empty() { net.mine(0, vec![]).unwrap(); }
     assert_eq!(keys(&owner, &net), (6..16).collect::<Vec<u16>>());
-    assert_eq!(net.chain.state.clone().apply(&p, &pieces[13]), Err("cheque number already consumed"));
+    assert_eq!(net.chain.state.clone().apply(&p, &rest[0]), Err("cheque not open"));
+    assert_eq!(net.chain.state.clone().apply(&p, &owner.open_all(5, &Message::new(1, 1000, 5, 1).digits())), Err("cheque number already consumed"));
 }
 
-/// Several cheques may be open at once; completing one removes the lower ones (opened or not) and keeps the higher.
+/// At most one cheque is open: opening a higher one (a void, say) removes the lower open one; the higher completes.
 #[test]
-fn several_open_cheques() {
+fn a_higher_opening_closes_the_open_cheque() {
     let p = Params { piece_lifetime: 20, ..params() };
     let owner = bk(7, p.magic);
     let (mut net, _) = funded(&p, &owner, false);
     let d = Message::new(1, 1, 0, 1).digits();
-    let mut txs = owner.pieces(3, &d)[..12].to_vec();
-    txs.extend(owner.pieces(7, &d)[..5].to_vec());
-    txs.extend(owner.sign(5, &Message::new(1, 1000, 5, 1)));
-    net.mine(0, txs).unwrap();
+    net.mine(0, vec![owner.opening(3, &d, 12)]).unwrap();
+    net.mine(0, vec![owner.opening(7, &d, 14)]).unwrap();
     let a = net.acct(&owner);
-    assert_eq!((a.nonce, a.open.keys().copied().collect::<Vec<_>>()), (Some(5), vec![7]));
-    assert_eq!(keys(&owner, &net), (6..16).collect::<Vec<u16>>());
-    net.mine(0, owner.pieces(7, &d)[5..].to_vec()).unwrap();   // and the higher one completes
-    assert_eq!((net.acct(&owner).nonce, net.acct(&owner).balance), (Some(7), 9 * COIN - 1 - 2 * p.fee_unit));
+    assert_eq!((a.nonce, a.open.keys().copied().collect::<Vec<_>>()), (Some(7), vec![7]));
+    assert_eq!(keys(&owner, &net), (7..16).collect::<Vec<u16>>());
+    assert_eq!(net.chain.state.clone().apply(&p, &owner.pieces(3, &d)[13]), Err("cheque not open"));
+    net.mine(0, owner.pieces(7, &d)[15..].to_vec()).unwrap();   // and the higher one completes
+    assert_eq!((net.acct(&owner).nonce, net.acct(&owner).balance), (Some(7), 10 * COIN - 1 - p.fee_unit));
 }
 
-/// Audit item 27: an open cheque expires piece_lifetime blocks after its first piece, however many follow.
+/// Audit item 27: an open cheque expires piece_lifetime blocks after its opening, however many pieces follow.
 #[test]
-fn expiry_is_set_by_the_first_piece() {
+fn expiry_is_set_by_the_opening() {
     let p = params();
     let owner = bk(7, p.magic);
     let (mut net, _) = funded(&p, &owner, false);
-    let pieces = owner.sign(2, &Message::new(1, 1000, 5, 1));
-    net.mine(0, vec![pieces[0].clone()]).unwrap();
+    let (open, rest) = owner.halves(2, &Message::new(1, 1000, 5, 1).digits());
+    net.mine(0, vec![open]).unwrap();
     let due = net.chain.height() + p.piece_lifetime;
-    net.mine(0, vec![pieces[1].clone()]).unwrap();
-    net.mine(0, vec![pieces[2].clone()]).unwrap();
+    net.mine(0, vec![rest[0].clone()]).unwrap();
+    net.mine(0, vec![rest[1].clone()]).unwrap();
     assert_eq!(net.acct(&owner).open[&2].expiry, due);
     net.mine(0, vec![]).unwrap();
     assert_eq!(net.chain.height(), due);
-    assert!(net.acct(&owner).open.is_empty() && net.acct(&owner).commits.contains_key(&2));
+    assert!(net.acct(&owner).open.is_empty() && !net.acct(&owner).commits.contains_key(&2));
+    assert_eq!(net.acct(&owner).nonce, Some(2));
 }
 
 /// Audit item 10: a cheque to a number nobody holds yet used to stay completable by whoever got that number. Its last
@@ -163,8 +153,8 @@ fn a_cheque_to_an_unknown_or_young_number_is_void() {
     let (mut net, _) = funded(&p, &owner, false);
     let next = net.chain.state.next_number;
     let pieces = owner.sign(1, &Message::new(next + 1, 2, 8, 1));
-    net.mine(0, pieces[..17].to_vec()).unwrap();
-    net.mine(0, vec![pieces[17].clone()]).unwrap();
+    net.mine(0, pieces[..5].to_vec()).unwrap();
+    net.mine(0, vec![pieces[5].clone()]).unwrap();
     let a = net.acct(&owner);
     assert_eq!((a.balance, a.nonce, a.open.is_empty(), a.commits.contains_key(&1)), (10 * COIN, Some(1), true, false));
     let (filler, thief) = (bk(4, p.magic), bk(5, p.magic));
@@ -174,7 +164,7 @@ fn a_cheque_to_an_unknown_or_young_number_is_void() {
     net.mine(0, owner.sign(2, &Message::new(next + 1, 2, 8, 1))).unwrap();
     assert_eq!((net.acct(&owner).balance, net.acct(&thief).balance, net.acct(&owner).nonce), (10 * COIN, 0, Some(2)));
     for _ in 0..3 { net.mine(0, vec![]).unwrap(); }
-    assert_eq!(net.mine(0, vec![pieces[17].clone()]), Err("cheque number already consumed"));
+    assert_eq!(net.mine(0, vec![pieces[0].clone()]), Err("cheque number already consumed"));
     assert_eq!(net.acct(&thief).balance, 0);
 }
 
@@ -221,12 +211,15 @@ fn cells_are_bound_to_the_network() {
     for _ in 0..3 { a.mine(1, vec![]).unwrap(); b.mine(1, vec![]).unwrap(); }
     let pieces = va.sign(1, &Message::new(1, 5, 8, 1));
     a.mine(0, pieces.clone()).unwrap();
-    let replay: Vec<Tx> = pieces.into_iter().map(|t| match t { Tx::ChequePiece { cheque, column, shares, .. } => Tx::ChequePiece { account: vb.id(), cheque, column, shares }, _ => unreachable!() }).collect();
+    let replay: Vec<Tx> = pieces.into_iter().map(|t| match t {
+        Tx::ChequePiece { cheque, column, shares, .. } => Tx::ChequePiece { account: vb.id(), cheque, column, shares },
+        Tx::ChequeOpen { cheque, pieces, .. } => Tx::ChequeOpen { account: vb.id(), cheque, pieces },
+        _ => unreachable!() }).collect();
     assert_eq!(b.mine(0, replay), Err("no commitment matches"));
 }
 
 /// A state restored from its snapshot encoding at every height accepts the same next block with the same root as the
-/// live state: several open cheques, bound and not, expiries, renewals, number reuse, re-registration.
+/// live state: open cheques, expiries, renewals, number reuse, re-registration.
 #[test]
 fn snapshot_restore_differential() {
     let p = Params { unfunded_pow_lifetime: 6, number_quarantine: 4, piece_lifetime: 3, batch_lifetime: 30, renew_window: 20, renew_fee: 10, ..params() };
@@ -243,7 +236,7 @@ fn snapshot_restore_differential() {
         assert_eq!((twin.state.root(), twin.state.encode()), (live.state.root(), live.state.encode()));
         Ok(())
     };
-    let pow = |c: &Chain, tx: Tx| mine_registration(tx, c.tip(), c.state.reg_target);
+    let pow = |c: &Chain, tx: Tx| mine_registration(tx, c.tip(), c.state.next_reg_target(&p));
     let books: Vec<Book> = (1..=6).map(|k| bk(k, p.magic)).collect();
     step(&mut live, &mut twin, vec![], 0).unwrap();
     let r0 = pow(&live, books[0].register(0, 16, Payment::Pow([0; 32], 0)));
@@ -253,12 +246,10 @@ fn snapshot_restore_differential() {
     for b in &books[1..] { let r = pow(&live, b.register(0, 16, Payment::Pow([0; 32], 0))); step(&mut live, &mut twin, vec![r], 1).unwrap(); }
     let n1 = live.state.accounts[&books[1].id()].number;
     step(&mut live, &mut twin, books[0].sign(1, &Message::new(n1, 2, 8, 1)), 1).unwrap();
-    // book 2: one cheque bound and unfinished, two opened from one part
+    // book 5: one cheque opened and unfinished, one more piece in the next block
     let d = Message::new(0, 0, 0, 0).digits();
-    let mut txs: Vec<Tx> = books[2].pieces(1, &d).into_iter().take(13).collect();
-    txs.extend(books[2].pieces(4, &d).into_iter().take(3));
-    txs.extend(books[2].pieces(6, &d).into_iter().skip(12));
-    step(&mut live, &mut twin, txs, 1).unwrap();
+    step(&mut live, &mut twin, vec![books[5].opening(4, &d, 13)], 1).unwrap();
+    step(&mut live, &mut twin, vec![books[5].pieces(4, &d)[15].clone()], 1).unwrap();
     for h in 0..30 {
         let mut txs = vec![];
         if h == 6 { txs.push(Tx::Renew { account: books[0].id(), start: 0 }); }

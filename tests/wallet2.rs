@@ -10,7 +10,7 @@ use walletfake::*;
 fn register_records_cheque_0_and_a_sweep_never_reuses_it() {
     let h = home("w2-cheque0");
     let f = fake(reply("none", &first16()));
-    f.set(|s| s.lose = 1);   // the honesty check never reaches the chain: nonce stays none
+    f.set(|s| { s.lose = 1; s.registered = false; });   // the honesty check never reaches the chain: nonce stays none
     let (ok, out) = wallet(&h, &f, &["register"]);
     assert!(ok, "{out}");
     assert_eq!(cheques(&f), vec![0]);
@@ -32,8 +32,14 @@ fn register_records_cheque_0_and_a_sweep_never_reuses_it() {
 fn register_again_after_cheques_does_not_resign_cheque_0() {
     let h = home("w2-reregister");
     let f = fake(reply("none", &first16()));
+    f.set(|s| s.registered = false);
     assert!(wallet(&h, &f, &["register"]).0);
     assert!(wallet(&h, &f, &["send", "--to", &num(7), "--amount", "1", "--fresh"]).0);
+    // run again on the registered book: nothing to do, and it says so (no "account exists" from the node)
+    let (ok, out) = wallet(&h, &f, &["register"]);
+    assert!(ok && out.contains("already registered"), "{out}");
+    // a book whose registration landed but whose record is gone (another machine) does not send cheque 0 again
+    f.set(|s| s.registered = false);
     let (ok, out) = wallet(&h, &f, &["register"]);
     assert!(ok && out.contains("not sent again"), "{out}");
     assert_eq!(cheques(&f), vec![0, 1]);
@@ -75,7 +81,7 @@ fn the_record_fails_hard() {
     let st = h.join("state");
     let (ok, out) = run(None, &h, &["send", "--to", &to, "--amount", "1", "--fresh", "--seed-file", s, "--rpc", &f.addr, "--state-dir", st.to_str().unwrap()], &[]);
     assert!(ok, "{out}");
-    let (ok, out) = run(None, &h, &["send", "--to", &to, "--amount", "1", "--seed-file", s, "--rpc", &f.addr], &[("BITCHEQUE_STATE", st.to_str().unwrap())]);
+    let (ok, out) = run(None, &h, &["send", "--to", &to, "--amount", "2", "--seed-file", s, "--rpc", &f.addr], &[("BITCHEQUE_STATE", st.to_str().unwrap())]);
     assert!(ok, "{out}");
     assert_eq!(cheques(&f), vec![1, 2]);
     // an empty or garbled record is not "nothing used"
@@ -119,7 +125,7 @@ fn a_hostile_node_cannot_steer_the_cheque() {
     assert_eq!(cheques(&f), vec![3]);
 }
 
-/// With --rpc A,B the most cautious answer wins: the highest nonce, every queued cheque.
+/// With --rpc A,B the nodes must report the book alike, and every queued cheque on any of them is skipped.
 #[test]
 fn a_second_rpc_cross_checks_the_cheque() {
     let h = home("w2-two");
@@ -128,12 +134,16 @@ fn a_second_rpc_cross_checks_the_cheque() {
     a.relay_to(&b);
     let seed = h.join("seed");
     let (ok, out) = run(Some(&h), &h, &["sweep", "--to", &num(7), "--fresh", "--seed-file", seed.to_str().unwrap(), "--rpc", &format!("{},{}", a.addr, b.addr)], &[]);
+    assert!(!ok && out.contains("disagree"), "{out}");
+    assert!(a.posts.lock().unwrap().is_empty() && record(&h).is_none());
+    a.set(|s| s.nonce = "2".into());
+    let (ok, out) = run(Some(&h), &h, &["sweep", "--to", &num(7), "--fresh", "--seed-file", seed.to_str().unwrap(), "--rpc", &format!("{},{}", a.addr, b.addr)], &[]);
     assert!(ok, "{out}");
     assert_eq!(cheques(&a), vec![4]);
     assert!(b.posts.lock().unwrap().is_empty());   // the cheque goes to the first node only
 }
 
-/// Fee tiers above 9, or tier 0 with coins, would be refused at the last piece and burn the cheque: refused up front.
+/// Fee tiers above 9, or tier 0 (a zero cheque is a void), are refused up front, before anything is signed.
 #[test]
 fn invalid_fee_tiers_are_refused_before_signing() {
     let h = home("w2-fee");
@@ -142,10 +152,12 @@ fn invalid_fee_tiers_are_refused_before_signing() {
     for args in [&["send", "--to", &to, "--amount", "1", "--fee", "10"][..], &["send", "--to", &to, "--amount", "1", "--fee", "255"],
                  &["sweep", "--to", &to, "--fee", "12"], &["send", "--to", &to, "--amount", "1", "--fee", "0"], &["sweep", "--to", &to, "--fee", "0"]] {
         let (ok, out) = wallet(&h, &f, args);
-        assert!(!ok && (out.contains("tier from 0 to 9") || out.contains("fee tier 0 only")), "{args:?}: {out}");
+        assert!(!ok && (out.contains("tier from 1 to 9") || out.contains("only for a void")), "{args:?}: {out}");
     }
+    let (ok, out) = wallet(&h, &f, &["send", "--to", &num(7), "--amount", "0", "--fee", "0", "--fresh"]);   // a zero cheque is a void
+    assert!(!ok && out.contains("wallet void"), "{out}");
     assert!(f.posts.lock().unwrap().is_empty() && record(&h).is_none());
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &num(7), "--amount", "0", "--fee", "0", "--fresh"]);   // a zero cheque may go free
+    let (ok, out) = wallet(&h, &f, &["void", "--fresh"]);   // which goes free
     assert!(ok, "{out}");
     assert_eq!(cheques(&f), vec![1]);
 }

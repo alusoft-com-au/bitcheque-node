@@ -2,7 +2,7 @@
 //! cheque pieces for one or more domains. A real wallet keeps each domain on its own device.
 use crate::book::{self, Bytes, ChequeShares};
 use crate::crypto::{key, sha256, Key};
-use crate::message::{Message, COLS, ROWS};
+use crate::message::{Message, COLS, PART_A, ROWS};
 use crate::params::TESTNET_MAGIC;
 use crate::tx::{account_id, AccountId, Batch, Payment, Tx};
 use crate::u256::U256;
@@ -63,13 +63,29 @@ impl Book {
             else { Tx::RegisterBatch { account: id.clone(), batch, pay: Payment::Pow([0; 32], 0) } }
         }).collect()
     }
-    /// The 18 pieces of a cheque, payee columns first. Each carries every domain's cell.
-    pub fn pieces(&self, cheque: u16, digits: &[u8; COLS]) -> Vec<Tx> {
-        let id = self.id();
-        (0..COLS as u8).map(|c| Tx::ChequePiece { account: id.clone(), cheque, column: c,
-            shares: self.domains.iter().map(|d| d.cell(&self.net, self.n(), cheque, c, digits[c as usize])).collect() }).collect()
+    /// Every domain's cell of one column: what a piece carries.
+    fn column(&self, cheque: u16, c: u8, digit: u8) -> Vec<Bytes> { self.domains.iter().map(|d| d.cell(&self.net, self.n(), cheque, c, digit)).collect() }
+    /// The 18 pieces of a cheque, one per column. On their own they open nothing (§10.12): a cheque is opened by
+    /// `opening`, and a piece adds a column to an open cheque.
+    pub fn pieces(&self, cheque: u16, digits: &[u8; COLS]) -> Vec<Tx> { self.pieces_of(&self.id(), cheque, digits) }
+    fn pieces_of(&self, id: &AccountId, cheque: u16, digits: &[u8; COLS]) -> Vec<Tx> {
+        (0..COLS as u8).map(|c| Tx::ChequePiece { account: id.clone(), cheque, column: c, shares: self.column(cheque, c, digits[c as usize]) }).collect()
     }
-    pub fn sign(&self, cheque: u16, msg: &Message) -> Vec<Tx> { self.pieces(cheque, &msg.digits()) }
+    /// The opening of a cheque: columns 0..=last in one transaction (last at least PART_A, the first amount column).
+    pub fn opening(&self, cheque: u16, digits: &[u8; COLS], last: usize) -> Tx { self.opening_of(self.id(), cheque, digits, last) }
+    fn opening_of(&self, account: AccountId, cheque: u16, digits: &[u8; COLS], last: usize) -> Tx {
+        Tx::ChequeOpen { account, cheque, pieces: (0..=last.min(COLS - 1) as u8).map(|c| (c, self.column(cheque, c, digits[c as usize]))).collect() }
+    }
+    /// A whole cheque in one transaction: opened and completed at once (a void, the honesty check).
+    pub fn open_all(&self, cheque: u16, digits: &[u8; COLS]) -> Tx { self.opening(cheque, digits, COLS - 1) }
+    /// A cheque in its two halves (§10.12): the opening, recipient and first amount column (0..=PART_A), then the
+    /// 5 pieces of the rest. A wallet sends the second half only once the first is deep enough in a block.
+    pub fn halves(&self, cheque: u16, digits: &[u8; COLS]) -> (Tx, Vec<Tx>) {
+        let id = self.id();   // derived once: it is the whole book
+        (self.opening_of(id.clone(), cheque, digits, PART_A), self.pieces_of(&id, cheque, digits).split_off(PART_A + 1))
+    }
+    /// Both halves together, in order (in one block they complete the cheque).
+    pub fn sign(&self, cheque: u16, msg: &Message) -> Vec<Tx> { let (o, rest) = self.halves(cheque, &msg.digits()); [vec![o], rest].concat() }
 }
 
 /// Grind a registration's (book or batch) PoW nonce, anchored to `anchor` (a recent block hash: the tip), until its

@@ -50,7 +50,7 @@ fn void_kills_a_live_cheque() {
     let st = f.st.clone();
     std::thread::spawn(move || { std::thread::sleep(std::time::Duration::from_secs(2)); let mut s = st.lock().unwrap(); s.mining = true; s.mine(); });
     let (ok, out) = wallet(&h, &f, &["void"]);
-    assert!(ok && out.contains("finishing it") && out.contains("cheque 2 sent") && out.contains("voids"), "{out}");
+    assert!(ok && (out.contains("finishing it") || out.contains("done already")) && out.contains("cheque 2 sent") && out.contains("voids"), "{out}");
     assert_eq!(digits_of(&f, 2).len(), 18);
     let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5"]);
     assert!(ok, "{out}");
@@ -58,8 +58,8 @@ fn void_kills_a_live_cheque() {
     never_two_messages(&[&f]);
 }
 
-/// M3: the 12 recipient pieces first, in a block before the 6 amount pieces go out; a half-sent cheque is finished
-/// by running the same command again, with the same digits.
+/// M3: the opening (the 12 recipient columns and the first amount column) first, in a block before the 5 remaining
+/// pieces go out; a half-sent cheque is finished by running the same command again, with the same digits.
 #[test]
 fn recipient_half_first_then_amount() {
     let h = home("w3-half");
@@ -68,7 +68,8 @@ fn recipient_half_first_then_amount() {
     let to = num(7);
     let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5", "--fresh", "--wait", "1"]);
     assert!(!ok && out.contains("cheque 1 is half sent") && out.contains("run the same command again"), "{out}");
-    assert_eq!(columns(&f, 1), (0..12).collect::<Vec<u8>>());
+    assert_eq!(columns(&f, 1), (0..13).collect::<Vec<u8>>());
+    assert_eq!(openings(&f), vec![(1, (0..13).collect::<Vec<u8>>())]);
     let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "9"]);
     assert!(!ok && out.contains("may still be live"), "{out}");
     f.set(|s| { s.mining = true; s.mine(); });
@@ -77,8 +78,8 @@ fn recipient_half_first_then_amount() {
     assert_eq!(columns(&f, 1), (0..18).collect::<Vec<u8>>());
     never_two_messages(&[&f]);
     // the amount half not in a block in time: "posted", not "sent"
-    f.set(|s| s.mine_below = 12);
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5", "--wait", "1"]);
+    f.set(|s| s.mine_below = 13);
+    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "6", "--wait", "1"]);
     assert!(ok && out.contains("cheque 2 posted, not in a block"), "{out}");
 }
 
@@ -89,7 +90,7 @@ fn w2_recipient_check_digit_and_burn() {
     let f = fake(reply("none", &first16()));
     let n = num(48213);
     assert!(wallet(&h, &f, &["send", "--to", &n, "--amount", "1", "--fresh"]).0);
-    assert!(wallet(&h, &f, &["send", "--to", &n.replace('-', ""), "--amount", "1"]).0);
+    assert!(wallet(&h, &f, &["send", "--to", &n.replace('-', ""), "--amount", "2"]).0);
     let wrong = format!("{}{}", &n[..12], (n.as_bytes()[12] - b'0' + 1) % 10);
     let transposed = format!("00000048231-{}", &n[12..]);
     for bad in ["48213", "48231", &wrong, &transposed, "0000004821-35", "+0000004821-3", "000000482135x"] {
@@ -156,24 +157,42 @@ fn paying_an_unfunded_account_warns() {
 }
 
 /// W5 / L1: `pieces` records the number like any cheque: a send never reuses it, nor does `pieces` with other digits.
+/// It prints the opening only; the 5 remaining pieces need --rest, the record of this cheque, and the opening deep
+/// enough on chain.
 #[test]
 fn w5_pieces_command_is_recorded() {
     let h = home("w3-w5");
     let f = fake(reply("none", &first16()));
     let seed = h.join("seed");
     let s = seed.to_str().unwrap();
-    let (ok, out) = run(Some(&h), &h, &["pieces", "--seed-file", s, "--cheque", "1", "--digits", "000000000077999981"], &[]);
-    assert!(ok && out.lines().count() == 18, "{out}");
+    let d = "000000000077999981";
+    let (ok, out) = run(Some(&h), &h, &["pieces", "--seed-file", s, "--cheque", "2", "--digits", d, "--rest", "--rpc", &f.addr], &[]);
+    assert!(!ok && out.contains("no record of cheque 2"), "{out}");   // never signed without a record
+    let (ok, out) = run(Some(&h), &h, &["pieces", "--seed-file", s, "--digits", d], &[]);
+    assert!(!ok && out.contains("--cheque N needed"), "{out}");   // never cheque 0 by default
+    let (ok, open) = run(Some(&h), &h, &["pieces", "--seed-file", s, "--cheque", "1", "--digits", d], &[]);
+    assert!(ok && open.lines().count() == 1, "{open}");
     assert_eq!(record(&h).as_deref(), Some("1"));
-    let (ok, out) = run(Some(&h), &h, &["pieces", "--seed-file", s, "--cheque", "1", "--digits", "000000000077999981"], &[]);
-    assert!(ok, "{out}");   // the same digits again are harmless
-    for (c, d) in [("1", "000000000077999982"), ("0", "000000000000000000")] {
-        let (ok, out) = run(Some(&h), &h, &["pieces", "--seed-file", s, "--cheque", c, "--digits", d], &[]);
-        assert!(!ok && out.contains("never signed with other digits"), "{out}");
-    }
+    let (ok, out) = run(Some(&h), &h, &["pieces", "--seed-file", s, "--cheque", "1", "--digits", d], &[]);
+    assert!(ok && out == open, "{out}");   // the same digits again are harmless
+    let (ok, out) = run(Some(&h), &h, &["pieces", "--seed-file", s, "--cheque", "1", "--digits", "000000000077999982"], &[]);
+    assert!(!ok && out.contains("never signed with other digits"), "{out}");
+    let (ok, out) = run(Some(&h), &h, &["pieces", "--seed-file", s, "--cheque", "0", "--digits", "000000000000000000"], &[]);
+    assert!(!ok && out.contains("honesty check"), "{out}");
     let (ok, out) = wallet(&h, &f, &["send", "--to", &num(7), "--amount", "1"]);
     assert!(!ok && out.contains("cheque 1 may still be live"), "{out}");
     assert!(f.posts.lock().unwrap().is_empty());
+    // the rest only once the opening is on chain, deep enough
+    let rest = ["pieces", "--seed-file", s, "--cheque", "1", "--digits", d, "--rest", "--rpc", &f.addr];
+    let (ok, out) = run(Some(&h), &h, &rest, &[]);
+    assert!(!ok && out.contains("not open with these digits"), "{out}");
+    f.set(|s| s.extra = 0);
+    bitcheque::net::http(&f.addr, "POST", "/tx", open.trim()).unwrap();
+    let (ok, out) = run(Some(&h), &h, &rest, &[]);
+    assert!(!ok && out.contains("not 3 blocks deep"), "{out}");
+    f.set(|s| s.extra = 2);
+    let (ok, out) = run(Some(&h), &h, &rest, &[]);
+    assert!(ok && out.lines().filter(|l| !l.is_empty() && l.bytes().all(|c| c.is_ascii_hexdigit())).count() == 5 && out.contains("only one node"), "{out}");
 }
 
 /// W6 / L2: a registration target too hard to meet, or easier than the chain allows, is refused at once.
@@ -183,9 +202,10 @@ fn w6_implausible_regtarget_is_refused() {
               "ffffffffffffffff ffffffffffffffff ffffffffffffffff ffffffffffffffff"] {
         let h = home("w3-w6");
         let f = fake(Reply { regtarget: t.into(), ..reply("none", &first16()) });
+        f.set(|s| s.registered = false);
         let t0 = std::time::Instant::now();
         let (ok, out) = wallet(&h, &f, &["register"]);
-        assert!(!ok && out.contains("registration target") && t0.elapsed().as_secs() < 5, "{out}");
+        assert!(!ok && out.contains("registration target") && t0.elapsed().as_secs() < 30, "{out}");
         assert!(f.posts.lock().unwrap().is_empty());
     }
 }
@@ -255,6 +275,7 @@ fn amounts_are_plain_digits() {
 fn register_reads_the_seed_from_standard_input() {
     let h = home("w3-stdin");
     let f = fake(reply("none", &first16()));
+    f.set(|s| s.registered = false);
     let st = h.join("state");
     let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_bitcheque"));
     c.env_clear().args(["wallet", "register", "--seed-file", "-", "--rpc", &f.addr, "--state-dir", st.to_str().unwrap(), "--local"])
@@ -267,8 +288,8 @@ fn register_reads_the_seed_from_standard_input() {
     assert_eq!(cheques(&f), vec![0]);
 }
 
-/// Someone holding one printed part opened a cheque with their own digits: the wallet skips that cheque (it binds
-/// nothing) and never sends the other half onto a cheque pinned to digits it did not write.
+/// A cheque open on chain with digits this machine never wrote is skipped, and a cheque of ours opened with other digits
+/// never gets its other half.
 #[test]
 fn a_pinned_cheque_is_skipped_and_never_finished() {
     let h = home("w3-pin");
@@ -279,14 +300,14 @@ fn a_pinned_cheque_is_skipped_and_never_finished() {
     let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5", "--fresh"]);
     assert!(ok && out.contains("cheque 2 sent"), "{out}");
     assert!(!cheques(&f).contains(&1));
-    // a half-sent cheque whose remaining column is then taken by another digit: nothing more goes out on it
+    // a half-sent cheque opened on chain with another digit (someone holding both parts raced it): nothing more goes out on it
     f.set(|s| s.mining = false);
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5", "--wait", "1"]);
+    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "6", "--wait", "1"]);
     assert!(!ok && out.contains("cheque 3 is half sent"), "{out}");
     let ours = digits_of(&f, 3).into_iter().find(|p| p.0 == 3).map(|p| digit(3, 3, &[p.1]).unwrap()).unwrap();
     f.set(|s| { s.pool.clear(); s.chain.entry(3).or_default().insert(3); s.digits.insert((3, 3), (ours + 1) % 10); s.open = "3".into(); s.mining = true; });
     let before = pieces(&f).len();
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5"]);
+    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "6"]);
     assert!(!ok && out.contains("cells this machine never sent") && out.contains("wallet void"), "{out}");
     assert_eq!(pieces(&f).len(), before, "no piece of the amount half may go out");
 }

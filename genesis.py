@@ -28,7 +28,7 @@ def main():
     net = "testnet" if "--testnet" in sys.argv else "mainnet"
     bits = INITIAL_BITS[net]
     cb = coinbase_tx(0, REWARD_PAYEE, MESSAGE)
-    txroot = sha256d(cb)                         # single-tx Merkle tree
+    txroot = sha256d(b"\x00" + sha256d(cb))     # single-tx Merkle tree: the leaf, SHA256d(0 || txid)
     stateroot = bytes(32)                        # empty state
     prev = bytes(32)
     target = target_from_bits(bits)

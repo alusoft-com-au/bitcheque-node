@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use crate::block::{next_bits, relieved_bits, Block, Blocks, Chain, Header, HostBlocks};
+use crate::block::{bits_ok, Block, Blocks, Chain, Header, HostBlocks};
 use crate::params::Params;
 use crate::state::State;
 use crate::tx::{Tx, R, W};
@@ -209,7 +209,7 @@ impl Store {
         if b.header.prev == self.chain.tip() {
             // the header first, so a block that cannot extend the tip is never written to the file
             let (p, hs) = (&self.chain.params, &self.chain.headers);
-            if b.header.bits != next_bits(p, hs) && b.header.bits != relieved_bits(p, hs, b.header.time) { return Err("bits"); }
+            if !bits_ok(p, hs, &b.header) { return Err("bits"); }
             if b.header.time <= self.chain.median_time() { return Err("old time"); }
             if b.header.time > now.saturating_add(p.max_future_seconds) { return Err("time"); }
             let fresh = loc.is_none() && self.file.is_some();
@@ -279,7 +279,7 @@ impl Store {
         let from = ((fork as usize + 1).saturating_sub(need.saturating_sub(anc.len())) as u32).max(self.chain.base);
         let mut ctx: Vec<Header> = self.chain.headers_from(from).iter().take((fork + 1).saturating_sub(from) as usize).cloned().collect();
         ctx.extend(anc.into_iter().rev());
-        if h.bits != next_bits(p, &ctx) && h.bits != relieved_bits(p, &ctx, h.time) { return Err("bits"); }
+        if !bits_ok(p, &ctx, h) { return Err("bits"); }
         let mut t: Vec<u32> = ctx.iter().rev().take(11).map(|x| x.time).collect();
         t.sort_unstable();
         if h.time <= t[t.len() / 2] { return Err("old time"); }

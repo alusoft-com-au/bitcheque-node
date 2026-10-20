@@ -1,6 +1,7 @@
 //! Wallet-facing HTTP interface, plain text, standard library only.
 //!   GET  /height   GET /peers   GET /addrs (known peer addresses)   GET /tip                GET /block/<height>   (hex)   GET /summary/<height> (text)
 //!   GET  /account/<number>    GET /id/<account id hex>   GET /lookup/<code> (start of the id after its scheme byte)
+//!   (account text, one "key value" line each: ... open N|none, revealed N:<18 digits or '.'>|none, expires N:<height>|none, salt)
 //!   (a number appears in any output only once it is final, number_maturity blocks deep; /account/<n> of a
 //!   number not final yet answers only "pending" and its ready_at)
 //!   GET /commits/<account id hex>/<cheque> (a registered unspent cheque's commitments: 18 lines, one per column, of 10 hex, one per row)
@@ -12,7 +13,8 @@
 //!   GET  /template/<number>  (hex: the next block to mine, reward to that number (0 burns it), nonce 0)
 //!   POST /tx  (body: hex-encoded tx, or several, one per line, queued together: one result per line)   POST /block (body: hex-encoded block, mined from a template)
 //!   POST /check (body: one hex tx per line; dry run, nothing stored: one result per line, "ok", "ok <row>" for a
-//!   cheque piece (the row its cell matched), or the reason)
+//!   cheque piece (the row its cell matched), "ok <rows>" for a cheque opening (the row of each of its columns, in
+//!   order, as one string of digits), or the reason)
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -213,7 +215,7 @@ impl Node {
                 }
                 // each cheque completed in this block, as written (from the sender's recent history)
                 let mut seen = std::collections::BTreeSet::new();
-                for t in &b.txs { if let Tx::ChequePiece { account, cheque, .. } = t { if seen.insert((account.clone(), *cheque)) {
+                for t in &b.txs { if let Tx::ChequePiece { account, cheque, .. } | Tx::ChequeOpen { account, cheque, .. } = t { if seen.insert((account.clone(), *cheque)) {
                     if let Some(Event::Transfer { to, amount, fee, digits, .. }) = c.history.get(account).and_then(|h| h.iter().find(|e| e.height as usize == i && matches!(&e.event, Event::Transfer { cheque: n, .. } if n == cheque)).map(|e| e.event.clone())) {
                         let from = c.state.accounts.get(account).map(|a| a.number).filter(|n| c.state.numbers.get(n).is_some_and(|(id, _)| id == account) && is_final(c, *n));
                         out += &format!("cheque account={} cheque={cheque}{} to={to} amount={amount} fee={fee} digits={}\n", hex(account), from.map_or(String::new(), |n| format!(" from={n}")), digits.iter().map(|d| char::from(b'0' + d)).collect::<String>());
@@ -277,10 +279,15 @@ impl Node {
                 let mut out = format!("count {}\n{}", m.len(), m.iter().take(MEMPOOL_LIST).map(|t| tx_line(t)).collect::<String>());
                 // what each waiting cheque says so far, read from the pieces against the sender's commitments
                 let mut seen: BTreeMap<(Vec<u8>, u16), [Option<u8>; COLS]> = BTreeMap::new();
-                for t in m.iter() { if let Tx::ChequePiece { account, cheque, column, shares } = t {
+                for t in m.iter() {
+                    let (account, cheque, cols): (_, _, Vec<(u8, &[Vec<u8>])>) = match t {
+                        Tx::ChequePiece { account, cheque, column, shares } => (account, cheque, vec![(*column, shares)]),
+                        Tx::ChequeOpen { account, cheque, pieces } => (account, cheque, pieces.iter().map(|(c, sh)| (*c, sh.as_slice())).collect()),
+                        _ => continue,
+                    };
                     let d = seen.entry((account.clone(), *cheque)).or_insert_with(|| c.state.accounts.get(account).and_then(|a| a.open.get(cheque)).map_or([None; COLS], |o| o.digits));
-                    if let Some(x) = c.state.piece_digit(account, *cheque, *column, shares) { d[*column as usize] = Some(x); }
-                } }
+                    for (col, sh) in cols { if let Some(x) = c.state.piece_digit(account, *cheque, col, sh) { d[col as usize] = Some(x); } }
+                }
                 for ((account, cheque), d) in seen {
                     if !d[..=PAYEE_DIGITS].iter().all(|x| x.is_some()) { continue; }
                     let p: Vec<u8> = d[..=PAYEE_DIGITS].iter().map(|x| x.unwrap()).collect();
@@ -324,7 +331,7 @@ impl Node {
                 // a wallet must never sign a second cheque with a number already waiting: this lists them, uncapped
                 let id = unhex(h).ok_or("bad hex")?;
                 let m = self.mempool.lock().unwrap();
-                let mut ns: Vec<u16> = m.iter().filter_map(|t| match t { Tx::ChequePiece { account, cheque, .. } if *account == id => Some(*cheque), _ => None }).collect();
+                let mut ns: Vec<u16> = m.iter().filter_map(|t| match t { Tx::ChequePiece { account, cheque, .. } | Tx::ChequeOpen { account, cheque, .. } if *account == id => Some(*cheque), _ => None }).collect();
                 ns.sort_unstable(); ns.dedup();
                 Ok(ns.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","))
             }
@@ -333,7 +340,8 @@ impl Node {
                 let id = unhex(h).ok_or("bad hex")?;
                 c.state.accounts.get(&id).zip(n.parse::<u16>().ok()).and_then(|(a, n)| a.commits.get(&n)).map(|x| x.lines(crate::tx::id_n(&id))).ok_or("no such cheque")
             }
-            ("GET", ["regtarget"]) => Ok(c.state.reg_target.0.iter().map(|l| format!("{l:016x}")).collect::<Vec<_>>().join(" ")),
+            // the next block's target: a registration mined now must meet that one
+            ("GET", ["regtarget"]) => Ok(c.state.next_reg_target(&c.params).0.iter().map(|l| format!("{l:016x}")).collect::<Vec<_>>().join(" ")),
             ("GET", ["proof", n]) => {
                 let num: u32 = n.parse().map_err(|_| "bad number")?;
                 let (id, _) = c.state.numbers.get(&num).filter(|_| is_final(c, num)).ok_or("no such number")?;   // not final: as if unknown
@@ -361,7 +369,7 @@ impl Node {
                     txs.push(Tx::decode(&mut R::new(&raw))?);
                 }
                 if txs.iter().filter(|t| matches!(t, Tx::RegisterBook { .. } | Tx::RegisterBatch { .. })).count() > CHECK_REGS { return Err("too many registrations in one check"); }
-                Ok(self.check_txs(&txs).into_iter().map(|r| match r { Ok(None) => "ok".to_string(), Ok(Some(row)) => format!("ok {row}"), Err(e) => e.to_string() }).collect::<Vec<_>>().join("\n"))
+                Ok(self.check_txs(&txs).into_iter().map(|r| match r { Ok(None) => "ok".to_string(), Ok(Some(rows)) => format!("ok {rows}"), Err(e) => e.to_string() }).collect::<Vec<_>>().join("\n"))
             }
             _ => Err("unknown route"),
         }
@@ -380,12 +388,14 @@ fn account_text(c: &crate::block::Chain, id: &[u8]) -> String {
     let ready_at = c.state.numbers.get(&a.number).map_or(0, |(_, at)| at + c.params.number_maturity);
     let mature = ready_at <= c.height();
     let number = if mature { format!("number {}\n", a.number) } else { String::new() };
-    format!("id {}\n{number}balance {}\npending {}\nnonce {}\nbook_size {}\nunspent {}\nfunded {}\nmature {}\nready_at {}\nopen {}\nrevealed {}\nsalt {}", hex(id), a.balance,
+    format!("id {}\n{number}balance {}\npending {}\nnonce {}\nbook_size {}\nunspent {}\nfunded {}\nmature {}\nready_at {}\nopen {}\nrevealed {}\nexpires {}\nsalt {}", hex(id), a.balance,
             pending_of(c, a.number), a.nonce.map_or("none".into(), |x| x.to_string()), a.book_size, a.commits.keys().map(|k| k.to_string()).collect::<Vec<_>>().join(","),
             a.funded, mature, ready_at, if a.open.is_empty() { "none".into() } else { a.open.keys().map(|k| k.to_string()).collect::<Vec<_>>().join(",") },
             // each open cheque's revealed digits, '.' for a column not yet on chain: a wallet checks its own cheque was
             // not pinned to someone else's digits before it shows the rest
             if a.open.is_empty() { "none".into() } else { a.open.iter().map(|(k, o)| format!("{k}:{}", o.digits.iter().map(|d| d.map_or('.', |d| (b'0' + d) as char)).collect::<String>())).collect::<Vec<_>>().join(",") },
+            // the height each open cheque goes at, unfinished (its opening's block + piece_lifetime)
+            if a.open.is_empty() { "none".into() } else { a.open.iter().map(|(k, o)| format!("{k}:{}", o.expiry)).collect::<Vec<_>>().join(",") },
             hex(&a.salt))
 }
 
@@ -397,5 +407,7 @@ fn tx_line(t: &Tx) -> String {
         Tx::RegisterBatch { account, batch, .. } => format!("batch account={} start={} count={}\n", hex(account), batch.start, batch.count),
         Tx::ChequePiece { account, cheque, column, shares } => format!("piece account={} cheque={cheque} column={column} txid={} share={}\n", hex(account), hex(&t.txid()), shares.iter().map(|s| hex(s)).collect::<Vec<_>>().join(",")),
         Tx::Renew { account, start } => format!("renew account={} start={start}\n", hex(account)),
+        Tx::ChequeOpen { account, cheque, pieces } => format!("open account={} cheque={cheque} columns={} txid={}\n", hex(account),
+            pieces.iter().map(|x| x.0.to_string()).collect::<Vec<_>>().join(","), hex(&t.txid())),
     }
 }
