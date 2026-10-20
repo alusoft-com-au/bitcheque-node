@@ -7,6 +7,9 @@ hand-copied cheques printed offline from a hash-based cheque book (256 cheques o
 - `src/`: the node, wallet and RPC (`cargo build --release`, binary `target/release/bitcheque`). `bitcheque node`
   joins the research network by following the edge nodes (its seeds) over their HTTP RPC; add `--rpc 0.0.0.0:8732` to
   serve wallets and miners, and `--peer HOST:8731` to also talk TCP to other nodes.
+- `bitcheque wallet` (see the top of `src/main.rs` for every flag) drives one book from a seed file. Its RPC is plain
+  HTTP: anyone between you and the node can withhold or forge replies (never a cheque), so give it two nodes reached
+  over different paths (`--rpc A,B`). If a send fails part way, run the same command again, or `wallet void`.
 - `tests/`: `cargo test`.
 - `wallet-wasm/`: the same Rust book and registration code compiled to WebAssembly for the website:
   `cd wallet-wasm && cargo build --release --target wasm32-unknown-unknown`.
