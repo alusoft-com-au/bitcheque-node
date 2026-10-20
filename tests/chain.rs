@@ -99,8 +99,8 @@ fn life_of_the_chain() {
 fn genesis_vector() {
     let g = Chain::genesis(&Params::mainnet(), 1_798_761_600, b"Bitcheque genesis. Message text and launch timestamp to be set (DESIGN.md 12.4).");
     let mut h = g.header.hash(); h.reverse();
-    assert_eq!(bitcheque::crypto::hex(&h), "000000f31d51d0a837e08646aeb546c8081b9e0d910d22499f1ba2b87444be58");
-    assert_eq!(g.header.nonce, 2106192);
+    assert_eq!(bitcheque::crypto::hex(&h), "0000006873330276025a60ea1afd7497498d3ee30edacdfbcbb632be90227e4c");
+    assert_eq!(g.header.nonce, 1434074);
 }
 
 /// Stall relief: after fast blocks the difficulty is high; once the chain has been silent for two
