@@ -39,7 +39,7 @@ fn sync_and_relay() {
     assert!(b.mempool.lock().unwrap().is_empty());
 }
 
-/// A cheque whose first pieces wait unmined in the queue must not block the account: the next cheque
+/// A cheque whose opening and pieces wait unmined in the queue must not block the account: the next cheque
 /// number abandons it (DESIGN.md §10.12), and the wallet relies on the exact rejection texts here.
 #[test]
 fn queued_cheque_does_not_block_the_next() {
@@ -60,15 +60,17 @@ fn queued_cheque_does_not_block_the_next() {
     let balance = |b: &Book| a.store.lock().unwrap().chain.state.accounts[&b.id()].balance;
     assert!(balance(&miner) >= 50 * COIN);
 
-    // cheque 1: 17 of 18 pieces queued, never completed
+    // cheque 1: opened and 4 of its 5 remaining pieces queued, never completed
     let half = miner.sign(1, &Message::new(2, 1, 8, 1));
-    for t in &half[..17] { a.submit_tx(t.clone(), None).unwrap(); }
-    // the queue knows those columns are taken: the wallet skips a number on exactly this text
-    let again = a.check_txs(&half[..1]);
-    assert_eq!(again[0], Err("column already revealed"));
-    // the same column with another digit: someone else holds this part, and the wallet stops on exactly this text
+    for t in &half[..5] { a.submit_tx(t.clone(), None).unwrap(); }
+    // the queue knows the cheque is open and which columns are taken: the wallet relies on exactly these texts
+    assert_eq!(a.check_txs(&half[..1])[0], Err("cheque already open"));
+    assert_eq!(a.check_txs(&half[1..2])[0], Err("column already revealed"));
+    // another digit, in an opening or a piece: someone else holds this cheque, and the wallet stops on exactly these texts
     let other = miner.sign(1, &Message::new(3, 1, 8, 1));
-    assert_eq!(a.check_txs(&other[10..11])[0], Err("column revealed with other digits"));
+    assert_eq!(a.check_txs(&other[..1])[0], Err("cheque open with other digits"));
+    let wrong = miner.pieces(1, &Message::new(2, 2, 8, 1).digits());
+    assert_eq!(a.check_txs(&wrong[15..16])[0], Err("column revealed with other digits"));
     // cheque 2 is accepted on top of the queue: it abandons cheque 1
     let next = miner.sign(2, &Message::new(2, 3, 8, 1)); // 3 coins
     assert!(a.check_txs(&next).iter().all(|r| r.is_ok()));

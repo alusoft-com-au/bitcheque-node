@@ -7,20 +7,23 @@
 //!   --listen defaults to 0.0.0.0:8730 (mainnet) or 0.0.0.0:8731 (testnet); --advertise is the address others can reach you on.
 //! bitcheque wallet new   (prints a fresh seed)
 //! bitcheque wallet info|register|more --seed-file FILE --rpc ADDR[,ADDR...] [--state-dir DIR] [--cheques N]
-//! bitcheque wallet send --to NNNNNNNNNNN-C --amount COINS | sweep --to NNNNNNNNNNN-C | void   --seed-file FILE --rpc ADDR[,ADDR...]
-//!       [--state-dir DIR] [--fee TIER] [--force-skip] [--last] [--burn] [--fresh] [--wait SECONDS]
-//! bitcheque wallet pieces --seed-file FILE --cheque N --digits D18 [--state-dir DIR]   (raw pieces as hex, for tests; recorded)
+//! bitcheque wallet send --to NNNNNNNNNNN-C --amount COINS | sweep --to NNNNNNNNNNN-C | void   --seed-file FILE --rpc ADDR [--rpc ADDR...]
+//!       [--state-dir DIR] [--fee TIER] [--force-skip] [--last] [--burn] [--fresh] [--again] [--confirmations K] [--wait SECONDS]
+//! bitcheque wallet pieces --seed-file FILE --cheque N --digits D18 [--state-dir DIR] [--rest --rpc ADDR]   (raw txs as hex; recorded:
+//!       the opening, then with --rest, once it is deep enough on chain, the 5 remaining pieces)
 //!   The seed (64 hex digits) comes from --seed-file (must be 0600 and yours: no group or world access), or the BITCHEQUE_SEED
 //!   environment variable (Linux keeps it readable in /proc/self/environ to you and root: prefer the file), or standard
 //!   input with --seed-file -. Never on the command line, where every user can read it.
 //!   The used-cheque record lives in --state-dir, else $BITCHEQUE_STATE, else ~/.config/bitcheque (absolute, yours alone).
-//!   Several --rpc nodes (comma list): the first gets the cheque, every one dry-runs it and cross-checks the cheque number.
+//!   Several --rpc nodes (repeated, or a comma list): the first gets the cheque, every one dry-runs it, and every decision
+//!   needs all of them to report the book alike.
 //!   With no record of a payment signed here, two agreeing nodes are needed, or --fresh for a book never used elsewhere.
 //!   --to is the recipient as printed, check digit included (never computed here); a non-zero amount to 0 needs --burn.
-//!   A payment goes in two halves: the 12 recipient pieces, and once they are in a block the 6 amount pieces. A send that
-//!   fails part way says so: run the same command again (the same cheque is finished, never re-written), or `wallet void`,
-//!   which confirms a zero cheque on the next number so the earlier one can never complete (DESIGN.md §10.13).
-//!   The RPC is plain HTTP: anyone on the path can withhold or forge replies (never forge a cheque). Use --rpc A,B with
+//!   A payment goes in two halves: the opening (recipient and first amount digit), and once it is --confirmations blocks
+//!   deep (3) the 5 remaining pieces. A send that fails part way says so: run the same command again (the same cheque is
+//!   finished, never re-written; a payment already made is refused unless --again), or `wallet void`, which confirms a
+//!   zero cheque on the next number so the earlier one can never complete (DESIGN.md §10.13).
+//!   The RPC is plain HTTP: anyone on the path can withhold or forge replies (never forge a cheque). Use --rpc A --rpc B with
 //!   nodes reached over different paths.
 use bitcheque::{block::Chain, crypto::hex, net::Node, params::{Params, GENESIS_MESSAGE as MESSAGE, LAUNCH_TIME, LOCAL_TIME, TESTNET_TIME}, rpc::unhex, store::Store,
                 u256::U256};
@@ -64,7 +67,7 @@ fn main() {
         }
         Some("mine") => if let Err(e) = mine(&opt) { eprintln!("error: {e}"); std::process::exit(1) },
         Some("wallet") => if let Err(e) = cli_wallet::wallet(&args, &opt, &p) { eprintln!("error: {e}"); std::process::exit(1) },
-        _ => eprintln!("usage: bitcheque genesis [--mainnet|--local] | bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR] [--upstream HOST:PORT] [--no-upstream]\n       bitcheque mine --rpc ADDR --to NUMBER [--threads N]\n       bitcheque wallet new | info|register|more --seed-file FILE --rpc ADDR[,ADDR...] [--state-dir DIR] [--cheques N]\n       bitcheque wallet send --to NNNNNNNNNNN-C --amount COINS | sweep --to NNNNNNNNNNN-C | void  --seed-file FILE --rpc ADDR[,ADDR...] [--state-dir DIR] [--fee TIER] [--force-skip] [--last] [--burn] [--fresh] [--wait SECONDS]"),
+        _ => eprintln!("usage: bitcheque genesis [--mainnet|--local] | bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR] [--upstream HOST:PORT] [--no-upstream]\n       bitcheque mine --rpc ADDR --to NUMBER [--threads N]\n       bitcheque wallet new | info|register|more --seed-file FILE --rpc ADDR[,ADDR...] [--state-dir DIR] [--cheques N]\n       bitcheque wallet send --to NNNNNNNNNNN-C --amount COINS | sweep --to NNNNNNNNNNN-C | void  --seed-file FILE --rpc ADDR[,ADDR...] [--state-dir DIR] [--fee TIER] [--force-skip] [--last] [--burn] [--fresh] [--again] [--confirmations K] [--wait SECONDS]"),
     }
 }
 

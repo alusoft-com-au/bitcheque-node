@@ -1,8 +1,9 @@
 //! A fake node RPC on 127.0.0.1 (a tiny TcpListener in the test) for the command-line wallet tests. It keeps a little
-//! state: posted cheque pieces wait in its pool and, while `mining` is on, go straight into a "block": a cheque with
-//! some columns becomes the open one, a cheque with all 18 moves the nonce (cheque numbers advance on completion).
-//! POST /check answers "column already revealed" for a piece it has, else "ok" (or `refuse`). Every run gets its own
-//! temporary HOME; nothing touches ~/.config or the network.
+//! state: posted cheque cells (openings and pieces) wait in its pool and, while `mining` is on, go straight into a
+//! "block": a cheque's first cells there open it and move the nonce to it (an opening uses its number), all 18 finish
+//! it. POST /check answers as a node does: "ok <rows>", "column already revealed" or "cheque already open" for cells it
+//! has, "... with other digits" for other cells there (or `refuse`). Every run gets its own temporary HOME; nothing
+//! touches ~/.config or the network.
 #![allow(dead_code)]
 use bitcheque::{rpc::unhex, tx::{Tx, R}};
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,12 +26,39 @@ pub fn reply(nonce: &'static str, unspent: &str) -> Reply {
 pub fn first16() -> String { (0..16).map(|i| i.to_string()).collect::<Vec<_>>().join(",") }
 
 /// The fake's chain and pool. `lose` posts are kept in `posts` but never reach the pool; `drop_replies` posts reach it
-/// but get no reply; only pieces of a column below `mine_below` are mined.
+/// but get no reply; only cells of a column below `mine_below` are mined. Every `mine` is a block (`height`); GET /height
+/// answers `height + extra`, so an opening is `extra + 1` blocks deep at once; an open cheque expires `lifetime` blocks
+/// after the block that opened it (`opened`, else the current height).
 pub struct St { pub nonce: String, pub open: String, pub pool: Vec<(u16, u8)>, pub chain: BTreeMap<u16, BTreeSet<u8>>, pub mining: bool,
                 /// the digit each revealed (cheque, column) shows, read from its cell against SEED's book
                 pub digits: BTreeMap<(u16, u8), u8>,
-                pub lose: usize, pub drop_replies: usize, pub refuse: Option<String>, pub mine_below: u8 }
+                pub lose: usize, pub drop_replies: usize, pub refuse: Option<String>, pub mine_below: u8,
+                pub height: u32, pub extra: u32, pub lifetime: u32, pub opened: BTreeMap<u16, u32>,
+                /// GET /id answers "no such account" until a registration is posted (even a lost one: it lands)
+                pub registered: bool,
+                /// posts of cheque pieces only (an amount half) reach the pool but get no reply
+                pub drop_piece_replies: usize,
+                /// GET /id requests served
+                pub ids: usize }
 impl St {
+    fn expires(&self) -> String {
+        if self.open == "none" { return "none".into(); }
+        self.open.split(',').map(|c| { let n: u16 = c.parse().unwrap_or(0); format!("{c}:{}", self.opened.get(&n).copied().unwrap_or(self.height) + self.lifetime) }).collect::<Vec<_>>().join(",")
+    }
+    fn started(&self, c: u16) -> bool { self.pool.iter().any(|p| p.0 == c) || self.chain.contains_key(&c) }
+    /// The node's /check answer for one line.
+    fn check(&self, l: &str) -> String {
+        if let Some(e) = &self.refuse { return e.clone(); }
+        let Some((open, cells)) = parse(l) else { return "ok".into() };
+        let c = cells[0].0;
+        let mine: Vec<(u8, Option<u8>)> = cells.iter().map(|(_, col, sh)| (*col, digit(c, *col, sh))).collect();
+        let other = mine.iter().any(|&(col, d)| self.has(c, col) && self.digits.get(&(c, col)).copied() != d);
+        if open && self.started(c) { return if other { "cheque open with other digits" } else { "cheque already open" }.into(); }
+        if open && self.nonce.parse::<u16>().is_ok_and(|n| n >= c) { return "cheque number already consumed".into(); }
+        if !open && self.has(c, mine[0].0) { return if other { "column revealed with other digits" } else { "column already revealed" }.into(); }
+        if !open && !self.started(c) { return "cheque not open".into(); }
+        format!("ok {}", mine.iter().map(|(_, d)| d.map_or('?', |d| (b'0' + d) as char)).collect::<String>())
+    }
     /// The open cheques and their digits as a node's `revealed` line shows them (only cheques on chain, not finished).
     fn revealed(&self) -> String {
         let open: Vec<String> = self.chain.iter().filter(|(_, s)| s.len() < 18).map(|(c, s)| format!("{c}:{}",
@@ -41,11 +69,16 @@ impl St {
     pub fn mine(&mut self) {
         let (now, keep): (Vec<_>, Vec<_>) = self.pool.drain(..).partition(|&(_, col)| col < self.mine_below);
         self.pool = keep;
+        self.height += 1;
         for (c, col) in now {
+            if !self.chain.contains_key(&c) {
+                // opened: its number is used at once
+                self.opened.insert(c, self.height);
+                if self.nonce.parse::<u16>().map_or(true, |n| n < c) { self.nonce = c.to_string(); }
+            }
             let s = self.chain.entry(c).or_default();
             s.insert(col);
             if s.len() == 18 {
-                if self.nonce.parse::<u16>().map_or(true, |n| n < c) { self.nonce = c.to_string(); }
                 if self.open == c.to_string() { self.open = "none".into(); }
             } else { self.open = c.to_string(); }
         }
@@ -62,7 +95,8 @@ pub fn fake(r: Reply) -> Fake {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap().to_string();
     let posts = Arc::new(Mutex::new(Vec::new()));
-    let st = Arc::new(Mutex::new(St { nonce: r.nonce.into(), open: r.open.into(), pool: vec![], chain: BTreeMap::new(), digits: BTreeMap::new(), mining: true, lose: 0, drop_replies: 0, refuse: None, mine_below: 18 }));
+    let st = Arc::new(Mutex::new(St { nonce: r.nonce.into(), open: r.open.into(), pool: vec![], chain: BTreeMap::new(), digits: BTreeMap::new(), mining: true, lose: 0, drop_replies: 0, refuse: None, mine_below: 18,
+                                      height: 100, extra: 5, lifetime: 10_000, opened: BTreeMap::new(), registered: true, drop_piece_replies: 0, ids: 0 }));
     let relay: Arc<Mutex<Vec<Arc<Mutex<St>>>>> = Arc::new(Mutex::new(Vec::new()));
     let (p, s0, rl) = (posts.clone(), st.clone(), relay.clone());
     std::thread::spawn(move || for s in l.incoming() {
@@ -86,13 +120,16 @@ pub fn fake(r: Reply) -> Fake {
             let lines: Vec<String> = body.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
             let text = if method == "POST" && path == "/tx" {
                 p.lock().unwrap().push(body.clone());
+                if lines.iter().any(|l| l.starts_with("01")) { st.lock().unwrap().registered = true; }
                 let (lost, dropped) = { let mut g = st.lock().unwrap(); let lost = g.lose > 0; if lost { g.lose -= 1; }
-                    let dropped = !lost && g.drop_replies > 0; if dropped { g.drop_replies -= 1; } (lost, dropped) };
+                    let mut dropped = !lost && g.drop_replies > 0; if dropped { g.drop_replies -= 1; }
+                    if !lost && !dropped && g.drop_piece_replies > 0 && lines.iter().all(|l| parse(l).is_some_and(|x| !x.0)) { g.drop_piece_replies -= 1; dropped = true; }
+                    (lost, dropped) };
                 if !lost {
                     let all: Vec<Arc<Mutex<St>>> = [st.clone()].into_iter().chain(rl.lock().unwrap().iter().cloned()).collect();
                     for n in all {
                         let mut g = n.lock().unwrap();
-                        for l in &lines { if let Some((c, col, sh)) = piece(l) { if !g.has(c, col) {
+                        for l in &lines { for (c, col, sh) in parse(l).map_or(vec![], |x| x.1) { if !g.has(c, col) {
                             g.pool.push((c, col));
                             if let Some(d) = digit(c, col, &sh) { g.digits.insert((c, col), d); }
                         } } }
@@ -103,16 +140,13 @@ pub fn fake(r: Reply) -> Fake {
                 lines.iter().map(|_| "ok").collect::<Vec<_>>().join("\n")
             } else if method == "POST" && path == "/check" {
                 let g = st.lock().unwrap();
-                lines.iter().map(|l| match (&g.refuse, piece(l)) {
-                    (Some(e), _) => e.clone(),
-                    // as a node answers: the same cell again, or a cell of another row
-                    (None, Some((c, col, sh))) if g.has(c, col) => if g.digits.get(&(c, col)).copied() == digit(c, col, &sh) { "column already revealed".into() } else { "column revealed with other digits".into() },
-                    _ => "ok".into(),
-                }).collect::<Vec<_>>().join("\n")
+                lines.iter().map(|l| g.check(l)).collect::<Vec<_>>().join("\n")
             } else if let Some(id) = path.strip_prefix("/id/") {
                 std::thread::sleep(std::time::Duration::from_millis(r.delay));
-                let g = st.lock().unwrap();
-                format!("id {id}\nnumber 5\nbalance 100000000000\npending 0\nnonce {}\nbook_size {}\nunspent {}\nfunded true\nmature true\nready_at 0\nopen {}\nrevealed {}", g.nonce, r.book, r.unspent, g.open, g.revealed())
+                let mut g = st.lock().unwrap();
+                g.ids += 1;
+                if !g.registered { let _ = write!(s, "HTTP/1.0 404 Not Found\r\nContent-Length: 17\r\n\r\nno such account\r\n"); return; }
+                format!("id {id}\nnumber 5\nbalance 100000000000\npending 0\nnonce {}\nbook_size {}\nunspent {}\nfunded true\nmature true\nready_at 0\nopen {}\nrevealed {}\nexpires {}", g.nonce, r.book, r.unspent, g.open, g.revealed(), g.expires())
             } else if let Some(n) = path.strip_prefix("/account/") { r.acct.clone().unwrap_or(format!("id 00\nnumber {n}\nbalance 0\nfunded true")) }
             else if path.starts_with("/queued/") {
                 let g = st.lock().unwrap();
@@ -122,6 +156,7 @@ pub fn fake(r: Reply) -> Fake {
             }
             else if path == "/regtarget" { r.regtarget.clone() }
             else if path == "/tip" { "00".repeat(32) }
+            else if path == "/height" { let g = st.lock().unwrap(); (g.height + g.extra).to_string() }
             else { String::new() };
             let _ = write!(s, "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{text}", text.len());
         });
@@ -136,9 +171,19 @@ pub fn digit(c: u16, col: u8, shares: &[Vec<u8>]) -> Option<u8> {
     (0..10u8).find(|&row| shares.first().is_some_and(|s| *s == d.cell(&bitcheque::params::Params::local().magic, 16, c, col, row)))
 }
 
-fn piece(l: &str) -> Option<(u16, u8, Vec<Vec<u8>>)> {
+/// A cheque opening (true) or piece: its (cheque, column, cells), one per column.
+fn parse(l: &str) -> Option<(bool, Vec<(u16, u8, Vec<Vec<u8>>)>)> {
     let raw = unhex(l)?;
-    match Tx::decode(&mut R::new(&raw)).ok()? { Tx::ChequePiece { cheque, column, shares, .. } => Some((cheque, column, shares)), _ => None }
+    match Tx::decode(&mut R::new(&raw)).ok()? {
+        Tx::ChequePiece { cheque, column, shares, .. } => Some((false, vec![(cheque, column, shares)])),
+        Tx::ChequeOpen { cheque, pieces, .. } => Some((true, pieces.into_iter().map(|(c, sh)| (cheque, c, sh)).collect())),
+        _ => None,
+    }
+}
+/// The openings posted to the fake: (cheque, columns).
+pub fn openings(f: &Fake) -> Vec<(u16, Vec<u8>)> {
+    f.posts.lock().unwrap().iter().flat_map(|b| b.lines().map(|l| l.to_string()).collect::<Vec<_>>())
+        .filter_map(|l| parse(l.trim()).filter(|x| x.0).map(|x| (x.1[0].0, x.1.iter().map(|p| p.1).collect()))).collect()
 }
 
 /// A fresh HOME with the seed file (0600) in it.
@@ -164,10 +209,13 @@ pub fn run(home: Option<&Path>, dir: &Path, args: &[&str], env: &[(&str, &str)])
     (o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
 }
 pub fn wallet(h: &Path, f: &Fake, args: &[&str]) -> (bool, String) { wallet_at(h, &f.addr, args) }
-pub fn wallet_at(h: &Path, rpc: &str, args: &[&str]) -> (bool, String) {
+pub fn wallet_at(h: &Path, rpc: &str, args: &[&str]) -> (bool, String) { wallet_rpcs(h, &[rpc], args) }
+/// With `--rpc` given once per node.
+pub fn wallet_rpcs(h: &Path, rpcs: &[&str], args: &[&str]) -> (bool, String) {
     let seed = h.join("seed");
     let mut a = args.to_vec();
-    a.extend(["--seed-file", seed.to_str().unwrap(), "--rpc", rpc]);
+    a.extend(["--seed-file", seed.to_str().unwrap()]);
+    for r in rpcs { a.extend(["--rpc", r]); }
     run(Some(h), h, &a, &[])
 }
 
@@ -177,9 +225,9 @@ pub fn num(n: u32) -> String {
     format!("{n:011}-{}", bitcheque::damm::check_digit(&d))
 }
 
-/// Every cheque piece posted to the fake: (cheque, column, the cells sent for it).
+/// Every cheque cell posted to the fake, in openings and pieces: (cheque, column, the cells sent for it).
 pub fn pieces(f: &Fake) -> Vec<(u16, u8, Vec<Vec<u8>>)> {
-    f.posts.lock().unwrap().iter().flat_map(|b| b.lines().map(|l| l.to_string()).collect::<Vec<_>>()).filter_map(|l| piece(l.trim())).collect()
+    f.posts.lock().unwrap().iter().flat_map(|b| b.lines().map(|l| l.to_string()).collect::<Vec<_>>()).filter_map(|l| parse(l.trim())).flat_map(|x| x.1).collect()
 }
 pub fn cheques(f: &Fake) -> Vec<u16> { let mut c: Vec<u16> = pieces(f).iter().map(|p| p.0).collect(); c.dedup(); c }
 /// The one-time rule itself: no (cheque, column) was ever sent with two different cells (two different digits).

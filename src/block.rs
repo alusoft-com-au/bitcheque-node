@@ -51,15 +51,24 @@ impl Block {
     }
 }
 
-/// Merkle root over txids, zero-padded to a power of two (no duplicate-last malleability).
+/// Merkle root over txids, zero-padded to a power of two (no duplicate-last malleability). Leaves and inner nodes are
+/// hashed apart (a leaf is SHA256d(0 || txid), a node SHA256d(1 || left || right)), so no 64 bytes can pass for both.
 pub fn tx_root(txs: &[Tx]) -> [u8; 32] { root_of(txs.iter().map(|t| t.txid()).collect()) }
-fn root_of(mut level: Vec<[u8; 32]>) -> [u8; 32] {
-    if level.is_empty() { return [0u8; 32]; }
+fn root_of(ids: Vec<[u8; 32]>) -> [u8; 32] {
+    if ids.is_empty() { return [0u8; 32]; }
+    let mut level: Vec<[u8; 32]> = ids.iter().map(|id| sha256d(&[&[0u8][..], id].concat())).collect();
     while !level.len().is_power_of_two() { level.push([0u8; 32]); }
     while level.len() > 1 {
-        level = level.chunks(2).map(|p| sha256d(&[p[0], p[1]].concat())).collect();
+        level = level.chunks(2).map(|p| sha256d(&[&[1u8][..], &p[0], &p[1]].concat())).collect();
     }
     level[0]
+}
+
+/// A header's target is the one the rules ask after `headers` (with or without stall relief), compared as targets:
+/// two encodings of one target are the same target.
+pub fn bits_ok(p: &Params, headers: &[Header], h: &Header) -> bool {
+    let t = U256::from_compact(h.bits);
+    t == U256::from_compact(next_bits(p, headers)) || t == U256::from_compact(relieved_bits(p, headers, h.time))
 }
 
 /// LWMA-1 (Zawy) over the last `window` headers, clamped to ×/÷ `clamp` per block. A solve time is measured from
@@ -274,7 +283,7 @@ impl Chain {
         let h = &b.header;
         if h.prev != self.tip() { return Err("prev hash"); }
         if h.time <= self.median_time() || h.time > now.saturating_add(p.max_future_seconds) { return Err("time"); }
-        if h.bits != next_bits(p, &self.headers) && h.bits != relieved_bits(p, &self.headers, h.time) { return Err("bits"); }
+        if !bits_ok(p, &self.headers, h) { return Err("bits"); }
         if !h.meets_target() { return Err("pow"); }
         if b.encode().len() > p.max_block_bytes { return Err("block too large"); }
         let ids: Vec<[u8; 32]> = b.txs.iter().map(|t| t.txid()).collect();
@@ -297,7 +306,7 @@ impl Chain {
         let mut s = self.check(b, now)?;
         let height = self.height() + 1;
         self.totals.txs += b.txs.len() as u64 - 1;
-        self.totals.pieces += b.txs.iter().filter(|t| matches!(t, Tx::ChequePiece { .. })).count() as u64;
+        self.totals.pieces += b.txs.iter().map(|t| match t { Tx::ChequePiece { .. } => 1, Tx::ChequeOpen { pieces, .. } => pieces.len() as u64, _ => 0 }).sum::<u64>();
         for e in s.log.drain(..) {
             match &e { Event::Register { .. } => self.totals.registrations += 1, Event::Transfer { .. } => self.totals.transfers += 1, Event::Reward { .. } => self.totals.rewards += 1 }
             let mut ids: Vec<AccountId> = match &e {

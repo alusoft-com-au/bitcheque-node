@@ -1,12 +1,16 @@
 //! `bitcheque wallet`: a software wallet for one book from one seed (DESIGN.md §5, §10.12, §10.13).
-use bitcheque::{crypto::{hex, sha256}, damm, message::{self, Message, COLS, PAYEE_DIGITS}, params::{Params, COIN}, tx::Tx,
+use bitcheque::{crypto::{hex, sha256}, damm, message::{self, Message, COLS, PART_A, PAYEE_DIGITS}, params::{Params, COIN}, tx::Tx,
                 u256::U256, wallet::{mine_registration, Book, Domain, BATCH, BOOK_SIZE}};
 use std::path::Path;
 
-/// The recipient columns: sent first, and in a block before the amount's 6 pieces leave this machine (§10.12).
+/// The recipient as printed: 11 digits and the check digit (columns 0-11, printed part A).
 const RECIPIENT: usize = PAYEE_DIGITS + 1;
 /// How long a send waits for each half of a cheque to reach a block, unless --wait says otherwise.
 const WAIT_SECONDS: u64 = 600;
+/// Blocks the opening must be deep before the amount's 5 pieces leave this machine, unless --confirmations says otherwise.
+const CONFIRMATIONS: u32 = 3;
+/// The amount half is never released this close to the opening's expiry: it could land after the opening is gone.
+const EXPIRY_MARGIN: u32 = 100;
 
 /// A software wallet for one book from one seed: the same 256-cheque book the website prints, so a seed works in both.
 /// `register` registers the first cheques (16 by default, `--cheques` for more), `more` the next ones, 16 per proof of work.
@@ -29,14 +33,39 @@ pub fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Params)
     run(cmd, args, opt, p, &book.0)
 }
 
+/// What one node says about the book: the whole /id text, and the fields every decision rests on, which every node
+/// asked must report alike (`key`).
+struct View { a: Vec<(String, String)>, nonce: Option<u16>, open: Vec<u16>, expires: Vec<(u16, u32)> }
+impl View {
+    fn field(&self, k: &str) -> String { self.a.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default() }
+    fn key(&self) -> (Option<u16>, Vec<u16>, String, Vec<(u16, u32)>) { (self.nonce, self.open.clone(), self.field("revealed"), self.expires.clone()) }
+    /// Cheque n is over: its number is used (nonce reached it) and it is not the open one: completed, voided, or gone.
+    fn done(&self, n: u16) -> bool { self.nonce.is_some_and(|x| x >= n) && !self.open.contains(&n) }
+    /// The digits an open cheque shows on chain, None for a column not revealed (or a cheque not open).
+    fn revealed(&self, n: u16) -> [Option<u8>; COLS] {
+        let v = self.field("revealed");
+        v.split(',').find_map(|e| e.strip_prefix(&format!("{n}:"))).filter(|d| d.len() == COLS)
+            .map_or([None; COLS], |d| std::array::from_fn(|i| d.as_bytes()[i].checked_sub(b'0').filter(|&x| x <= 9)))
+    }
+    fn expiry(&self, n: u16) -> Option<u32> { self.expires.iter().find(|e| e.0 == n).map(|e| e.1) }
+}
+
 fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Params, book: &Book) -> Result<(), String> {
     let flag = |k: &str| args.iter().any(|a| a == k);
-    let rpcs: Vec<String> = opt("--rpc").unwrap_or_default().split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect();
-    if rpcs.is_empty() && cmd != "pieces" { return Err("--rpc ADDR needed".into()); }
+    // --rpc may be given several times, each one node or a comma list
+    let rpcs: Vec<String> = args.iter().enumerate().filter(|(_, a)| *a == "--rpc").filter_map(|(i, _)| args.get(i + 1))
+        .flat_map(|v| v.split(',')).map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect();
+    let rest_only = cmd == "pieces" && flag("--rest");
+    if rpcs.is_empty() && (cmd != "pieces" || rest_only) { return Err("--rpc ADDR needed".into()); }
+    if rpcs.len() == 1 && (matches!(cmd, "send" | "sweep" | "void") || rest_only) {
+        eprintln!("note: only one node asked (--rpc): give --rpc again with another node, reached another way, and every decision is cross-checked");
+    }
     let rpc = rpcs.first().cloned().unwrap_or_default();
     let size = BOOK_SIZE;
     let cheques: u32 = opt("--cheques").map_or(Ok(BATCH), |v| v.parse()).map_err(|_| "bad --cheques")?;
     if !(1..=size).contains(&cheques) { return Err(format!("--cheques must be 1 to {size}")); }
+    let confirmations: u32 = opt("--confirmations").map_or(Ok(CONFIRMATIONS), |v| v.parse()).ok().filter(|&k| k >= 1).ok_or("--confirmations takes a number of blocks, 1 or more")?;
+    let wait: u64 = opt("--wait").map_or(Ok(WAIT_SECONDS), |w| w.parse()).map_err(|_| "bad --wait (seconds)")?;
     let id = hex(&book.id());
     let account_at = |rpc: &str| -> Result<Vec<(String, String)>, String> {
         Ok(http(rpc, "GET", &format!("/id/{id}"), "")?.lines().filter_map(|l| l.split_once(' ').map(|(k, v)| (clean(k), clean(v)))).collect())
@@ -57,19 +86,110 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
         let reply = http(&rpc, "POST", "/tx", &txs.iter().map(|t| hex(&t.encode())).collect::<Vec<_>>().join("\n"))?;
         match reply.lines().find(|l| !matches!(l.trim(), "ok" | "already in mempool" | "batch overlaps")) { None => Ok(()), Some(e) => Err(format!("node refused: {}", clean(e))) }
     };
-    if cmd == "pieces" {
-        // raw pieces as hex, for tests; recorded like any cheque, so the number is never signed again with other digits
-        let cheque: u16 = opt("--cheque").ok_or("--cheque N needed")?.parse().map_err(|_| "bad --cheque")?;
-        if cheque as u32 >= size { return Err(format!("--cheque must be below {size}")); }
-        let d = opt("--digits").ok_or("--digits needed")?;
+    // what each node reports is only believed within this book
+    let num = |v: &str, what: &str| -> Result<Option<u16>, String> {
+        if v == "none" { return Ok(None); }
+        v.parse::<u16>().ok().filter(|&n| (n as u32) < size).map(Some).ok_or(format!("a node reports {what} {}, not a cheque of this book: try another node", clean(v)))
+    };
+    let list = |v: &str, what: &str| -> Result<Vec<u16>, String> { v.split(',').filter(|x| !x.trim().is_empty()).map(|x| num(x.trim(), what).map(Option::unwrap)).collect() };
+    // nonce: the last cheque used (opened); open: the cheque opened and not finished, with the digits revealed so far
+    // and the height it goes at, unfinished
+    let view_at = |r: &str| -> Result<View, String> {
+        let a = account_at(r)?;
+        if field(&a, "book_size") != size.to_string() { return Err(format!("{r} says this book has {} cheques, not {size}: try another node", clean(&field(&a, "book_size")))); }
+        let open = if field(&a, "open") == "none" { vec![] } else { list(&field(&a, "open"), "open")? };
+        let ex = field(&a, "expires");
+        let expires = if ex == "none" { vec![] } else { ex.split(',').map(|e| e.split_once(':').and_then(|(n, h)| Some((num(n, "open").ok()??, h.parse::<u32>().ok()?))))
+            .collect::<Option<Vec<_>>>().ok_or(format!("{r} gave a bad expires line: try another node"))? };
+        if !open.iter().all(|n| expires.iter().any(|e| e.0 == *n)) { return Err(format!("{r} gave no expiry for an open cheque: try another node")); }
+        Ok(View { nonce: num(&field(&a, "nonce"), "nonce")?, open, expires, a })
+    };
+    // every node's view, which must all say the same (else Err, or Ok(None) when `lenient`: a wait goes on polling)
+    let agreed = |lenient: bool| -> Result<Option<View>, String> {
+        let mut views = Vec::new();
+        for r in &rpcs { match view_at(r) { Ok(v) => views.push(v), Err(e) if !lenient => return Err(e), Err(_) => return Ok(None) } }
+        if views.windows(2).any(|w| w[0].key() != w[1].key()) {
+            if lenient { return Ok(None); }
+            return Err("the nodes disagree on this book (its last cheque, open cheque, revealed digits or expiry): wait a block and try again".into());
+        }
+        Ok(views.into_iter().next())
+    };
+    // the lowest and highest tip height among the nodes
+    let heights = || -> Result<(u32, u32), String> {
+        let mut hs = Vec::new();
+        for r in &rpcs { hs.push(http(r, "GET", "/height", "")?.trim().parse::<u32>().map_err(|_| format!("{r} gave a bad height"))?); }
+        Ok((*hs.iter().min().unwrap(), *hs.iter().max().unwrap()))
+    };
+    // whether the amount of an open cheque may be released: its opening `confirmations` blocks deep on every node (the
+    // opening's block is its expiry less piece_lifetime), and far enough from its expiry. Err when it never may.
+    let deep = |v: &View, n: u16| -> Result<bool, String> {
+        let Some(exp) = v.expiry(n) else { return Ok(false) };
+        let Ok((low, high)) = heights() else { return Ok(false) };   // a node not answering: not yet
+        let left = exp.saturating_sub(high);
+        if left < EXPIRY_MARGIN { return Err(format!("cheque {n}'s opening expires in {left} blocks: too close to send its amount (it could land after the opening is gone). Run `wallet void` to close it, then send again")); }
+        Ok(low + 1 >= exp.saturating_sub(p.piece_lifetime) + confirmations)
+    };
+    let tampered = |n: u16| format!("cheque {n} shows cells this machine never sent (someone holds a printed part of it?): nothing more is sent on it. \
+        Run `wallet void` to close it, and sweep to a new book: a part of this book's cheques may be exposed");
+    // a dry run of `txs` on every node: Ok(the txs the first node still needs) when each says "ok" with the rows of our
+    // digits, or that it has the cells already; Err (tampered or refused) otherwise
+    let dry_run = |n: u16, txs: &[Tx], digits: &[u8; COLS], again: &str| -> Result<Vec<Tx>, String> {
+        let mut send = Vec::new();
+        for r in &rpcs {
+            let reply = http(r, "POST", "/check", &txs.iter().map(|t| hex(&t.encode())).collect::<Vec<_>>().join("\n")).map_err(|e| format!("{e}\ncheque {n} may still be live: {again}"))?;
+            let lines: Vec<&str> = reply.lines().map(str::trim).collect();
+            if lines.len() != txs.len() { return Err(format!("{r} gave a bad dry run\ncheque {n} may still be live: {again}")); }
+            for (t, l) in txs.iter().zip(lines) {
+                // the rows the node read from our cells must be our digits: else it holds other commitments than this book's
+                let ours: String = match t { Tx::ChequePiece { column, .. } => vec![*column], Tx::ChequeOpen { pieces, .. } => pieces.iter().map(|x| x.0).collect(), _ => vec![] }
+                    .iter().map(|&c| char::from(b'0' + digits[c as usize])).collect();
+                if let Some(rows) = l.strip_prefix("ok ") {
+                    if rows != ours { return Err(format!("{r} reads cheque {n}'s cells as {}, not {ours}: it does not hold this book as registered; nothing more is sent. Try another node", clean(rows))); }
+                    if r == &rpc { send.push(t.clone()); }
+                }
+                else if matches!(l, "column revealed with other digits" | "cheque open with other digits") { return Err(tampered(n)); }
+                else if !matches!(l, "column already revealed" | "cheque already open") { return Err(format!("{r} refuses cheque {n}: {}\ncheque {n} may still be live: {again}", clean(l))); }
+            }
+        }
+        Ok(send)
+    };
+    // poll every node until `ready` holds on the view they all agree on, or `wait` seconds pass (Ok(false))
+    let poll = |ready: &dyn Fn(&View) -> Result<bool, String>| -> Result<bool, String> {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(v) = agreed(true)? { if ready(&v)? { return Ok(true); } }
+            if start.elapsed().as_secs() >= wait { return Ok(false); }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    };
+    let parse_digits = |d: &str| -> Result<[u8; COLS], String> {
         let digits: [u8; COLS] = d.bytes().map(|c| c.wrapping_sub(b'0')).collect::<Vec<_>>().try_into().map_err(|_| "--digits must be 18 digits")?;
         if digits.iter().any(|&x| x > 9) { return Err("--digits must be 18 digits".into()); }
+        Ok(digits)
+    };
+    if cmd == "pieces" {
+        // raw transactions as hex, for tests and hand use: first the opening alone, recorded like any cheque (so the number
+        // is never signed again with other digits); the 5 remaining pieces only with --rest, for the cheque recorded here
+        // and once its opening is deep enough on chain with these digits
+        let cheque: u16 = opt("--cheque").ok_or("--cheque N needed")?.parse().map_err(|_| "bad --cheque")?;
+        if cheque == 0 || cheque as u32 >= size { return Err(format!("--cheque must be 1 to {} (0 is the honesty check)", size - 1)); }
+        let digits = parse_digits(&opt("--digits").ok_or("--digits needed")?)?;
         let rec = record()?;
+        let (open, rest) = book.halves(cheque, &digits);
+        if rest_only {
+            if rec.read()? != Some((cheque, Some(digits))) { return Err(format!("this machine has no record of cheque {cheque} with these digits: print its opening first (without --rest)")); }
+            let v = agreed(false)?.unwrap();
+            if v.revealed(cheque).iter().zip(digits).any(|(r, d)| r.is_some_and(|r| r != d)) { return Err(tampered(cheque)); }
+            if !v.open.contains(&cheque) || v.revealed(cheque)[..=PART_A].iter().zip(&digits).any(|(r, d)| *r != Some(*d)) { return Err(format!("cheque {cheque} is not open with these digits on chain: send its opening first, and wait for it")); }
+            if !deep(&v, cheque)? { return Err(format!("cheque {cheque}'s opening is not {confirmations} blocks deep yet: wait, and ask again")); }
+            for t in rest { println!("{}", hex(&t.encode())); }
+            return Ok(());
+        }
         if let Some((n, d)) = rec.read()? { if cheque < n || (cheque == n && d != Some(digits)) {
             return Err(format!("this machine signed cheques up to {n} already: cheque {cheque} is never signed with other digits"));
         } }
         rec.write(cheque, &digits)?;
-        for t in book.pieces(cheque, &digits) { println!("{}", hex(&t.encode())); }
+        println!("{}", hex(&open.encode()));
         return Ok(());
     }
     match cmd {
@@ -78,6 +198,8 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
             Err(_) => println!("id {id}\nnot registered"),
         },
         "register" | "more" => {
+            // a rerun of a registration that went through (a lost reply, say) has nothing left to do
+            if cmd == "register" && account().is_ok() { println!("id {id}\nalready registered"); return Ok(()); }
             // `more` starts after the highest cheque the chain knows (unspent or used), at a batch boundary
             let first = if cmd == "register" { 0 } else {
                 let a = account()?;
@@ -92,16 +214,18 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
             // easier than consensus allows (the registration would be refused)
             if target < U256::one_shl(200) { return Err("the node's registration target is implausibly hard: try another node".into()); }
             if target > p.reg_pow_target { return Err("the node's registration target is easier than the chain allows: try another node".into()); }
+            // a little below it, so registrations in the block before ours (which make the next target harder) do not void the work
+            let target = target.div_u64(16).mul_u64(15);
             // the proof of work names the node's tip, so it is valid for the next reg_anchor_window blocks only
             let anchor: [u8; 32] = bitcheque::rpc::unhex(&http(&rpc, "GET", "/tip", "")?).and_then(|v| v.try_into().ok()).ok_or("bad tip")?;
             let regs = book.registrations(first, first + cheques - 1);
             let mut txs: Vec<_> = regs.iter().map(|reg| mine_registration(reg.clone(), anchor, target)).collect(); // each batch of 16 pays its own proof of work
-            // honesty check: cheque 0, zero coins, to nobody. Recorded before it is signed, so if its pieces never reach the
-            // chain no later cheque takes number 0 (mixed with the honesty check's pieces, a sweep could go to number 0)
+            // honesty check: cheque 0, zero coins, to nobody, one opening of all 18 columns. Recorded before it is signed,
+            // so if it never reaches the chain no later cheque takes number 0
             let mut honesty = false;
             let zero = Message::new(0, 0, 0, 0);
             if let Some(r) = &rec { match r.read()? {
-                None | Some((0, _)) => { r.write(0, &zero.digits())?; txs.extend(book.sign(0, &zero)); honesty = true; }
+                None | Some((0, _)) => { r.write(0, &zero.digits())?; txs.push(book.open_all(0, &zero.digits())); honesty = true; }
                 Some((n, _)) => eprintln!("warning: this machine signed cheques up to {n} already: the honesty check (cheque 0) is not sent again"),
             } }
             post_all(&txs)?;
@@ -109,8 +233,9 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
             println!("id {id}\ncheques {first}-{last} registered{}", if honesty { ", honesty check (cheque 0) sent" } else { "" });
         }
         "send" | "sweep" | "void" => {
-            let wait: u64 = opt("--wait").map_or(Ok(WAIT_SECONDS), |w| w.parse()).map_err(|_| "bad --wait (seconds)")?;
-            let tier: u8 = if cmd == "void" { 0 } else { opt("--fee").map_or(Ok(1), |f| f.parse()).ok().filter(|&t| t <= 9).ok_or("--fee is a tier from 0 to 9")? };
+            let tier: u8 = if cmd == "void" { 0 } else { opt("--fee").map_or(Ok(1), |f| f.parse()).ok().filter(|&t| t <= 9).ok_or("--fee is a tier from 1 to 9")? };
+            // tier 0 is for zero cheques, and a zero cheque is a void: `wallet void` writes it
+            if tier == 0 && cmd != "void" { return Err("--fee 0 is only for a void (zero coins to nobody): use `wallet void`, or a fee tier from 1 to 9".into()); }
             // a sweep (mantissa 0000, exponent 9) moves the whole balance minus the fee: how a used-up book moves on.
             // A void is zero coins to nobody: once in a block, no lower cheque can ever complete (§10.13)
             let to = if cmd == "void" { 0 } else { payee(&opt("--to").ok_or("--to NUMBER needed: the recipient's 12 digits, as NNNNNNNNNNN-C")?)? };
@@ -120,8 +245,8 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
                     .ok_or("amount needs at most 4 significant digits")?
             };
             let msg = Message::new(to, mantissa, exponent, tier);
-            // checked as consensus reads it before anything is recorded or signed: a cheque the chain refuses (fee tier 0
-            // with coins, say) is only refused at its last piece, and its number is burned by then
+            // checked as consensus reads it before anything is recorded or signed: a cheque the chain refuses is only
+            // refused at its last piece, and its number is used by then
             match message::parse(&msg.digits()) { Ok(m) if m == msg => {} Ok(_) => return Err("the cheque does not read back as written".into()), Err(e) => return Err(format!("not a valid cheque: {e}")) }
             if to == 0 && !msg.is_zero() && !flag("--burn") {
                 return Err("number 0 is nobody: coins sent to it go to the block's miner. Pass --burn if that is really what you want".into());
@@ -130,43 +255,22 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
             // locked from here until the cheque is in a block: another run waits, then sees this cheque's number
             let rec = record()?;
             let used = rec.read()?;
-            // every node asked must agree on the book; what they report is only believed within it, and the most
-            // cautious answer wins (highest consumed number, every queued one, a cheque all of them list unspent)
-            let num = |v: &str, what: &str| -> Result<Option<u16>, String> {
-                if v == "none" { return Ok(None); }
-                v.parse::<u16>().ok().filter(|&n| (n as u32) < size).map(Some).ok_or(format!("a node reports {what} {}, not a cheque of this book: try another node", clean(v)))
-            };
-            let list = |v: &str, what: &str| -> Result<Vec<u16>, String> { v.split(',').filter(|x| !x.trim().is_empty()).map(|x| num(x.trim(), what).map(Option::unwrap)).collect() };
-            // nonce: the last cheque bound (a cell of both printed parts on chain); open: every cheque with cells on chain
-            // that is not finished, with the digits revealed so far
-            let state_at = |r: &str| -> Result<(Vec<(String, String)>, Option<u16>, Vec<u16>), String> {
-                let a = account_at(r)?;
-                if field(&a, "book_size") != size.to_string() { return Err(format!("{r} says this book has {} cheques, not {size}: try another node", clean(&field(&a, "book_size")))); }
-                let open = if field(&a, "open") == "none" { vec![] } else { list(&field(&a, "open"), "open")? };
-                Ok((num(&field(&a, "nonce"), "nonce")?, open)).map(|(nonce, open)| (a, nonce, open))
-            };
-            // the digits an open cheque shows on chain, '.' (None) for a column not revealed yet
-            let revealed = |a: &[(String, String)], n: u16| -> [Option<u8>; COLS] {
-                let v = field(a, "revealed");
-                v.split(',').find_map(|e| e.strip_prefix(&format!("{n}:"))).filter(|d| d.len() == COLS)
-                    .map_or([None; COLS], |d| std::array::from_fn(|i| d.as_bytes()[i].checked_sub(b'0').filter(|&x| x <= 9)))
-            };
-            // someone else (a stolen or photographed part) revealed a column of this cheque with other digits: sending more
-            // would finish their cheque, not this one
-            let pinned = |a: &[(String, String)], n: u16| revealed(a, n).iter().zip(digits).any(|(r, d)| r.is_some_and(|r| r != d));
-            let tampered = |n: u16| format!("cheque {n} shows cells this machine never sent (someone holds a printed part of it?): nothing more is sent on it. \
-                Run `wallet void` to close it, and sweep to a new book: a part of this book's cheques may be exposed");
-            let mut states = Vec::new();
-            for r in &rpcs { states.push(state_at(r)?); }
-            // cheque n is over on a node when its nonce reached n and it is not the open one: completed, or dead
-            let done = |nonce: Option<u16>, open: &[u16], n: u16| nonce.is_some_and(|x| x >= n) && !open.contains(&n);
-            // the cheque this machine signed last, if some node does not show it over yet (cheque 0 as the honesty
-            // check moves nothing and has nothing below it to void)
-            let live = used.filter(|&(n, d)| (n > 0 || d.is_some_and(|d| d != [0; COLS])) && !states.iter().all(|(_, nonce, open)| done(*nonce, open, n)));
-            let resume = matches!(live, Some((_, Some(d))) if d == digits);
-            let cheque = if let Some((n, _)) = live.filter(|_| resume) {
+            // every node asked must report the book alike (MEDIUM-4: one node could hide an open or queued cheque)
+            let v = agreed(false)?.unwrap();
+            // the cheque this machine signed last, if it is not over yet (cheque 0 as the honesty check moves nothing and
+            // has nothing below it to void)
+            let honesty = |n: u16, d: Option<[u8; COLS]>| n == 0 && d.map_or(true, |d| d == [0; COLS]);
+            let live = used.filter(|&(n, d)| !honesty(n, d) && !v.done(n));
+            // the same payment as the cheque recorded here (same recipient, amount and fee)
+            let same = used.filter(|&(n, d)| !honesty(n, d) && d == Some(digits)).map(|u| u.0);
+            if let Some(n) = same.filter(|&n| v.done(n) && cmd != "void") {
+                if !flag("--again") { return Err(format!("payment already made (cheque {n}): this machine wrote this same cheque as cheque {n}, and it is over \
+                    (paid, or closed unfinished: `wallet info` and the account's history show which). Pass --again to pay the same again on a new cheque")); }
+            }
+            // a void again after a void that is over: nothing new is live (it would be the record's cheque), so that void stands
+            let cheque = if let Some(n) = same.filter(|_| live.is_some() || cmd == "void") {
                 // the same cheque again (a lost reply, a half-sent cheque): finished, never re-written on another number
-                eprintln!("cheque {n} is this same cheque and is not finished yet: finishing it");
+                if live.is_some() { eprintln!("cheque {n} is this same cheque and is not finished yet: finishing it"); } else { eprintln!("cheque {n} is this same void, done already"); }
                 n
             } else {
                 if let Some((n, _)) = live.filter(|_| cmd != "void") {
@@ -174,37 +278,31 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
                 }
                 // no payment signed here before (a new machine, a restored seed, a new --state-dir): one node could hide
                 // an open or queued cheque, so two that agree are needed, or the holder's word that the book is fresh
-                if used.map_or(true, |(n, _)| n == 0) && !flag("--fresh") {
-                    if rpcs.len() < 2 { return Err("this machine has no record of the book's cheques: give two or more nodes that agree (--rpc A,B), or pass --fresh if this book has never signed a cheque anywhere else".into()); }
-                    if states.windows(2).any(|w| (w[0].1, &w[0].2) != (w[1].1, &w[1].2)) { return Err("the nodes disagree on this book's last cheque: wait a block and try again, or pass --fresh if this book has never signed a cheque anywhere else".into()); }
+                if used.map_or(true, |(n, _)| n == 0) && !flag("--fresh") && rpcs.len() < 2 {
+                    return Err("this machine has no record of the book's cheques: give two or more nodes that agree (--rpc A --rpc B), or pass --fresh if this book has never signed a cheque anywhere else".into());
                 }
-                let (mut top, mut queued, mut unspent): (Option<u16>, Vec<u16>, Vec<Vec<u16>>) = (None, vec![], vec![]);
-                for (r, (a, nonce, open)) in rpcs.iter().zip(&states) {
-                    top = top.max(*nonce);
-                    // an open cheque (half sent from elsewhere, or pinned by someone holding one printed part) is never
-                    // written again: skipped, it binds nothing and lower cheques stay usable
-                    queued.extend(open);
-                    unspent.push(list(&field(a, "unspent"), "unspent")?);
+                let (mut queued, mut unspent): (Vec<u16>, Vec<Vec<u16>>) = (v.open.clone(), vec![]);
+                for r in &rpcs {
+                    unspent.push(list(&field(&account_at(r)?, "unspent"), "unspent")?);
                     // never two cheques with one number: skip those waiting in a node's queue (asked fresh, failing hard if a node will not say)
                     queued.extend(list(&http(r, "GET", &format!("/queued/{id}"), "")?, "queued")?);
                 }
-                // the lowest cheque above everything bound or signed here before, neither open nor queued (a node's answers may
+                // the lowest cheque above everything used or signed here before, neither open nor queued (a node's answers may
                 // be a few seconds old), and never 0, the honesty check's number
-                let floor = [used.map(|u| u.0), top].iter().flatten().map(|&n| n + 1).max().unwrap_or(1).max(1);
+                let floor = [used.map(|u| u.0), v.nonce].iter().flatten().map(|&n| n + 1).max().unwrap_or(1).max(1);
                 let cheque = unspent[0].iter().copied().filter(|&n| n >= floor && !queued.contains(&n) && unspent.iter().all(|u| u.contains(&n))).min().ok_or("no unused cheques left")?;
-                // completing a cheque burns every lower one forever: a stale or lying node must not make this wallet jump far
+                // opening a cheque burns every lower one forever: a stale or lying node must not make this wallet jump far
                 if cheque - floor > 3 {
-                    if !flag("--force-skip") { return Err(format!("the next free cheque looks like {cheque}, which would burn cheques {floor}-{} forever; the node may be stale or lying: try another (--rpc A,B asks both), or pass --force-skip if you are sure", cheque - 1)); }
+                    if !flag("--force-skip") { return Err(format!("the next free cheque looks like {cheque}, which would burn cheques {floor}-{} forever; the node may be stale or lying: try another (--rpc A --rpc B asks both), or pass --force-skip if you are sure", cheque - 1)); }
                     eprintln!("warning: --force-skip: cheques {floor}-{} are burned forever", cheque - 1);
                 }
                 // the remaining checks happen here, from what the chain says publicly: no cell leaves this machine before
                 // the cheque is sent for real, and exactly one cheque is signed per payment
-                let balance: u64 = field(&states[0].0, "balance").parse().map_err(|_| "the node gave no balance")?;
+                let balance: u64 = v.field("balance").parse().map_err(|_| "the node gave no balance")?;
                 let fee = tier as u64 * p.fee_unit;
                 let amount = msg.amount().unwrap_or(0);
                 if balance < amount + fee { return Err(format!("balance {} is less than {} coins and the fee", balance as f64 / COIN as f64, (amount + fee) as f64 / COIN as f64)); }
-                // every node must know the recipient as a final number: a cheque to a number nobody holds yet would pay
-                // whoever is given it later
+                // every node must know the recipient as a final number: a cheque to a number nobody holds yet is void
                 if to != 0 { for r in &rpcs {
                     let t = http(r, "GET", &format!("/account/{to}"), "").unwrap_or_default();
                     if !t.lines().any(|l| l == format!("number {to}")) { return Err(format!("{r}: account {to} is not a final number yet (or does not exist)")); }
@@ -222,45 +320,35 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
                 rec.write(cheque, &digits)?;
                 cheque
             };
-            let pieces = book.sign(cheque, &msg);
             let again = if cmd == "void" { "run `wallet void` again" } else { "run the same command again to finish it, or `wallet void` to cancel it" };
-            // a void goes in one piece: nothing in it to protect. A payment's recipient half first, in a block before
-            // its amount half is shown to anyone (§10.12)
-            let halves: Vec<&[Tx]> = if cmd == "void" { vec![&pieces] } else { vec![&pieces[..RECIPIENT], &pieces[RECIPIENT..]] };
-            let mut in_block = false;
-            for (i, half) in halves.iter().enumerate() {
-                let last = i + 1 == halves.len();
-                for r in &rpcs { if state_at(r).is_ok_and(|(a, _, _)| pinned(&a, cheque)) { return Err(tampered(cheque)); } }
-                // dry run on every node first; a piece a node already has (an earlier run sent it) is not sent again
-                let mut send = Vec::new();
-                for r in &rpcs {
-                    let reply = http(r, "POST", "/check", &half.iter().map(|t| hex(&t.encode())).collect::<Vec<_>>().join("\n"))
-                        .map_err(|e| format!("{e}\ncheque {cheque} may still be live: {again}"))?;
-                    let lines: Vec<&str> = reply.lines().map(str::trim).collect();
-                    if lines.len() != half.len() { return Err(format!("{r} gave a bad dry run\ncheque {cheque} may still be live: {again}")); }
-                    for (t, l) in half.iter().zip(lines) {
-                        if l == "ok" || l.starts_with("ok ") { if r == &rpc { send.push(t.clone()); } }
-                        else if l == "column revealed with other digits" { return Err(tampered(cheque)); }
-                        else if l != "column already revealed" { return Err(format!("{r} refuses cheque {cheque}: {}\ncheque {cheque} may still be live: {again}", clean(l))); }
-                    }
-                }
+            let other = |v: &View| v.revealed(cheque).iter().zip(digits).any(|(r, d)| r.is_some_and(|r| r != d));
+            // a void goes in one transaction, all 18 columns: nothing in it to protect. A payment's opening first (the
+            // recipient and one amount column), and its 5 remaining pieces only once that is deep enough in a block (§10.12)
+            let (open, rest) = if cmd == "void" { (book.open_all(cheque, &digits), vec![]) } else { book.halves(cheque, &digits) };
+            let v = agreed(false)?.unwrap();
+            if other(&v) { return Err(tampered(cheque)); }
+            if !v.done(cheque) && !v.open.contains(&cheque) {
+                let send = dry_run(cheque, std::slice::from_ref(&open), &digits, again)?;
                 if !send.is_empty() { post_all(&send).map_err(|e| format!("{e}\ncheque {cheque} may still be live: {again}"))?; }
-                // wait for this half in a block on every node: the recipient half as the open cheque, the rest as done
-                let start = std::time::Instant::now();
-                in_block = loop {
-                    let mut all = true;
-                    for r in &rpcs {
-                        // the recipient half counts once the chain shows exactly these 12 digits on this open cheque
-                        let ok = state_at(r).is_ok_and(|(a, nonce, open)| done(nonce, &open, cheque)
-                            || (!last && open.contains(&cheque) && revealed(&a, cheque)[..RECIPIENT].iter().zip(&digits).all(|(r, d)| *r == Some(*d))));
-                        if !ok { all = false; break; }
-                    }
-                    if all { break true; }
-                    if start.elapsed().as_secs() >= wait { break false; }
-                    std::thread::sleep(std::time::Duration::from_secs(3));
-                };
-                if !in_block && !last { return Err(format!("cheque {cheque} is half sent: its recipient pieces are not in a block after {wait} seconds; {again}")); }
             }
+            let in_block = if cmd == "void" { poll(&|v| Ok(v.done(cheque)))? } else {
+                // the opening counts once every node shows exactly our digits on this open cheque, deep enough
+                let ready = poll(&|v| {
+                    if other(v) { return Err(tampered(cheque)); }
+                    if v.done(cheque) { return Ok(true); }
+                    Ok(v.open.contains(&cheque) && v.revealed(cheque)[..=PART_A].iter().zip(&digits).all(|(r, d)| *r == Some(*d)) && deep(v, cheque)?)
+                })?;
+                if !ready { return Err(format!("cheque {cheque} is half sent: its opening is not {confirmations} blocks deep on every node after {wait} seconds; {again}")); }
+                // released only now, and only on what every node agrees on: our digits, deep enough, not near expiry
+                let v = agreed(false)?.unwrap();
+                if other(&v) { return Err(tampered(cheque)); }
+                if !v.done(cheque) {
+                    if !deep(&v, cheque)? { return Err(format!("cheque {cheque}'s opening is no longer {confirmations} blocks deep on every node (a reorganisation?); {again}")); }
+                    let send = dry_run(cheque, &rest, &digits, again)?;
+                    if !send.is_empty() { post_all(&send).map_err(|e| format!("{e}\ncheque {cheque} may still be live: {again}"))?; }
+                }
+                poll(&|v| { if other(v) { return Err(tampered(cheque)); } Ok(v.done(cheque)) })?
+            };
             drop(rec);
             let what = if cmd == "sweep" { format!("{} sweeps the whole balance to {to}, fee tier {tier}", msg.display()) }
                 else if cmd == "void" { format!("{} voids every lower cheque", msg.display()) }
@@ -371,7 +459,8 @@ impl Record {
                 let n = w.next().and_then(|n| n.parse::<u16>().ok()).filter(|&n| (n as u32) < self.size).ok_or_else(bad)?;
                 let d = match w.next() {
                     None => None,
-                    Some(d) => Some(d.bytes().map(|c| c.wrapping_sub(b'0')).filter(|&x| x <= 9).collect::<Vec<_>>().try_into().map_err(|_| bad())?),
+                    Some(d) if d.bytes().all(|c| c.is_ascii_digit()) => Some(d.bytes().map(|c| c - b'0').collect::<Vec<_>>().try_into().map_err(|_| bad())?),
+                    Some(_) => return Err(bad()),
                 };
                 if w.next().is_some() { return Err(bad()); }
                 Ok(Some((n, d)))
@@ -402,10 +491,11 @@ const O_NOFOLLOW: i32 = 0o400000;
 const O_NOFOLLOW: i32 = 0o100000;
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
 const O_NOFOLLOW: i32 = 0x100;
-#[cfg(not(any(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "s390x",
-                                           target_arch = "arm", target_arch = "aarch64", target_arch = "powerpc", target_arch = "powerpc64")),
-              target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")))]
-const O_NOFOLLOW: i32 = 0;
+// anywhere else it is unknown here: no build, rather than record files opened through symbolic links
+#[cfg(all(unix, not(any(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "s390x",
+                                                    target_arch = "arm", target_arch = "aarch64", target_arch = "powerpc", target_arch = "powerpc64")),
+                       target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))))]
+compile_error!("O_NOFOLLOW is not known for this target: add its value in cli_wallet.rs");
 
 /// A file only its owner may read, never opened through a symbolic link.
 fn private(o: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {

@@ -951,24 +951,37 @@ impl Node {
         out
     }
     /// Dry run: apply `txs` in order on a copy of the next block's state (after the mempool).
-    /// Nothing is stored or relayed. Returns one result per transaction: for a cheque piece, the row (digit) its
-    /// cell matched, so a wallet can tell a cell copied from the wrong row of the right column. A repeat of an earlier
-    /// line is answered "duplicate transaction" without being checked again.
-    pub fn check_txs(&self, txs: &[Tx]) -> Vec<Result<Option<u8>, &'static str>> {
+    /// Nothing is stored or relayed. Returns one result per transaction: for a cheque piece, the row (digit) its cell
+    /// matched, for a cheque opening the row of each of its columns in order (a string of digits), so a wallet can tell a
+    /// cell copied from the wrong row of the right column. A repeat of an earlier line is answered "duplicate
+    /// transaction" without being checked again.
+    pub fn check_txs(&self, txs: &[Tx]) -> Vec<Result<Option<String>, &'static str>> {
         if txs.is_empty() { return Vec::new(); }
         let pre = self.prechecks(txs.iter().map(|t| (t, t.txid())));
         if pre.iter().all(|r| r.is_err()) { return pre.into_iter().map(|r| r.map(|_| None)).collect(); }
         let s = self.store.lock().unwrap(); let c = &s.chain;
         let m = self.mempool.lock().unwrap();
         let mut st = Self::next_state(c, &m, &mut self.next.lock().unwrap()).clone();
+        // does the open cheque show another digit than `rows` in any of their columns?
+        let other = |st: &State, account: &Vec<u8>, cheque: &u16, rows: &[(u8, Option<u8>)]|
+            st.accounts.get(account).and_then(|a| a.open.get(cheque)).is_some_and(|o| rows.iter().any(|&(col, r)| o.digits[col as usize] != r));
         txs.iter().zip(pre).map(|(t, pre)| {
             pre?;
-            let row = match t { Tx::ChequePiece { account, cheque, column, shares } => st.piece_digit(account, *cheque, *column, shares), _ => None };
-            st.apply(&c.params, t).map(|_| row).map_err(|e| match t {
-                // the same cell again is harmless (an earlier run sent it); a column already showing another digit means
+            // (column, row matched) of each cell, read before the tx is applied
+            let rows: Vec<(u8, Option<u8>)> = match t {
+                Tx::ChequePiece { account, cheque, column, shares } => vec![(*column, st.piece_digit(account, *cheque, *column, shares))],
+                Tx::ChequeOpen { account, cheque, pieces } => pieces.iter().map(|(col, sh)| (*col, st.piece_digit(account, *cheque, *col, sh))).collect(),
+                _ => vec![],
+            };
+            let text = (!rows.is_empty()).then(|| rows.iter().map(|(_, r)| r.map_or('?', |r| (b'0' + r) as char)).collect::<String>());
+            st.apply(&c.params, t).map(|_| text).map_err(|e| match t {
+                // the same cells again are harmless (an earlier run sent them); a column already showing another digit means
                 // someone else holds this part of the cheque, and a wallet must not send the rest
-                Tx::ChequePiece { account, cheque, column, .. } if e == "column already revealed"
-                    && st.accounts.get(account).and_then(|a| a.open.get(cheque)).and_then(|o| o.digits[*column as usize]) != row => "column revealed with other digits",
+                Tx::ChequePiece { account, cheque, .. } if e == "column already revealed"
+                    && other(&st, account, cheque, &rows) => "column revealed with other digits",
+                // an opening of a cheque already opened with other digits: someone else holds both parts of it
+                Tx::ChequeOpen { account, cheque, .. } if e == "cheque already open"
+                    && other(&st, account, cheque, &rows) => "cheque open with other digits",
                 _ => e,
             })
         }).collect()

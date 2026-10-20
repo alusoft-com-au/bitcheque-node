@@ -2,6 +2,7 @@
 //! exist: a cheque piece is authorised by hash preimages, registrations are self-verifying.
 use crate::book::{Bytes, ChequeShares};
 use crate::crypto::sha256d;
+use crate::message::{COLS, PART_A};
 
 /// `scheme || root`; scheme = 0x03 | m<<4 | n256<<7.
 pub type AccountId = Vec<u8>;
@@ -35,8 +36,22 @@ pub enum Tx {
     Coinbase { height: u32, payee: u32, message: Vec<u8> },
     RegisterBook { salt: [u8; 16], m: u8, n256: bool, book_size: u32, root: Bytes, batch: Batch, pay: Payment },
     RegisterBatch { account: AccountId, batch: Batch, pay: Payment },
+    /// One column of a cheque already open (§10.12).
     ChequePiece { account: AccountId, cheque: u16, column: u8, shares: Vec<Bytes> },
     Renew { account: AccountId, start: u32 },
+    /// Opens a cheque: (column, shares) for every recipient column 0-11 and at least one amount column 12-17, columns
+    /// strictly rising. Only a holder of both printed parts can make one; it uses the number at once (§10.12).
+    ChequeOpen { account: AccountId, cheque: u16, pieces: Vec<(u8, Vec<Bytes>)> },
+}
+
+/// The columns of a cheque opening: all of part A (0-11), then one or more of part B, strictly rising, below 18.
+pub fn open_columns_ok(cols: impl Iterator<Item = u8>) -> bool {
+    let (mut k, mut last) = (0usize, None::<u8>);
+    for c in cols {
+        if (k < PART_A && c as usize != k) || c as usize >= COLS || last.is_some_and(|l| c <= l) { return false; }
+        k += 1; last = Some(c);
+    }
+    k > PART_A
 }
 
 // ---- byte encoding: little-endian ints, length-prefixed vectors ----
@@ -103,6 +118,10 @@ impl Tx {
                 w.u8(3); w.bytes(account); w.u16(*cheque); w.u8(*column); w.u8(shares.len() as u8); for h in shares { w.bytes(h) }
             }
             Tx::Renew { account, start } => { w.u8(4); w.bytes(account); w.u32(*start) }
+            Tx::ChequeOpen { account, cheque, pieces } => {
+                w.u8(5); w.bytes(account); w.u16(*cheque); w.u8(pieces.len() as u8);
+                for (c, shares) in pieces { w.u8(*c); w.u8(shares.len() as u8); for h in shares { w.bytes(h) } }
+            }
         }
         w.0
     }
@@ -130,6 +149,12 @@ impl Tx {
                    let n = id_n(&account); let mut shares = Vec::new(); for _ in 0..k { shares.push(r.share(n)?) }
                    Tx::ChequePiece { account, cheque, column, shares } }
             4 => Tx::Renew { account: account(r)?, start: r.u32()? },
+            5 => { let account = account(r)?; let cheque = r.u16()?; let k = r.u8()? as usize; if k > COLS { return Err("bad opening"); }
+                   let (m, n) = (id_m(&account), id_n(&account)); let mut pieces = Vec::with_capacity(k);
+                   for _ in 0..k { let c = r.u8()?; if r.u8()? != m { return Err("bad share count"); }
+                                   let mut shares = Vec::new(); for _ in 0..m { shares.push(r.share(n)?) } pieces.push((c, shares)); }
+                   if !open_columns_ok(pieces.iter().map(|p| p.0)) { return Err("bad opening columns"); }
+                   Tx::ChequeOpen { account, cheque, pieces } }
             _ => return Err("unknown tx type"),
         };
         if r.i != r.b.len() { return Err("trailing bytes"); }

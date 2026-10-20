@@ -95,8 +95,11 @@ fn junk_cheque_pieces_are_struck_and_remembered() {
     mine(&v, 0).unwrap();   // block 0 is no registration anchor
     v.submit_tx(mine_registration(b.register(0, 16, Payment::Pow([0; 32], 0)), common::tip(&v), p.reg_pow_target), None).unwrap();
     mine(&v, 0).unwrap();
-    let Tx::ChequePiece { account, .. } = b.pieces(1, &[0u8; 18]).remove(0) else { panic!() };
-    let junk = |i: u32| { let mut cell = vec![0u8; 16]; cell[..4].copy_from_slice(&i.to_le_bytes()); Tx::ChequePiece { account: account.clone(), cheque: 1, column: (i % 18) as u8, shares: vec![cell] } };
+    // cheque 1 open (a piece of a cheque not open is refused before any hashing)
+    v.submit_tx(b.opening(1, &[0u8; 18], 12), None).unwrap();
+    mine(&v, 0).unwrap();
+    let account = b.id();
+    let junk = |i: u32| { let mut cell = vec![0u8; 16]; cell[..4].copy_from_slice(&i.to_le_bytes()); Tx::ChequePiece { account: account.clone(), cheque: 1, column: 13 + (i % 5) as u8, shares: vec![cell] } };
     // direct: refused, then refused again at once while the store is held (the txid is remembered as bad)
     assert_eq!(v.submit_tx(junk(1_000_000), None), Err("no commitment matches"));
     let st = v.store.lock().unwrap();
@@ -110,7 +113,7 @@ fn junk_cheque_pieces_are_struck_and_remembered() {
     let _ = s.write_all(&flood);
     assert!(closed(&mut s, 5), "dropped after a few junk pieces");
     // and an honest piece is still taken
-    assert!(v.submit_tx(b.pieces(1, &[0u8; 18]).remove(0), None).is_ok());
+    assert!(v.submit_tx(b.pieces(1, &[0u8; 18]).remove(13), None).is_ok());
 }
 
 /// A4: a BLOCK frame may be no larger than a block can be, and a block's header is looked at before its transactions
@@ -285,7 +288,8 @@ fn upstream_posts_are_chunked_and_skip_old_blocks() {
     assert!(wait(5, || seen.lock().unwrap().iter().any(|(p, _)| p == "/block")));
     // the registrations went up too, now that it follows: only what comes after them is counted
     let regs = seen.lock().unwrap().iter().filter(|(p, _)| p == "/tx").count();
-    let pieces: Vec<Tx> = books.iter().flat_map(|b| b.pieces(1, &[0u8; 18]).into_iter().take(17)).collect();
+    // each book's cheques 1-15 opened in turn (each closes the one before), and two pieces of cheque 15: 68 transactions
+    let pieces: Vec<Tx> = books.iter().flat_map(|b| (1..=15u16).map(|n| b.opening(n, &[0u8; 18], 12)).chain(b.pieces(15, &[0u8; 18]).into_iter().skip(13).take(2))).collect();
     assert_eq!(pieces.len(), 68);
     assert!(v.submit_txs(pieces, None).iter().all(|r| r.is_ok()));
     assert!(wait(5, || seen.lock().unwrap().iter().filter(|(p, _)| p == "/tx").count() == regs + 2));

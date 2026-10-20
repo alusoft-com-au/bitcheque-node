@@ -29,9 +29,9 @@ fn main() {
     mine(1);
     submit(vec![mine_registration(shop.register(0, 16, Payment::Pow([0; 32], 0)), tip(), p.reg_pow_target)]);
     mine(1); mine(1); mine(1);
-    let pieces = saver.sign(1, &Message::new(3, 4000, 4, 2));             // saver pays the shop 0.4 coins, in two parts
-    submit(pieces[..12].to_vec()); mine(1);
-    submit(pieces[12..].to_vec()); mine(1);
+    let pieces = saver.sign(1, &Message::new(3, 4000, 4, 2));             // saver pays the shop 0.4 coins: the opening, then the rest
+    submit(pieces[..1].to_vec()); mine(1);
+    submit(pieces[1..].to_vec()); mine(1);
     println!("demo ready: accounts 1 (miner), 2 (saver), 3 (shop); mining continues");
     loop { mine(1); std::thread::sleep(std::time::Duration::from_secs(2)); }
 }

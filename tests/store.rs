@@ -95,14 +95,15 @@ fn proof_and_rpc() {
     let pieces = m.sign(1, &Message::new(0, 1000, 2, 1));
     let body2: String = pieces.iter().map(|p| bitcheque::crypto::hex(&p.encode())).collect::<Vec<_>>().join("\n");
     let res = http(format!("POST /check HTTP/1.0\r\nContent-Length: {}\r\n\r\n{}", body2.len(), body2));
-    // each piece's reply names the row its cell matched: the digits of the cheque as written
-    let digits = Message::new(0, 1000, 2, 1).digits();
-    assert_eq!(res.lines().map(String::from).collect::<Vec<_>>(), digits.iter().map(|d| format!("ok {d}")).collect::<Vec<_>>());
+    // each reply names the rows its cells matched: the digits of the cheque as written (the opening's 13 at once)
+    let digits: Vec<String> = Message::new(0, 1000, 2, 1).digits().iter().map(|d| d.to_string()).collect();
+    let want: Vec<String> = [format!("ok {}", digits[..13].concat())].into_iter().chain(digits[13..].iter().map(|d| format!("ok {d}"))).collect();
+    assert_eq!(res.lines().map(String::from).collect::<Vec<_>>(), want);
     let mut bad = m.sign(2, &Message::new(0, 1000, 2, 1));
-    if let bitcheque::tx::Tx::ChequePiece { shares, .. } = &mut bad[3] { shares[0][0] ^= 1 }
+    if let bitcheque::tx::Tx::ChequeOpen { pieces, .. } = &mut bad[0] { pieces[3].1[0][0] ^= 1 }
     let body3: String = bad.iter().map(|p| bitcheque::crypto::hex(&p.encode())).collect::<Vec<_>>().join("\n");
     let res3 = http(format!("POST /check HTTP/1.0\r\nContent-Length: {}\r\n\r\n{}", body3.len(), body3));
-    assert_eq!(res3.lines().nth(3), Some("no commitment matches"));
+    assert_eq!(res3.lines().next(), Some("no commitment matches"));
     assert!(http("GET /account/1 HTTP/1.0\r\n\r\n".into()).contains("nonce none"), "a dry run must not consume a cheque");
 }
 

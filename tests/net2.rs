@@ -331,7 +331,7 @@ fn the_mempool_listing_is_cached() {
     let books: Vec<Book> = (10..30).map(book).collect();
     for ch in books.chunks(10) {
         // against the chain's current target, which tightens after a block full of registrations
-        let target = node.store.lock().unwrap().chain.state.reg_target;
+        let target = node.store.lock().unwrap().chain.state.next_reg_target(&p);
         for b in ch { node.submit_tx(mine_registration(b.register(0, 16, Payment::Pow([0; 32], 0)), common::tip(&node), target), None).unwrap(); }
         mine(&node, 0).unwrap();
     }

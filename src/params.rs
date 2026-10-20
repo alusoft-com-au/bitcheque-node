@@ -24,7 +24,8 @@ pub struct Params {
     pub max_block_bytes: usize,
     pub max_future_seconds: u32,
     pub reg_pow_target: U256,
-    pub reg_pow_window: u32,   // the registration target's time constant: it moves by (window+1)/(window+registrations) every block
+    pub reg_pow_window: u32,   // the registration target's time constant: it moves by (window+1)/(window+reg_per_blocks×registrations) every block
+    pub reg_per_blocks: u32,   // the registration target settles at one registration per this many blocks
     pub reg_anchor_window: u32, // a registration's proof of work names one of the last this many block hashes
     pub reg_pow_per_block_cap: u32,
     pub fee_unit: u64,
@@ -64,7 +65,9 @@ impl Params {
             max_block_bytes: 1_000_000,    // about 1 MB a minute: well within what home connections relay
             max_future_seconds: 720,       // twelve blocks, as Bitcoin's two hours are twelve of its blocks
             reg_pow_target: U256::one_shl(228), // 2^256 / 2^28
-            reg_pow_window: 1_440,         // a day: a block at the cap makes registering 1% harder, an empty one 0.07% easier
+            reg_pow_window: 1_440,         // a day: an empty block makes registering 0.07% easier (e-fold in a day), one
+                                           // registration 0.6% harder, a block at the cap 10% harder (twice as hard in 7)
+            reg_per_blocks: 10,            // one registration per 10 blocks at equilibrium (the edge node's memory, below)
             reg_anchor_window: 144,        // a mined registration must be mined into a block within about 2.4 hours
             reg_pow_per_block_cap: 16,     // about what fits in a block (a registration of 16 cheques is ~58 KB)
             fee_unit: 1000,
@@ -73,7 +76,12 @@ impl Params {
             min_fund: COIN,                // permanence costs a coin held, not one base unit
             renew_window: 43_200,          // the last 30 days of a batch's life
             max_reorg: 100,                // as deep as number_maturity: replacing a final number takes twice the work
-            unfunded_pow_lifetime: 4_320,  // 3 days: one registration a block at the floor target then holds ~200 MB, not ~2 GB
+            // a day. Worst-case state of unfunded registrations (each 16 cheques × 180 cells × 16 bytes ≈ 46 KB): the target
+            // settles at one per 10 blocks, so at the floor target 1,440 / 10 = 144 live ≈ 6.6 MB (the edge node's Durable
+            // Object has 128 MB; at the former one a block for 4,320 blocks it was ~200 MB). More needs more work: within
+            // one lifetime, every further 144 registrations (6.6 MB) make each one e ≈ 2.7 times harder, so 128 MB would
+            // need its last registrations to cost ~10^8 floor registrations' work each
+            unfunded_pow_lifetime: 1_440,
             number_quarantine: 525_600,    // a year
             batch_lifetime: 2_100_000,     // about four years
             piece_lifetime: 10_000,        // about a week

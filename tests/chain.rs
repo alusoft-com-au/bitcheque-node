@@ -57,11 +57,11 @@ fn life_of_the_chain() {
     assert_eq!(net.mine(1, miner.sign(0, &Message::new(2, 1000, 5, 1))), Ok(()));
     assert_eq!(net.balance(&user.id()), COIN);
 
-    // user pays 0.5 coin back with cheque 3, payee columns in one block, the rest in the next
-    let pieces = user.sign(3, &Message::new(1, 5000, 4, 2));
-    net.mine(1, pieces[..12].to_vec()).unwrap();
+    // user pays 0.5 coin back with cheque 3, the opening (payee columns and one more) in one block, the rest in the next
+    let (open, rest) = user.halves(3, &Message::new(1, 5000, 4, 2).digits());
+    net.mine(1, vec![open.clone()]).unwrap();
     assert!(net.chain.state.accounts[&user.id()].open.contains_key(&3));
-    net.mine(1, pieces[12..].to_vec()).unwrap();
+    net.mine(1, rest).unwrap();
     let u = &net.chain.state.accounts[&user.id()];
     assert_eq!((u.balance, u.nonce, u.open.is_empty()), (COIN - 5000 * 10_000 - 2 * p.fee_unit, Some(3), true));
     assert!(!u.commits.contains_key(&1) && !u.commits.contains_key(&2) && !u.commits.contains_key(&3));
@@ -69,17 +69,16 @@ fn life_of_the_chain() {
     // rejections: lower number, replay, wrong shares
     let s = &net.chain.state;
     assert_eq!(s.clone().apply(&p, &user.sign(2, &Message::new(1, 1, 0, 1))[0]), Err("cheque number already consumed"));
-    assert_eq!(s.clone().apply(&p, &pieces[0]), Err("cheque number already consumed"));
+    assert_eq!(s.clone().apply(&p, &open), Err("cheque number already consumed"));
     let mut bad = user.sign(4, &Message::new(1, 1, 0, 1));
-    if let Tx::ChequePiece { shares, .. } = &mut bad[0] { shares[0][0] ^= 1 }
+    if let Tx::ChequeOpen { pieces, .. } = &mut bad[0] { pieces[3].1[0][0] ^= 1 }
     assert_eq!(s.clone().apply(&p, &bad[0]), Err("no commitment matches"));
 
     // wrong check digit: every piece is a valid preimage, completion fails, cheque 4 expires unspent
     let mut d = Message::new(1, 1000, 0, 1).digits();
     d[11] = (d[11] + 1) % 10;
-    let wrong = user.pieces(4, &d);
-    net.mine(1, wrong[..17].to_vec()).unwrap();
-    assert_eq!(net.chain.state.clone().apply(&p, &wrong[17]), Err("payee check digit wrong"));
+    net.mine(1, vec![user.opening(4, &d, 16)]).unwrap();
+    assert_eq!(net.chain.state.clone().apply(&p, &user.pieces(4, &d)[17]), Err("payee check digit wrong"));
     for _ in 0..3 { net.mine(1, vec![]).unwrap(); }
     let u = &net.chain.state.accounts[&user.id()];
     assert!(u.open.is_empty() && !u.commits.contains_key(&4) && u.nonce == Some(4));
@@ -162,12 +161,13 @@ fn registration_target_tightens_and_loosens() {
     let p = Params::mainnet();
     let mut s = State::new(&p);
     s.reg_target = p.reg_pow_target.div_u64(16);
-    for h in 1..=144 { s.reg_block_count = p.reg_pow_per_block_cap; s.begin_block(&p, h); }   // 144 blocks at the cap
-    assert!(s.reg_target < p.reg_pow_target.div_u64(64) && s.reg_target > p.reg_pow_target.div_u64(128), "a burst: about 4.5 times harder in 144 blocks");
+    for h in 1..=14 { s.reg_block_count = p.reg_pow_per_block_cap; s.begin_block(&p, h); }   // 14 blocks at the cap
+    assert!(s.reg_target < p.reg_pow_target.div_u64(64) && s.reg_target > p.reg_pow_target.div_u64(128), "a burst: about 4.3 times harder in 14 blocks");
     let hard = s.reg_target;
-    s.reg_block_count = 1; s.begin_block(&p, 145);
-    assert_eq!(s.reg_target.div_u64(1 << 20), hard.div_u64(1 << 20), "one a block: steady");
-    for h in 146..146 + p.reg_pow_window { s.begin_block(&p, h); }
+    s.reg_block_count = 1; s.begin_block(&p, 15);
+    for h in 16..25 { s.begin_block(&p, h); }
+    assert!(s.reg_target > hard.div_u64(1000).mul_u64(999) && s.reg_target < hard.div_u64(1000).mul_u64(1001), "one per 10 blocks: steady");
+    for h in 25..25 + p.reg_pow_window { s.begin_block(&p, h); }
     assert!(s.reg_target > hard.mul_u64(2) && s.reg_target < hard.mul_u64(3), "a quiet day: about e times easier");
     for h in 0..20_000 { s.begin_block(&p, 10_000 + h); }
     assert_eq!(s.reg_target, p.reg_pow_target, "never easier than the genesis target");
