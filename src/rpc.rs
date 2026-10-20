@@ -33,14 +33,41 @@ const CHECK_MAX: usize = 64;       // transactions per /check or per batched /tx
 const BODY_MAX: usize = 8 << 20;   // request body bytes (16 registrations of 16 cheques, with a cheque, are under 2 MB of hex)
 const HEAD_MAX: usize = 16 << 10;  // request line and headers
 const RPC_THREADS: usize = 256;    // requests served at once
-const PER_IP: usize = 8;           // ...of which from one address (an IPv6 /64)
-const DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);   // the whole request must arrive within this
+const PER_IP: usize = 8;           // ...of which from one address (an IPv6 /56: a home or a server may have that much)
+const DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);   // the whole request must arrive within this, plus a second per 32 KB of body received
+const WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);   // ...and the whole reply must be taken within this
+const CHECK_REGS: usize = 2;       // registrations per /check (each can cost thousands of hashes)
 const MEMPOOL_LIST: usize = 500;   // waiting transactions listed by /mempool
 static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The key an address is limited by: an IPv4 address, or the /64 an IPv6 address is in (one host has a whole /64).
 fn limit_key(ip: std::net::IpAddr) -> std::net::IpAddr {
     match ip { std::net::IpAddr::V6(a) if a.to_ipv4_mapped().is_none() => { let s = a.segments(); std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)) } x => x }
+}
+
+/// The key connections are counted by: an IPv4 address, or the /56 an IPv6 address is in.
+fn conn_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip { std::net::IpAddr::V6(a) if a.to_ipv4_mapped().is_none() => { let s = a.segments(); std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3] & 0xff00, 0, 0, 0, 0)) } x => x }
+}
+type Open = Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>;
+/// One connection counted against its address while this lives (None: not limited), or None when it already has PER_IP.
+struct Held(Open, Option<std::net::IpAddr>);
+impl Held {
+    fn take(open: &Open, k: Option<std::net::IpAddr>) -> Option<Held> {
+        if let Some(k) = k { let mut o = open.lock().unwrap(); let c = o.entry(k).or_default(); if *c >= PER_IP { return None; } *c += 1; }
+        Some(Held(open.clone(), k))
+    }
+}
+impl Drop for Held { fn drop(&mut self) { if let Some(k) = self.1 { let mut o = self.0.lock().unwrap(); if let Some(c) = o.get_mut(&k) { *c -= 1; if *c == 0 { o.remove(&k); } } } } }
+/// Write all of `b` within WRITE_DEADLINE in all, however slowly the client reads.
+fn write_by(s: &mut TcpStream, b: &[u8]) {
+    let start = std::time::Instant::now();
+    let mut i = 0;
+    while i < b.len() {
+        let Some(left) = WRITE_DEADLINE.checked_sub(start.elapsed()).filter(|d| !d.is_zero()) else { return };
+        if s.set_write_timeout(Some(left)).is_err() { return; }
+        match s.write(&b[i..]) { Ok(0) | Err(_) => return, Ok(n) => i += n }
+    }
 }
 
 impl Node {
@@ -59,27 +86,27 @@ impl Node {
         let l = TcpListener::bind(addr)?;
         let local = l.local_addr()?;
         let node = self.clone();
-        let open: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>> = Arc::default();   // connections being served, per address
+        let open: Open = Arc::default();   // connections being served, per address
         std::thread::spawn(move || for mut s in l.incoming().flatten() {
             use std::sync::atomic::Ordering;
-            let key = s.peer_addr().ok().map(|a| limit_key(a.ip())).filter(|ip| !ip.is_loopback());
-            let busy = ACTIVE.load(Ordering::Relaxed) >= RPC_THREADS || key.is_some_and(|k| open.lock().unwrap().get(&k).copied().unwrap_or(0) >= PER_IP);
-            if busy { let _ = write!(s, "HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"); continue; }
+            // loopback is counted once the request names its client (X-Forwarded-For from a proxy), in handle
+            let key = s.peer_addr().ok().map(|a| conn_key(a.ip())).filter(|ip| !ip.is_loopback());
+            let held = if ACTIVE.load(Ordering::Relaxed) >= RPC_THREADS { None } else { Held::take(&open, key) };
+            let Some(held) = held else { let _ = write!(s, "HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"); continue };
             ACTIVE.fetch_add(1, Ordering::Relaxed);
-            if let Some(k) = key { *open.lock().unwrap().entry(k).or_default() += 1; }
             let (n, open) = (node.clone(), open.clone());
             std::thread::spawn(move || {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| n.handle(s)));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| n.handle(s, &open)));
+                drop(held);
                 ACTIVE.fetch_sub(1, Ordering::Relaxed);
-                if let Some(k) = key { let mut o = open.lock().unwrap(); if let Some(c) = o.get_mut(&k) { *c -= 1; if *c == 0 { o.remove(&k); } } }
             });
         });
         Ok(local)
     }
-    fn handle(&self, mut s: TcpStream) {
-        let reply = |s: &mut TcpStream, status: &str| { let _ = write!(s, "HTTP/1.0 {status}\r\nContent-Length: 0\r\n\r\n"); };
-        let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(10)));
-        // the whole request within DEADLINE (a per-read timeout alone lets a client trickle a byte at a time forever)
+    fn handle(&self, mut s: TcpStream, open: &Open) {
+        let reply = |s: &mut TcpStream, status: &str| write_by(s, format!("HTTP/1.0 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes());
+        // the whole request within DEADLINE (a per-read timeout alone lets a client trickle a byte at a time forever);
+        // a big body earns a second more per 32 KB actually received, never on the strength of its Content-Length
         let start = std::time::Instant::now();
         let deadline = std::cell::Cell::new(DEADLINE);
         let read = |s: &mut TcpStream, tmp: &mut [u8]| -> Option<usize> {
@@ -98,31 +125,41 @@ impl Node {
                 let lens: Vec<&str> = head.lines().filter_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")).map(|(_, v)| v.trim())).collect();
                 let len = match lens.as_slice() { [] => 0, [v] => match v.parse::<usize>() { Ok(n) => n, Err(_) => return reply(&mut s, "400 Bad Request") }, _ => return reply(&mut s, "400 Bad Request") };
                 if len > BODY_MAX { return reply(&mut s, "413 Payload Too Large"); }
-                deadline.set(DEADLINE + std::time::Duration::from_secs(len as u64 / 32_768));   // a big body: a second more per 32 KB
                 break (i + 4, len);
             }
             if buf.len() > HEAD_MAX { return reply(&mut s, "431 Request Header Fields Too Large"); }
         };
         let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-        // the limit is per address; behind a reverse proxy on this machine every request comes from loopback, so the
+        // the limits are per address; behind a reverse proxy on this machine every request comes from loopback, so the
         // proxy's X-Forwarded-For names the client. Loopback with no such header is the operator's own tools: not limited.
+        // This assumes exactly one proxy, which appends the address it saw: the last entry is believed (earlier ones are
+        // whatever the client claimed). Behind a chain of proxies every client would look like the last proxy but one.
+        let mut _held = None;
         if let Ok(a) = s.peer_addr() {
-            // the proxy appends the address it saw: the last entry (earlier ones are whatever the client claimed). One
-            // that does not parse is limited as loopback, so a made-up header buys nothing.
+            // one that does not parse is limited as loopback, so a made-up header buys nothing
             let fwd = head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("x-forwarded-for")).map(|(_, v)| v.to_string()));
             let who = if !a.ip().is_loopback() { Some(a.ip()) } else { fwd.map(|v| v.rsplit(',').next().and_then(|x| x.trim().parse().ok()).unwrap_or(a.ip())) };
             if who.is_some_and(|ip| !self.allow(ip)) { return reply(&mut s, "429 Too Many Requests"); }
+            // a proxied client is held to PER_IP connections too (a direct one was counted when it connected)
+            if a.ip().is_loopback() { if let Some(ip) = who { match Held::take(open, Some(conn_key(ip))) { Some(h) => _held = Some(h), None => return reply(&mut s, "503 Service Unavailable") } } }
         }
-        while buf.len() < head_end + body_len { let Some(n) = read(&mut s, &mut tmp) else { return }; buf.extend_from_slice(&tmp[..n]); }
+        while buf.len() < head_end + body_len {
+            let Some(n) = read(&mut s, &mut tmp) else { return };
+            buf.extend_from_slice(&tmp[..n]);
+            deadline.set(DEADLINE + std::time::Duration::from_secs((buf.len() - head_end) as u64 / 32_768));
+        }
         buf.truncate(head_end + body_len);
+        // every request body is hex: anything else is refused before it is turned into text
+        if !buf[head_end..].is_ascii() { return reply(&mut s, "400 Bad Request"); }
         let body = String::from_utf8_lossy(&buf[head_end..]);
         let mut words = head.split_whitespace();
         let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
         let (status, text) = match self.route(method, path, &body) { Ok(t) => ("200 OK", t), Err(e) => ("400 Bad Request", e.to_string()) };
-        let _ = write!(s, "HTTP/1.0 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{text}", text.len());
+        write_by(&mut s, format!("HTTP/1.0 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{text}", text.len()).as_bytes());
     }
     pub fn route(&self, method: &str, path: &str, body: &str) -> Result<String, &'static str> {
         let seg: Vec<&str> = path.trim_matches('/').split('/').collect();
+        if (method, path, body.trim()) == ("POST", "/check", "") { return Ok(String::new()); }   // nothing to check: not even the store lock
         let st = self.store.lock().unwrap();
         let c = &st.chain;
         match (method, seg.as_slice()) {
@@ -216,6 +253,9 @@ impl Node {
             ("GET", ["mempool"]) => {
                 // store before mempool, the same lock order as submit_tx
                 let m = self.mempool.lock().unwrap();
+                // decoding every waiting piece is costly: done once per mempool version and tip
+                let key = (m.version, c.tip());
+                if let Some((k, text)) = self.mempool_text.lock().unwrap().as_ref() { if *k == key { return Ok(text.clone()); } }
                 let mut out = format!("count {}\n{}", m.len(), m.iter().take(MEMPOOL_LIST).map(|t| tx_line(t)).collect::<String>());
                 // what each waiting cheque says so far, read from the pieces against the sender's commitments
                 let mut seen: BTreeMap<(Vec<u8>, u16), [Option<u8>; COLS]> = BTreeMap::new();
@@ -233,6 +273,7 @@ impl Node {
                     let rest = full.map_or(String::new(), |msg| format!(" amount={} fee={}", msg.amount().map_or("all".into(), |a| a.to_string()), msg.tier as u64 * c.params.fee_unit));
                     out += &format!("cheque account={} cheque={cheque} to={to}{rest}\n", hex(&account));
                 }
+                *self.mempool_text.lock().unwrap() = Some((key, out.clone()));
                 Ok(out)
             }
             ("GET", ["top"]) | ("GET", ["top", _]) => {
@@ -296,6 +337,7 @@ impl Node {
                     let raw = unhex(line).ok_or("bad hex")?;
                     txs.push(Tx::decode(&mut R::new(&raw))?);
                 }
+                if txs.iter().filter(|t| matches!(t, Tx::RegisterBook { .. } | Tx::RegisterBatch { .. })).count() > CHECK_REGS { return Err("too many registrations in one check"); }
                 Ok(self.check_txs(&txs).into_iter().map(|r| match r { Ok(None) => "ok".to_string(), Ok(Some(row)) => format!("ok {row}"), Err(e) => e.to_string() }).collect::<Vec<_>>().join("\n"))
             }
             _ => Err("unknown route"),

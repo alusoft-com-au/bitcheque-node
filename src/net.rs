@@ -3,7 +3,7 @@
 //! and peer discovery the way Bitcoin does it: seed nodes compiled in, `getaddr`/`addr`
 //! gossip, an address book saved next to the data file, and about eight outbound connections.
 //! Frame: magic(4) | type(1) | length(u32 LE) | payload.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -12,6 +12,7 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use crate::block::Block;
+use crate::params::Params;
 use crate::state::State;
 use crate::store::{Accepted, Store};
 use crate::tx::{Tx, R};
@@ -32,12 +33,18 @@ const MAX_INBOUND: usize = 125;  // inbound connections accepted (Bitcoin's defa
 const MAX_PER_IP: usize = 4;     // connections from one address
 const MAX_PER_GROUP: usize = 8;  // ...and from one /24 (IPv4) or /64 (IPv6)
 const BOOK_PER_GROUP: usize = 8; // addresses remembered per /16 (IPv4) or /32 (IPv6): one network cannot fill the book
-const HELLO_WAIT: Duration = Duration::from_secs(10);  // a new connection that has not said HELLO by then is dropped
+const HELLO_WAIT: Duration = Duration::from_secs(10);  // a new connection that has not said HELLO by then (in all) is dropped
+const HELLO_MAX: usize = 200;    // ...and its HELLO frame may be no longer than this (height, tip, advertised address)
+const IDLE: Duration = Duration::from_secs(600);       // after HELLO, the longest wait for a frame to start
+const FRAME_WAIT: Duration = Duration::from_secs(120); // ...and once started, the longest it may take to arrive in full
+const DIAL_WAIT: Duration = Duration::from_secs(3);    // outbound dials, made in parallel, so one round never takes long
 const STRIKES: u32 = 3;          // bad messages before a peer is dropped
 const GET_BLOCKS_GAP: Duration = Duration::from_millis(200); // fastest a peer may ask for the next batch
 const QUEUE_BYTES: usize = 64 << 20;   // bytes waiting to be written to one peer; past this, messages to it are dropped
 const QUEUE_FRAMES: usize = 4096;      // frames waiting to be written to one peer
-const STALL: Duration = Duration::from_secs(30);       // a sync source that delivers nothing new for this long is replaced
+const STALL: Duration = Duration::from_secs(30);       // a sync source must raise our height by PROGRESS blocks (or all it
+const PROGRESS: u32 = 50;                              // has left) every STALL, or it is replaced: a trickle is not progress
+const SYNC_AHEAD: u32 = 6;                             // no templates while a usable peer is this far ahead of us
 const BAR: Duration = Duration::from_secs(600);        // ...and not chosen again for this long
 const BAN: Duration = Duration::from_secs(1800);       // a misbehaving peer's address is refused for this long
 const ADDR_GAP: Duration = Duration::from_secs(10);    // fastest a peer's ADDR messages are read
@@ -45,6 +52,8 @@ const MEMPOOL_BYTES: usize = 64 << 20; // waiting transactions kept, in encoded 
 const HTTP_MAX: usize = 32 << 20;      // largest reply the HTTP client reads
 const HTTP_DEADLINE: Duration = Duration::from_secs(60);   // ...and the longest it waits for one, in all
 const UPSTREAM_QUEUE: usize = 1000;    // posts waiting for one upstream; past this the newest are dropped (the pull catches up)
+const BAD_TXS: usize = 4096;           // txids that can never be valid (failed a stateless check), remembered
+const TPL_PAYEES: usize = 16;          // templates kept per tip and mempool, one per payee
 
 /// Seed nodes a fresh node dials when it knows nobody else (DESIGN.md §7). Placeholders: the
 /// project has no domain yet, so these names do not resolve and a node just moves on.
@@ -89,8 +98,12 @@ pub fn http(addr: &str, method: &str, path: &str, body: &str) -> Result<String, 
     if head.split_whitespace().nth(1) == Some("200") { Ok(text.to_string()) } else { Err(format!("{path}: {}", clean(text.trim()))) }
 }
 
-/// Text from another machine, safe to print to a terminal: control characters (escape sequences) become '?'.
-pub fn clean(s: &str) -> String { s.chars().map(|c| if c.is_control() && c != '\n' { '?' } else { c }).collect() }
+/// Text from another machine, safe to print to a terminal: control characters (escape sequences) become '?', and
+/// invisible format characters (bidirectional overrides that reorder what is shown, zero-width ones) are dropped.
+pub fn clean(s: &str) -> String {
+    s.chars().filter(|c| !matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}'))
+        .map(|c| if c.is_control() && c != '\n' { '?' } else { c }).collect()
+}
 
 /// The network an address belongs to for diversity limits: /16 or /24 of IPv4, /32 or /64 of IPv6 (`wide` picks the first).
 fn group(ip: std::net::IpAddr, wide: bool) -> Vec<u8> {
@@ -114,13 +127,14 @@ fn public_ip(a: &str) -> Option<std::net::IpAddr> {
 fn ban_key(ip: std::net::IpAddr) -> std::net::IpAddr {
     match ip { std::net::IpAddr::V6(a) if a.to_ipv4_mapped().is_none() => { let s = a.segments(); std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)) } x => x }
 }
-/// A cheap random number (no crypto needed): for picking which addresses to share or evict.
+/// A cheap random number (no crypto needed): for picking which addresses to share, dial or evict.
 fn rand64() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u64(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64));
     h.finish()
 }
+fn shuffle<T>(v: &mut [T]) { for i in (1..v.len()).rev() { v.swap(i, rand64() as usize % (i + 1)); } }
 
 /// "host:port" with a numeric port and no spaces or control characters.
 pub fn valid_addr(a: &str) -> bool {
@@ -134,6 +148,32 @@ pub fn now() -> u32 { std::time::SystemTime::now().duration_since(std::time::UNI
 pub static NOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 #[cfg(target_arch = "wasm32")]
 pub fn now() -> u32 { NOW.load(Ordering::Relaxed) }
+
+/// Waiting transactions, oldest first, with their txids (an O(1) duplicate check) and a running total of their encoded
+/// bytes. `version` changes with every change (for the template and /mempool caches).
+#[derive(Default)]
+pub struct Mempool { txs: Vec<Tx>, meta: Vec<([u8; 32], usize)>, ids: HashSet<[u8; 32]>, pub bytes: usize, pub version: usize }
+impl std::ops::Deref for Mempool { type Target = Vec<Tx>; fn deref(&self) -> &Vec<Tx> { &self.txs } }
+impl Mempool {
+    pub fn push(&mut self, t: Tx) -> bool { let (id, n) = (t.txid(), t.encode().len()); self.put(t, id, n) }
+    fn put(&mut self, t: Tx, id: [u8; 32], n: usize) -> bool {
+        if !self.ids.insert(id) { return false; }
+        self.txs.push(t); self.meta.push((id, n)); self.bytes += n; self.version += 1;
+        true
+    }
+    pub fn has(&self, id: &[u8; 32]) -> bool { self.ids.contains(id) }
+    fn retain(&mut self, mut keep: impl FnMut(&Tx, &[u8; 32]) -> bool) {
+        let (txs, meta) = (std::mem::take(&mut self.txs), std::mem::take(&mut self.meta));
+        for (t, (id, n)) in txs.into_iter().zip(meta) {
+            if keep(&t, &id) { self.txs.push(t); self.meta.push((id, n)); } else { self.ids.remove(&id); self.bytes -= n; }
+        }
+        self.version += 1;
+    }
+    fn take(&mut self) -> Vec<Tx> { self.ids.clear(); self.meta.clear(); self.bytes = 0; self.version += 1; std::mem::take(&mut self.txs) }
+}
+
+/// A template cache: the transactions chosen for (tip, mempool version, time), and the blocks built from them per payee.
+struct Tpl { key: ([u8; 32], usize, u32), txs: Vec<Tx>, made: Vec<(u32, Block)> }
 
 /// One connection. Messages to it go through a bounded queue drained by its own writer thread,
 /// so no other thread ever blocks on a slow or silent peer (Bitcoin Core's per-peer send buffer).
@@ -150,23 +190,26 @@ struct Peer {
 
 pub struct Node {
     pub store: Mutex<Store>,
-    pub mempool: Mutex<Vec<Tx>>,
+    pub mempool: Mutex<Mempool>,
     peers: Mutex<Vec<Arc<Peer>>>,
     next_id: Mutex<u64>,
     magic: [u8; 4],
     book: Mutex<BTreeMap<String, u32>>, // address -> failed dials in a row
     book_path: Mutex<Option<PathBuf>>,
     advertise: Mutex<Option<String>>,   // our own reachable address, told to peers in HELLO
-    sync: Mutex<Option<(u64, u32, std::time::Instant)>>,   // (peer, our height when we last progressed, when): the one source we pull batches from
+    sync: Mutex<Option<(u64, u32, std::time::Instant)>>,   // (peer, our height when its window started, when): the one source we pull batches from
     pub rpc_limit: Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
     pub top_cache: Mutex<Option<(u32, String, Vec<String>)>>,   // height, header, ranked rows
     next: Mutex<Option<State>>,        // the tip state with the mempool applied; None = rebuild on next use
-    mempool_bytes: AtomicUsize,
     banned: Mutex<HashMap<std::net::IpAddr, Instant>>,
+    strikes: Mutex<HashMap<std::net::IpAddr, (u32, Instant)>>,   // bad messages per address (ban_key), since when
+    tried: Mutex<HashSet<String>>,     // addresses we dialled that answered with HELLO: dialled before untried ones
+    bad_txs: Mutex<(HashMap<[u8; 32], &'static str>, VecDeque<[u8; 32]>)>,   // txids that can never be valid -> why, oldest first
+    pub mempool_text: Mutex<Option<((usize, [u8; 32]), String)>>,   // /mempool's reply for (mempool version, tip)
+    params: Params,
     upstream: Mutex<Vec<SyncSender<(&'static str, String)>>>,   // per upstream: (path, body) to POST to it, in order
     mempool_cap: AtomicUsize,
-    mempool_version: AtomicUsize,      // bumped whenever the mempool changes (for the template cache)
-    tpl_cache: Mutex<Option<((u32, [u8; 32], usize, u32), Block)>>,   // (payee, tip, mempool version, time) -> template
+    tpl_cache: Mutex<Option<Tpl>>,
 }
 
 /// Queue a message for a peer. Never blocks: false when the peer's queue is full (it is not reading).
@@ -179,27 +222,43 @@ fn send(peer: &Peer, magic: &[u8; 4], kind: u8, payload: &[u8]) -> bool {
     if peer.out.try_send(f).is_err() { peer.queued.fetch_sub(len, Ordering::Relaxed); return false; }
     true
 }
-fn recv(stream: &mut TcpStream, magic: &[u8; 4]) -> std::io::Result<(u8, Vec<u8>)> {
+/// Fill `buf` by the instant `by`, however the bytes are paced (a per-read timeout alone lets a trickle last forever).
+fn read_by(s: &mut TcpStream, buf: &mut [u8], by: Instant) -> std::io::Result<()> {
+    let mut i = 0;
+    while i < buf.len() {
+        let left = by.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or(std::io::ErrorKind::TimedOut)?;
+        s.set_read_timeout(Some(left))?;
+        match s.read(&mut buf[i..]) { Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()), Ok(n) => i += n, Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {} Err(e) => return Err(e) }
+    }
+    Ok(())
+}
+/// One frame, which must start by `start_by`. Before HELLO (`hello`) the whole frame must be in by then, and only a
+/// short HELLO is read at all; after it, a frame once started must be complete within FRAME_WAIT.
+fn recv(stream: &mut TcpStream, magic: &[u8; 4], start_by: Instant, hello: bool) -> std::io::Result<(u8, Vec<u8>)> {
     let mut head = [0u8; 9];
-    stream.read_exact(&mut head)?;
+    read_by(stream, &mut head[..1], start_by)?;
+    let by = if hello { start_by } else { Instant::now() + FRAME_WAIT };
+    read_by(stream, &mut head[1..], by)?;
     if head[..4] != *magic { return Err(std::io::Error::other("wrong network")); }
     let len = u32::from_le_bytes(head[5..9].try_into().unwrap()) as usize;
+    if hello && (head[4] != HELLO || len > HELLO_MAX) { return Err(std::io::Error::other("no hello")); }
     if len > MAX_FRAME { return Err(std::io::Error::other("frame too large")); }
     // grow as the bytes arrive instead of trusting the claimed length up front
     let mut payload = Vec::new();
-    stream.take(len as u64).read_to_end(&mut payload)?;
-    if payload.len() != len { return Err(std::io::Error::other("truncated frame")); }
+    while payload.len() < len { let k = payload.len(); payload.resize(k + (len - k).min(1 << 16), 0); read_by(stream, &mut payload[k..], by)?; }
     Ok((head[4], payload))
 }
 
 impl Node {
     pub fn new(store: Store) -> Arc<Node> {
         let magic = store.chain.params.magic;
-        Arc::new(Node { store: Mutex::new(store), mempool: Mutex::new(Vec::new()), peers: Mutex::new(Vec::new()), next_id: Mutex::new(1), magic,
+        let params = store.chain.params.clone();
+        Arc::new(Node { store: Mutex::new(store), mempool: Mutex::default(), peers: Mutex::new(Vec::new()), next_id: Mutex::new(1), magic,
                         book: Mutex::new(BTreeMap::new()), book_path: Mutex::new(None), advertise: Mutex::new(None),
                         sync: Mutex::new(None), rpc_limit: Mutex::new(std::collections::HashMap::new()), top_cache: Mutex::new(None),
-                        next: Mutex::new(None), mempool_bytes: AtomicUsize::new(0), banned: Mutex::new(HashMap::new()), upstream: Mutex::new(Vec::new()),
-                        mempool_cap: AtomicUsize::new(MEMPOOL_BYTES), mempool_version: AtomicUsize::new(0), tpl_cache: Mutex::new(None) })
+                        next: Mutex::new(None), banned: Mutex::default(), strikes: Mutex::default(), tried: Mutex::default(), bad_txs: Mutex::default(),
+                        mempool_text: Mutex::new(None), params, upstream: Mutex::new(Vec::new()),
+                        mempool_cap: AtomicUsize::new(MEMPOOL_BYTES), tpl_cache: Mutex::new(None) })
     }
     /// Keep at most this many bytes of waiting transactions (the edge node, with 128 MB in all, keeps far fewer).
     pub fn set_mempool_cap(&self, bytes: usize) { self.mempool_cap.store(bytes, Ordering::Relaxed); }
@@ -224,6 +283,8 @@ impl Node {
         let ip = match public_ip(a) { Some(ip) => ip, None if devnet || seen => match a.parse::<SocketAddr>() { Ok(s) => s.ip(), Err(_) => return false }, None => return false };
         let mut b = self.book.lock().unwrap();
         if b.contains_key(a) { return false; }
+        // one entry per IP (not one host on many ports), except loopback, where a devnet runs many nodes
+        if !devnet && !ip.is_loopback() && b.keys().any(|k| k.parse::<SocketAddr>().is_ok_and(|s| s.ip() == ip)) { return false; }
         let g = group(ip, true);
         if !devnet && b.keys().filter(|k| k.parse::<SocketAddr>().is_ok_and(|s| group(s.ip(), true) == g)).count() >= BOOK_PER_GROUP { return false; }
         if b.len() >= MAX_BOOK {
@@ -232,6 +293,20 @@ impl Node {
             if let Some(old) = b.keys().nth(k).cloned() { if seeds(&self.magic).contains(&old.as_str()) { return false; } b.remove(&old); }
         }
         b.insert(a.to_string(), 0);
+        true
+    }
+    /// One bad message from `ip`, counted per address (an IPv6 /64) for BAN, not per connection, so reconnecting does not
+    /// start afresh. True from the STRIKES-th on: drop the peer, and refuse the address for BAN (loopback is never
+    /// refused, as devnets run many nodes on one machine, but it is still dropped).
+    pub fn strike(&self, ip: std::net::IpAddr) -> bool {
+        let (k, now) = (ban_key(ip), Instant::now());
+        let mut s = self.strikes.lock().unwrap();
+        if s.len() > 10_000 { s.retain(|_, v| now < v.1 + BAN); }
+        let e = s.entry(k).or_insert((0, now));
+        if now > e.1 + BAN { *e = (0, now); }
+        e.0 += 1;
+        if e.0 < STRIKES { return false; }
+        if !ip.is_loopback() { self.banned.lock().unwrap().insert(k, now + BAN); }
         true
     }
     fn is_banned(&self, ip: Option<std::net::IpAddr>) -> bool {
@@ -266,7 +341,7 @@ impl Node {
     pub fn connect(self: &Arc<Self>, addr: &str) -> std::io::Result<()> {
         let a = addr.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::other("no address"))?;
         if !a.ip().is_loopback() && self.is_banned(Some(a.ip())) { return Err(std::io::Error::other("banned for a while")); }
-        let s = TcpStream::connect_timeout(&a, Duration::from_secs(5))?;
+        let s = TcpStream::connect_timeout(&a, DIAL_WAIT)?;
         self.add_peer_from(s, Some(addr.to_string()), true);
         Ok(())
     }
@@ -280,43 +355,65 @@ impl Node {
             for a in &pinned {
                 if !connected.contains(a) { if let Err(e) = node.connect(a) { eprintln!("peer {a}: {e}"); } }
             }
-            let outbound = node.peers.lock().unwrap().iter().filter(|p| p.outbound).count();
+            let (outbound, mut groups): (usize, Vec<Vec<u8>>) = { let ps = node.peers.lock().unwrap();
+                (ps.iter().filter(|p| p.outbound).count(), ps.iter().filter(|p| p.outbound).filter_map(|p| p.ip).filter(|ip| !ip.is_loopback()).map(|ip| group(ip, true)).collect()) };
             if outbound < MAX_OUTBOUND {
-                let mut candidates: Vec<String> = node.book.lock().unwrap().iter().filter(|(a, &f)| f < GIVE_UP && !connected.contains(a) && !pinned.contains(a)).map(|(a, _)| a.clone()).collect();
-                if candidates.is_empty() && node.peers.lock().unwrap().is_empty() && pinned.is_empty() {
-                    candidates = seeds(&node.magic).iter().map(|s| s.to_string()).collect();
+                // at random, addresses that answered before (tried) taking turns with new ones, and at most one per
+                // network (/16, /32), so neither a run of sorted keys nor one network's many addresses take every slot
+                let (mut old, mut new): (Vec<String>, Vec<String>) = { let (b, t) = (node.book.lock().unwrap(), node.tried.lock().unwrap());
+                    b.iter().filter(|(a, &f)| f < GIVE_UP && !connected.contains(a) && !pinned.contains(a)).map(|(a, _)| a.clone()).partition(|a| t.contains(a)) };
+                if old.is_empty() && new.is_empty() && node.peers.lock().unwrap().is_empty() && pinned.is_empty() {
+                    new = seeds(&node.magic).iter().map(|s| s.to_string()).collect();
                 }
-                let n = candidates.len(); if n > 0 { candidates.rotate_left(tick as usize % n); }
-                for a in candidates.into_iter().take(MAX_OUTBOUND - outbound) {
-                    match node.connect(&a) {
+                shuffle(&mut old); shuffle(&mut new);
+                let mut picks = Vec::new();
+                let (mut o, mut n) = (old.into_iter(), new.into_iter());
+                while picks.len() < MAX_OUTBOUND - outbound {
+                    let Some(a) = (if picks.len() % 2 == 0 { o.next().or_else(|| n.next()) } else { n.next().or_else(|| o.next()) }) else { break };
+                    let g = a.parse::<SocketAddr>().ok().map(|s| s.ip()).filter(|ip| !ip.is_loopback()).map(|ip| group(ip, true));
+                    if g.as_ref().is_some_and(|g| groups.contains(g)) { continue; }
+                    groups.extend(g); picks.push(a);
+                }
+                // dialled in parallel: a round takes one DIAL_WAIT at most, however many addresses are dead
+                let dials: Vec<_> = picks.into_iter().map(|a| { let n = node.clone(); std::thread::spawn(move || { let r = n.connect(&a); (a, r) }) }).collect();
+                for (a, r) in dials.into_iter().filter_map(|d| d.join().ok()) {
+                    match r {
                         Ok(()) => { node.book.lock().unwrap().insert(a, 0); }
                         Err(e) => { let mut b = node.book.lock().unwrap(); let f = b.entry(a.clone()).or_insert(0); *f += 1;
-                                    if *f == 1 { eprintln!("peer {a}: {e}"); } if *f >= GIVE_UP && !seeds(&node.magic).contains(&a.as_str()) { b.remove(&a); } }
+                                    if *f == 1 { eprintln!("peer {a}: {e}"); } if *f >= GIVE_UP && !seeds(&node.magic).contains(&a.as_str()) { b.remove(&a); node.tried.lock().unwrap().remove(&a); } }
                     }
                 }
             }
-            // still behind someone? pull from the highest peer, dropping a source that stopped delivering
+            // still behind someone? pull from a peer that is ahead, replacing a source that is not really delivering
             {
                 let my = node.height();
                 let pick = {
                     let mut s = node.sync.lock().unwrap();
-                    if let Some((id, at, since)) = *s { if my == at && since.elapsed() > STALL {
-                        // it claimed more than it delivered: believe our own height for it, try someone else, and keep its
-                        // address away for a while (a fresh connection with a fresh claim would otherwise take the slot again)
-                        *s = None;
-                        if let Some(p) = node.peers.lock().unwrap().iter().find(|p| p.id == id) {
-                            *p.height.lock().unwrap() = my; *p.barred.lock().unwrap() = Some(Instant::now() + BAR);
-                            if let Some(ip) = p.ip.filter(|a| !a.is_loopback()) { node.banned.lock().unwrap().insert(ban_key(ip), Instant::now() + BAR); let _ = p.stream.lock().unwrap().shutdown(std::net::Shutdown::Both); }
+                    if let Some((id, at, since)) = *s { if since.elapsed() > STALL {
+                        let p = node.peers.lock().unwrap().iter().find(|p| p.id == id).cloned();
+                        // what it could still give us in a batch; PROGRESS of that (or all of it) per STALL, not a drip
+                        let left = p.as_ref().map_or(0, |p| (*p.height.lock().unwrap()).min(at + BATCH as u32).saturating_sub(at));
+                        if left == 0 { *s = None; } else if my >= at + left.min(PROGRESS) { *s = Some((id, my, Instant::now())); } else {
+                            // it claimed more than it delivered: believe our own height for it, try someone else, and keep its
+                            // address away for a while (a fresh connection with a fresh claim would otherwise take the slot again)
+                            *s = None;
+                            if let Some(p) = p {
+                                *p.height.lock().unwrap() = my; *p.barred.lock().unwrap() = Some(Instant::now() + BAR);
+                                if let Some(ip) = p.ip.filter(|a| !a.is_loopback()) { node.banned.lock().unwrap().insert(ban_key(ip), Instant::now() + BAR); let _ = p.stream.lock().unwrap().shutdown(std::net::Shutdown::Both); }
+                            }
                         }
                     } }
                     if s.is_some() { None } else {
                         let usable = |p: &&Arc<Peer>| p.barred.lock().unwrap().map_or(true, |t| t < Instant::now());
                         let taller = |p: &&Arc<Peer>| *p.height.lock().unwrap() > my + 1;
                         let ps = node.peers.lock().unwrap();
-                        // prefer peers not recently barred; with nobody else left, give a barred one another go
-                        let best = ps.iter().filter(usable).filter(taller).max_by_key(|p| *p.height.lock().unwrap())
-                            .or_else(|| ps.iter().filter(taller).max_by_key(|p| *p.height.lock().unwrap())).cloned();
+                        // a claimed height is not trusted to choose by (the biggest claim is the easiest lie): a random
+                        // peer that is ahead, one we dialled if any; with nobody else left, a barred one gets another go
+                        let mut c: Vec<Arc<Peer>> = ps.iter().filter(usable).filter(taller).cloned().collect();
+                        if c.is_empty() { c = ps.iter().filter(taller).cloned().collect(); }
                         drop(ps);
+                        if c.iter().any(|p| p.outbound) { c.retain(|p| p.outbound); }
+                        let best = (!c.is_empty()).then(|| c[rand64() as usize % c.len()].clone());
                         if let Some(p) = &best { *s = Some((p.id, my, std::time::Instant::now())); }
                         best
                     }
@@ -332,7 +429,7 @@ impl Node {
     pub fn peer_count(&self) -> usize { self.peers.lock().unwrap().len() }
     fn add_peer(self: &Arc<Self>, stream: TcpStream) { self.add_peer_from(stream, None, false) }
     fn add_peer_from(self: &Arc<Self>, stream: TcpStream, addr: Option<String>, outbound: bool) {
-        let _ = stream.set_read_timeout(Some(HELLO_WAIT));   // until it says HELLO; then 600 s (serve)
+        let hello_by = Instant::now() + HELLO_WAIT;   // the whole HELLO by then, however it is paced
         let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));   // a peer that stops reading is dropped, not waited on forever
         let reader = match stream.try_clone() { Ok(r) => r, Err(_) => return };
         let mut writer = match stream.try_clone() { Ok(w) => w, Err(_) => return };
@@ -353,10 +450,7 @@ impl Node {
         let node = self.clone();
         std::thread::spawn(move || {
             // a panic while serving must still free the slot (and the sync source)
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| node.serve(peer.clone(), reader)));
-            if matches!(&r, Ok(Err(e)) if e.to_string() == "misbehaving peer dropped") {
-                if let Some(ip) = ip.filter(|a| !a.is_loopback()) { node.banned.lock().unwrap().insert(ban_key(ip), Instant::now() + BAN); }
-            }
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| node.serve(peer.clone(), reader, hello_by)));
             let _ = peer.stream.lock().unwrap().shutdown(std::net::Shutdown::Both);
             node.peers.lock().unwrap().retain(|p| p.id != id);
             { let mut s = node.sync.lock().unwrap(); if s.map_or(false, |(p, _, _)| p == id) { *s = None; } }
@@ -368,26 +462,27 @@ impl Node {
         if let Some(a) = self.advertise.lock().unwrap().as_ref() { v.extend_from_slice(a.as_bytes()); }
         v
     }
-    fn serve(&self, peer: Arc<Peer>, mut reader: TcpStream) -> std::io::Result<()> {
+    fn serve(&self, peer: Arc<Peer>, mut reader: TcpStream, hello_by: Instant) -> std::io::Result<()> {
         send(&peer, &self.magic, HELLO, &self.hello());
         let mut peer_height = 0u32;
-        let (mut strikes, mut last_get) = (0u32, std::time::Instant::now() - GET_BLOCKS_GAP);
+        let mut last_get = std::time::Instant::now() - GET_BLOCKS_GAP;
         let mut last_addr = Instant::now() - ADDR_GAP;
         let mut last_backoff = (0u32, std::time::Instant::now() - Duration::from_secs(10), 100u32);   // (our height, when, how far) we last stepped back during sync
         let mut said_hello = false;
         loop {
-            let (kind, payload) = recv(&mut reader, &self.magic)?;
-            if !said_hello && kind != HELLO { return Err(std::io::Error::other("no hello")); }
+            let (kind, payload) = recv(&mut reader, &self.magic, if said_hello { Instant::now() + IDLE } else { hello_by }, !said_hello)?;
             let mut bad = false;
             match kind {
                 HELLO if payload.len() >= 36 && !said_hello => {
                     // once per connection: a peer cannot keep re-claiming a height to hold the sync slot
                     said_hello = true;
-                    let _ = reader.set_read_timeout(Some(Duration::from_secs(600)));
                     peer_height = u32::from_le_bytes(payload[..4].try_into().unwrap());
                     *peer.height.lock().unwrap() = peer_height;
+                    // a peer we dialled answered: dial it again before untried addresses
+                    if peer.outbound { if let Some(a) = peer.addr.lock().unwrap().clone() { let mut t = self.tried.lock().unwrap(); if t.len() < MAX_BOOK { t.insert(a); } } }
+                    // only a peer we chose takes the sync slot at once; one that called us waits for maintain's pick
                     let barred = peer.barred.lock().unwrap().is_some_and(|t| t > Instant::now());
-                    let want_sync = !barred && peer_height > self.height() && { let mut s = self.sync.lock().unwrap(); if s.is_none() { *s = Some((peer.id, self.height(), std::time::Instant::now())); true } else { false } };
+                    let want_sync = peer.outbound && !barred && peer_height > self.height() && { let mut s = self.sync.lock().unwrap(); if s.is_none() { *s = Some((peer.id, self.height(), std::time::Instant::now())); true } else { false } };
                     if let Ok(a) = std::str::from_utf8(&payload[36..]) { if !a.is_empty() && valid_addr(a) {
                         // believe an advertised address only when it is the IP the peer is really connecting from;
                         // otherwise a peer could claim honest nodes' addresses and stop us dialling them
@@ -403,7 +498,7 @@ impl Node {
                     // a random sample, so no address (chosen to sort first, say) spreads further than any other
                     let own = peer.addr.lock().unwrap().clone();
                     let mut list: Vec<String> = self.book.lock().unwrap().keys().filter(|a| Some(a.as_str()) != own.as_deref()).cloned().collect();
-                    for i in (1..list.len()).rev() { list.swap(i, rand64() as usize % (i + 1)); }
+                    shuffle(&mut list);
                     list.truncate(ADDR_REPLY);
                     send(&peer, &self.magic, ADDR, list.join("\n").as_bytes());
                 }
@@ -435,9 +530,8 @@ impl Node {
                         let my = self.height();
                         { let mut ph = peer.height.lock().unwrap(); if *ph < my { *ph = my; } }
                         let more = {
+                            // (the stall clock is maintain's: a block now and then does not hold the slot)
                             let mut s = self.sync.lock().unwrap();
-                            // only real progress resets the stall clock: side blocks keep a source busy but get us nowhere
-                            if let Some((id, at, _)) = *s { if id == peer.id && my > at { *s = Some((id, my, Instant::now())); } }
                             if peer_height <= my { if let Some((id, _, _)) = *s { if id == peer.id { *s = None; } } }   // caught up with this source
                             peer_height > my && got >= BATCH
                         };
@@ -451,14 +545,15 @@ impl Node {
                                 last_backoff = (self.height(), std::time::Instant::now(), depth);
                                 self.request_from(&peer, self.height().saturating_sub(depth).max(1));
                             }
-                            Err("pow") | Err("bits") | Err("tx root") | Err("state root") | Err("decode") | Err("coinbase") | Err("block too large") | Err("duplicate transaction") => bad = true,   // invalid, not merely unknown (a bad time can be clock skew)
+                            // invalid, not merely unknown: a time too far ahead can be clock skew, one at or below the median cannot
+                            Err("pow" | "bits" | "tx root" | "state root" | "decode" | "coinbase" | "block too large" | "duplicate transaction" | "old time" | "bad parent") => bad = true,
                             _ => {}
                     }
                 }
                 TX => { match Tx::decode(&mut R::new(&payload)) { Ok(t) => { let _ = self.submit_tx(t, Some(peer.id)); } Err(_) => bad = true } }
                 _ => bad = true,
             }
-            if bad { strikes += 1; if strikes >= STRIKES { return Err(std::io::Error::other("misbehaving peer dropped")); } }
+            if bad && self.strike(peer.ip.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into())) { return Err(std::io::Error::other("misbehaving peer dropped")); }
         }
     }
     fn request_from(&self, peer: &Peer, from: u32) -> bool { peer.got.store(0, Ordering::Relaxed); send(peer, &self.magic, GET_BLOCKS, &from.to_le_bytes()) }
@@ -511,48 +606,56 @@ impl Node {
     /// Store the block, extend or reorganize the chain, fix up the mempool, relay. Ok(true): the main chain changed
     /// (and the block was relayed); Ok(false): kept as a side block (not relayed: nobody needs it unless it wins).
     pub fn submit_block(&self, b: &Block, from: Option<u64>) -> Result<bool, &'static str> {
-        let returned = {
+        let (branch, back) = {
             let mut s = self.store.lock().unwrap();
             match s.accept(b, now())? {
                 Accepted::Known => return Err("known"),
                 Accepted::Side => return Ok(false),
                 Accepted::Extended => {
                     let mut m = self.mempool.lock().unwrap();
-                    m.retain(|t| !b.txs.contains(t));
+                    let ids: HashSet<[u8; 32]> = b.txs.iter().map(|t| t.txid()).collect();
+                    m.retain(|_, id| !ids.contains(id));
                     *self.next.lock().unwrap() = Some(Self::evict(&s.chain, &mut m));
-                    self.mempool_bytes.store(m.iter().map(|t| t.encode().len()).sum(), Ordering::Relaxed);
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 }
                 Accepted::Reorged(abandoned, fork) => {
-                    let mut m = self.mempool.lock().unwrap();
-                    let old = std::mem::take(&mut *m);
-                    *self.next.lock().unwrap() = None; self.mempool_bytes.store(0, Ordering::Relaxed);
                     // the whole new branch goes to the peers, not just this block: side blocks are not relayed, so a
                     // peer may never have seen the earlier ones (at most a batch's worth; a peer missing more asks)
                     // (this block itself, the tip, goes out below as usual)
                     let tip = s.chain.height() as usize;
                     let start = (fork as usize + 1).max(tip.saturating_sub(BATCH - 1));
-                    let branch = s.chain.blocks.read_many(start, tip - start);
-                    drop(m); drop(s);
-                    for raw in branch { self.relay(BLOCK, &raw, from); }
-                    [abandoned, old].concat()
+                    let branch = s.chain.blocks.read_many(start, tip - start).into_iter().take(tip - start).collect();
+                    // the abandoned blocks' transactions first (what was waiting may build on them), then what was waiting;
+                    // whatever the new branch already holds or no longer allows is dropped, nothing is resubmitted one by one
+                    let mut m = self.mempool.lock().unwrap();
+                    let old = m.take();
+                    let ids: HashSet<[u8; 32]> = abandoned.into_iter().filter_map(|t| { let id = t.txid(); m.push(t).then_some(id) }).collect();
+                    for t in old { m.push(t); }
+                    *self.next.lock().unwrap() = Some(Self::evict(&s.chain, &mut m));
+                    let cap = self.mempool_cap.load(Ordering::Relaxed);
+                    if m.bytes > cap { let mut total = 0; m.retain(|t, _| { total += t.encode().len(); total <= cap }); *self.next.lock().unwrap() = None; }
+                    // only the abandoned ones go out again: peers already have the rest
+                    let back = m.iter().zip(&m.meta).filter(|(_, (id, _))| ids.contains(id)).map(|(t, _)| t.encode()).collect();
+                    (branch, back)
                 }
             }
         };
-        self.mempool_version.fetch_add(1, Ordering::Relaxed);
-        for t in returned { let _ = self.submit_tx(t, Some(u64::MAX)); }
+        // blocks first, so peers have them before the transactions that follow
+        for raw in branch { self.relay(BLOCK, &raw, from); }
         let raw = b.encode();
         self.relay(BLOCK, &raw, from);
         self.push_up("/block", crate::crypto::hex(&raw), from);
+        if !back.is_empty() { self.push_up("/tx", back.iter().map(|r| crate::crypto::hex(r)).collect::<Vec<_>>().join("\n"), from); }
+        for t in back { self.relay(TX, &t, from); }
         Ok(true)
     }
     /// Drop queued transactions the chain can no longer mine (their account moved on, their cheque
     /// expired...). Without this a dead transaction would sit in memory, and in the explorer, forever.
     /// Returns the next block's state with the survivors applied.
-    fn evict(c: &crate::block::Chain, m: &mut Vec<Tx>) -> State {
+    fn evict(c: &crate::block::Chain, m: &mut Mempool) -> State {
         let mut s = c.state.clone();
         s.begin_block(&c.params, c.height() + 1);
-        m.retain(|t| s.apply(&c.params, t).is_ok());
+        m.retain(|t, _| s.apply(&c.params, t).is_ok());
         s
     }
     /// The next block's state with every queued transaction applied, rebuilt only after a reorg.
@@ -565,6 +668,24 @@ impl Node {
             s
         })
     }
+    /// What a transaction can be checked for without the chain, done before the store lock is taken: a registration's
+    /// proof of work (against the easiest target there can be) and its batch against its root. Such a failure can never
+    /// turn into a success, so the txid is remembered and refused at once if it comes again. Returns the txid.
+    fn precheck(&self, t: &Tx) -> Result<[u8; 32], &'static str> {
+        let id = t.txid();
+        if let Some(e) = self.bad_txs.lock().unwrap().0.get(&id) { return Err(e); }
+        if let Tx::RegisterBook { .. } = t {
+            let mut s = State::new(&self.params);
+            s.begin_block(&self.params, 1);
+            if let Err(e) = s.apply(&self.params, t) {
+                let mut b = self.bad_txs.lock().unwrap();
+                if b.0.insert(id, e).is_none() { b.1.push_back(id); }
+                while b.1.len() > BAD_TXS { if let Some(o) = b.1.pop_front() { b.0.remove(&o); } }
+                return Err(e);
+            }
+        }
+        Ok(id)
+    }
     /// Validate against the tip state plus the current mempool, add, relay. A failed apply leaves
     /// the state untouched, so the cached state stays right either way.
     pub fn submit_tx(&self, t: Tx, from: Option<u64>) -> Result<(), &'static str> { self.submit_txs(vec![t], from).remove(0) }
@@ -572,17 +693,23 @@ impl Node {
     /// them or every one that was accepted, so a cheque's 18 pieces (or a registration and its cheque 0) sent
     /// together land in the same block. One result per transaction; the accepted ones are relayed.
     pub fn submit_txs(&self, txs: Vec<Tx>, from: Option<u64>) -> Vec<Result<(), &'static str>> {
+        let mut seen = HashSet::new();
+        let pre: Vec<_> = txs.iter().map(|t| if seen.insert(t.txid()) { self.precheck(t) } else { Err("duplicate transaction") }).collect();
+        if pre.iter().all(|r| r.is_err()) { return pre.into_iter().map(|r| r.map(|_| ())).collect(); }   // no need for the store
         let (mut out, mut accepted) = (Vec::with_capacity(txs.len()), Vec::new());
         {
             let s = self.store.lock().unwrap(); let c = &s.chain;
             let mut m = self.mempool.lock().unwrap();
             let mut next = self.next.lock().unwrap();
-            for t in txs {
+            for (t, pre) in txs.into_iter().zip(pre) {
                 let raw = t.encode();
-                let r = if self.mempool_bytes.load(Ordering::Relaxed) + raw.len() > self.mempool_cap.load(Ordering::Relaxed) { Err("mempool full") }
-                        else if m.contains(&t) { Err("already in mempool") }
-                        else { Self::next_state(c, &m, &mut next).apply(&c.params, &t).map(|_| ()) };
-                if r.is_ok() { m.push(t); self.mempool_bytes.fetch_add(raw.len(), Ordering::Relaxed); self.mempool_version.fetch_add(1, Ordering::Relaxed); accepted.push(raw); }
+                let r = match pre {
+                    Err(e) => Err(e),
+                    Ok(_) if m.bytes + raw.len() > self.mempool_cap.load(Ordering::Relaxed) => Err("mempool full"),
+                    Ok(id) if m.has(&id) => Err("already in mempool"),
+                    Ok(_) => Self::next_state(c, &m, &mut next).apply(&c.params, &t).map(|_| ()),
+                };
+                if let (Ok(()), Ok(id)) = (r, pre) { m.put(t, id, raw.len()); accepted.push(raw); }
                 out.push(r);
             }
         }
@@ -593,12 +720,18 @@ impl Node {
     }
     /// Dry run: apply `txs` in order on a copy of the next block's state (after the mempool).
     /// Nothing is stored or relayed. Returns one result per transaction: for a cheque piece, the row (digit) its
-    /// cell matched, so a wallet can tell a cell copied from the wrong row of the right column.
+    /// cell matched, so a wallet can tell a cell copied from the wrong row of the right column. A repeat of an earlier
+    /// line is answered "duplicate transaction" without being checked again.
     pub fn check_txs(&self, txs: &[Tx]) -> Vec<Result<Option<u8>, &'static str>> {
+        if txs.is_empty() { return Vec::new(); }
+        let mut seen = HashSet::new();
+        let pre: Vec<_> = txs.iter().map(|t| if seen.insert(t.txid()) { self.precheck(t) } else { Err("duplicate transaction") }).collect();
+        if pre.iter().all(|r| r.is_err()) { return pre.into_iter().map(|r| r.map(|_| None)).collect(); }
         let s = self.store.lock().unwrap(); let c = &s.chain;
         let m = self.mempool.lock().unwrap();
         let mut st = Self::next_state(c, &m, &mut self.next.lock().unwrap()).clone();
-        txs.iter().map(|t| {
+        txs.iter().zip(pre).map(|(t, pre)| {
+            pre?;
             let row = match t { Tx::ChequePiece { account, cheque, column, shares } => st.piece_digit(account, *cheque, *column, shares), _ => None };
             st.apply(&c.params, t).map(|_| row)
         }).collect()
@@ -607,24 +740,33 @@ impl Node {
     /// first up to the block size limit. The node does not mine: miners fetch this over RPC
     /// (GET /template/<number>), search nonces themselves and send the block back (POST /block).
     pub fn template(&self, payee: u32) -> Result<Block, &'static str> {
-        if self.sync.lock().unwrap().is_some() { return Err("syncing"); }   // never hand out a stale tip while catching up
+        // never hand out a stale tip while a usable peer is well ahead (a claim alone holds this only until the peer is
+        // found not to deliver: maintain then bars it)
+        let my = self.height();
+        if self.peers.lock().unwrap().iter().any(|p| *p.height.lock().unwrap() > my.saturating_add(SYNC_AHEAD) && p.barred.lock().unwrap().map_or(true, |t| t < Instant::now())) { return Err("syncing"); }
         let st = self.store.lock().unwrap(); let c = &st.chain;
-        // the same template for the same payee, tip, mempool and second: a flood of requests costs one build
-        let key = (payee, c.tip(), self.mempool_version.load(Ordering::Relaxed), now().max(c.median_time() + 1));
-        if let Some((k, b)) = self.tpl_cache.lock().unwrap().as_ref() { if *k == key { return Ok(b.clone()); } }
         let m = self.mempool.lock().unwrap();
-        let mut s = c.state.clone();
-        s.begin_block(&c.params, c.height() + 1);
-        // fill up to the block size limit (header and coinbase take well under the margin), oldest first
-        let room = c.params.max_block_bytes.saturating_sub(4096);
-        let mut used = 0;
-        let txs: Vec<Tx> = m.iter().filter(|t| {
-            let n = t.encode().len() + 4;
-            if used + n > room || s.apply(&c.params, t).is_err() { return false; }
-            used += n; true
-        }).cloned().collect();
-        let b = c.template(key.3, payee, txs)?;
-        *self.tpl_cache.lock().unwrap() = Some((key, b.clone()));
+        // for the same tip, mempool and second the transactions are chosen once, and a block is built once per payee
+        // (a few payees kept): a flood of requests, or miners with different payees taking turns, costs one build each
+        let key = (c.tip(), m.version, now().max(c.median_time() + 1));
+        let mut cache = self.tpl_cache.lock().unwrap();
+        if cache.as_ref().map_or(true, |t| t.key != key) {
+            let mut s = c.state.clone();
+            s.begin_block(&c.params, c.height() + 1);
+            // fill up to the block size limit (header and coinbase take well under the margin), oldest first
+            let room = c.params.max_block_bytes.saturating_sub(4096);
+            let mut used = 0;
+            let txs: Vec<Tx> = m.iter().zip(&m.meta).filter(|(t, (_, n))| {
+                if used + n + 4 > room || s.apply(&c.params, t).is_err() { return false; }
+                used += n + 4; true
+            }).map(|(t, _)| t.clone()).collect();
+            *cache = Some(Tpl { key, txs, made: Vec::new() });
+        }
+        let t = cache.as_mut().unwrap();
+        if let Some((_, b)) = t.made.iter().find(|(p, _)| *p == payee) { return Ok(b.clone()); }
+        let b = c.template(key.2, payee, t.txs.clone())?;
+        if t.made.len() >= TPL_PAYEES { t.made.remove(0); }
+        t.made.push((payee, b.clone()));
         Ok(b)
     }
 }
