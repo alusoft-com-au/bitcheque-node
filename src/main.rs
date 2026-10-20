@@ -5,10 +5,12 @@
 //!   On the research network it also follows the edge nodes (node-ap/us/eu/oc/sa.bitcheque.org:80, the seeds) over their
 //!   HTTP RPC: pulls their blocks every minute and passes on what it accepts. --upstream picks others, --no-upstream none.
 //!   --listen defaults to 0.0.0.0:8730 (mainnet) or 0.0.0.0:8731 (testnet); --advertise is the address others can reach you on.
-//! bitcheque wallet new | info|register|more|send|sweep --seed-file FILE --rpc ADDR [--cheques N] [--to NUMBER --amount COINS [--fee TIER]]
+//! bitcheque wallet new | info|register|more|send|sweep --seed-file FILE --rpc ADDR[,ADDR...] [--state-dir DIR] [--cheques N] [--to NUMBER --amount COINS [--fee TIER] [--force-skip] [--last]]
 //! bitcheque wallet pieces --seed-file FILE --cheque N --digits D18   (raw pieces as hex, no checks: for tests)
-//!   The seed (64 hex digits) comes from --seed-file (keep it 0600), or the BITCHEQUE_SEED environment variable, or
-//!   standard input with --seed-file -. --seed HEX still works, but every user of the machine can read a command line.
+//!   The seed (64 hex digits) comes from --seed-file (must be 0600: no group or world access), or the BITCHEQUE_SEED
+//!   environment variable, or standard input with --seed-file -. Never on the command line, where every user can read it.
+//!   The used-cheque record lives in --state-dir, else $BITCHEQUE_STATE, else ~/.config/bitcheque (none of them: error).
+//!   Several --rpc nodes (comma list): the first gets the cheque, the others cross-check the cheque number.
 use bitcheque::{block::Chain, crypto::{hex, sha256}, message::Message, net::Node, params::{Params, COIN, GENESIS_MESSAGE as MESSAGE, LAUNCH_TIME, LOCAL_TIME, TESTNET_TIME}, rpc::unhex, store::Store,
                 u256::U256, wallet::{mine_registration, Book, Domain, BATCH, BOOK_SIZE}};
 
@@ -50,7 +52,7 @@ fn main() {
         }
         Some("mine") => if let Err(e) = mine(&opt) { eprintln!("error: {e}"); std::process::exit(1) },
         Some("wallet") => if let Err(e) = wallet(&args, &opt) { eprintln!("error: {e}"); std::process::exit(1) },
-        _ => eprintln!("usage: bitcheque genesis [--mainnet|--local] | bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR] [--upstream HOST:PORT] [--no-upstream]\n       bitcheque mine --rpc ADDR --to NUMBER [--threads N]\n       bitcheque wallet new | info|register|more|send|sweep --seed-file FILE --rpc ADDR [--cheques N] [--to NUMBER --amount COINS [--fee TIER]]"),
+        _ => eprintln!("usage: bitcheque genesis [--mainnet|--local] | bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR] [--upstream HOST:PORT] [--no-upstream]\n       bitcheque mine --rpc ADDR --to NUMBER [--threads N]\n       bitcheque wallet new | info|register|more|send|sweep --seed-file FILE --rpc ADDR[,ADDR...] [--state-dir DIR] [--cheques N] [--to NUMBER --amount COINS [--fee TIER] [--force-skip] [--last]]"),
     }
 }
 
@@ -58,6 +60,7 @@ fn main() {
 /// `register` registers the first cheques (16 by default, `--cheques` for more), `more` the next ones, 16 per proof of work.
 /// The book salt is derived from the seed, so the seed alone recreates the book. Talks to a node's RPC; keeps one
 /// small file per book (~/.config/bitcheque/used-<id>: the last cheque number it signed), so a number is never used twice.
+/// Cheque 0 is only ever the honesty check, sent with `register`; `send` and `sweep` never sign it.
 fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     let cmd = args.get(2).map(String::as_str).unwrap_or("");
     if cmd == "new" {
@@ -66,24 +69,42 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
         println!("{}", hex(&seed));
         return Ok(());
     }
-    let text = match (opt("--seed-file"), std::env::var("BITCHEQUE_SEED").ok(), opt("--seed")) {
-        (Some(f), _, _) if f == "-" => { let mut t = String::new(); std::io::Read::read_to_string(&mut std::io::stdin(), &mut t).map_err(|e| e.to_string())?; t }
-        (Some(f), _, _) => std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?,
-        (None, Some(t), _) => t,
-        (None, None, Some(t)) => { eprintln!("warning: --seed puts the seed on the command line, where other users of this machine (ps) and the shell history can read it; use --seed-file or BITCHEQUE_SEED"); t }
+    // the seed is never taken from the command line (ps and shell history show it), never printed in an error, and
+    // dropped from the environment once read, so nothing this process might start inherits it
+    if args.iter().any(|a| a == "--seed") { return Err("--seed is gone (every user of the machine can read a command line): use --seed-file FILE or BITCHEQUE_SEED".into()); }
+    let env_seed = std::env::var("BITCHEQUE_SEED").ok();
+    std::env::remove_var("BITCHEQUE_SEED");
+    let text = match (opt("--seed-file"), env_seed) {
+        (Some(f), _) if f == "-" => { let mut t = String::new(); std::io::Read::read_to_string(&mut std::io::stdin(), &mut t).map_err(|e| e.to_string())?; t }
+        (Some(f), _) => {
+            #[cfg(unix)] { use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&f).map_err(|e| format!("{f}: {e}"))?.permissions().mode();
+                if mode & 0o077 != 0 { return Err(format!("{f}: others can read this seed file (mode {:o}): chmod 600 {f}", mode & 0o777)); } }
+            std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?
+        }
+        (None, Some(t)) => t,
         _ => return Err("the seed is needed: --seed-file FILE (or - for standard input), or BITCHEQUE_SEED".into()),
     };
     let seed: [u8; 32] = unhex(text.trim()).and_then(|v| v.try_into().ok()).ok_or("seed must be 32 bytes of hex")?;
-    let rpc = opt("--rpc").unwrap_or_default();
-    if rpc.is_empty() && cmd != "pieces" { return Err("--rpc ADDR needed".into()); }
+    drop(text);
+    let rpcs: Vec<String> = opt("--rpc").unwrap_or_default().split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect();
+    if rpcs.is_empty() && cmd != "pieces" { return Err("--rpc ADDR needed".into()); }
+    let rpc = rpcs.first().cloned().unwrap_or_default();
     let salt: [u8; 16] = sha256(&[b"bitcheque/salt".as_slice(), &seed].concat())[..16].try_into().unwrap();
     let size = BOOK_SIZE;
     let cheques: u32 = opt("--cheques").map_or(Ok(BATCH), |v| v.parse()).map_err(|_| "bad --cheques")?;
     if !(1..=size).contains(&cheques) { return Err(format!("--cheques must be 1 to {size}")); }
     let book = Book { salt, n256: false, book_size: size, domains: vec![Domain(seed)] };
     let id = hex(&book.id());
-    let account = || -> Result<Vec<(String, String)>, String> {
-        Ok(http(&rpc, "GET", &format!("/id/{id}"), "")?.lines().filter_map(|l| l.split_once(' ').map(|(k, v)| (clean(k), clean(v)))).collect())
+    let account_at = |rpc: &str| -> Result<Vec<(String, String)>, String> {
+        Ok(http(rpc, "GET", &format!("/id/{id}"), "")?.lines().filter_map(|l| l.split_once(' ').map(|(k, v)| (clean(k), clean(v)))).collect())
+    };
+    let account = || account_at(&rpc);
+    let record = || -> Result<Record, String> {
+        let dir = opt("--state-dir").or(std::env::var("BITCHEQUE_STATE").ok()).map(std::path::PathBuf::from)
+            .or(std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config/bitcheque")))
+            .ok_or("nowhere to keep the used-cheque record: set HOME or BITCHEQUE_STATE, or pass --state-dir DIR")?;
+        Record::open(&dir, &id, size)
     };
     let field = |a: &[(String, String)], k: &str| a.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
     // everything a command sends goes in one request, so it all lands in the same block (a registration with its
@@ -113,62 +134,130 @@ fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>) -> Result<(), S
                 (top / BATCH + 1) * BATCH
             };
             if first >= size { return Err("every cheque of this book is registered already".into()); }
+            let rec = if cmd == "register" { Some(record()?) } else { None };   // held until the honesty check is posted
             let limbs: Vec<u64> = http(&rpc, "GET", "/regtarget", "")?.split_whitespace().map(|w| u64::from_str_radix(w, 16).unwrap_or(0)).collect();
             let target = U256(limbs.try_into().map_err(|_| "bad regtarget")?);
             // a node can only make registration harder, never impossible: a target this low would never be met
             if target < U256::one_shl(192) { return Err("the node's registration target is implausibly hard: try another node".into()); }
             let regs = book.registrations(first, first + cheques - 1);
             let mut txs: Vec<_> = regs.iter().map(|reg| mine_registration(reg.clone(), target)).collect(); // each batch of 16 pays its own proof of work
-            if cmd == "register" { txs.extend(book.sign(0, &Message::new(0, 0, 0, 0))); } // honesty check: cheque 0, zero coins, to nobody
+            // honesty check: cheque 0, zero coins, to nobody. Recorded before it is signed, so if its pieces never reach the
+            // chain no later cheque takes number 0 (mixed with the honesty check's pieces, a sweep could go to number 0)
+            let mut honesty = false;
+            if let Some(r) = &rec { match r.read()? {
+                None | Some(0) => { r.write(0)?; txs.extend(book.sign(0, &Message::new(0, 0, 0, 0))); honesty = true; }
+                Some(n) => eprintln!("warning: this machine signed cheques up to {n} already: the honesty check (cheque 0) is not sent again"),
+            } }
             post_all(&txs)?;
             let last = ((first / BATCH + regs.len() as u32) * BATCH).min(size) - 1;
-            println!("id {id}\ncheques {first}-{last} registered{}", if cmd == "register" { ", honesty check (cheque 0) sent" } else { "" });
+            println!("id {id}\ncheques {first}-{last} registered{}", if honesty { ", honesty check (cheque 0) sent" } else { "" });
         }
         "send" | "sweep" => {
             let to: u32 = opt("--to").ok_or("--to NUMBER needed")?.parse().map_err(|_| "bad --to")?;
-            let tier: u8 = opt("--fee").map_or(Ok(1), |f| f.parse()).map_err(|_| "bad --fee")?;
+            let tier: u8 = opt("--fee").map_or(Ok(1), |f| f.parse()).ok().filter(|&t| t <= 9).ok_or("--fee is a tier from 0 to 9")?;
             // a sweep (mantissa 0000, exponent 9) moves the whole balance minus the fee: how a used-up book moves on
             let (mantissa, exponent) = if cmd == "sweep" { (0, 9) } else {
                 let units = coins(&opt("--amount").ok_or("--amount COINS needed")?)?;
                 (0..=8u32).find_map(|e| { let d = 10u64.pow(e); (units % d == 0 && units / d <= 9999).then(|| ((units / d) as u16, e as u8)) })
                     .ok_or("amount needs at most 4 significant digits")?
             };
-            let a = account()?;
-            // a half-submitted cheque is abandoned by starting a higher one (consensus deletes it)
-            let nonce: Option<u16> = field(&a, "open").parse().ok().or(field(&a, "nonce").parse().ok());
             let msg = Message::new(to, mantissa, exponent, tier);
-            // the checks happen here, from what the chain says publicly: no cell leaves this machine before the cheque is
-            // sent for real (a node shown a signed cheque in a dry run could keep it), and exactly one cheque is signed
-            // per payment, so a node that lies about the result cannot collect a second one
-            let balance: u64 = field(&a, "balance").parse().map_err(|_| "the node gave no balance")?;
+            // checked as consensus reads it before anything is recorded or signed: a cheque the chain refuses (fee tier 0
+            // with coins, say) is only refused at its last piece, and its number is burned by then
+            match bitcheque::message::parse(&msg.digits()) { Ok(m) if m == msg => {} Ok(_) => return Err("the cheque does not read back as written".into()), Err(e) => return Err(format!("not a valid cheque: {e}")) }
+            // locked from here until the pieces are posted: another run waits, then sees this cheque's number
+            let rec = record()?;
+            let used = rec.read()?;
+            // every node asked must agree on the book; what they report is only believed within it, and the most
+            // cautious answer wins (highest consumed number, every queued one, a cheque all of them list unspent)
+            let num = |v: &str, what: &str| -> Result<Option<u16>, String> {
+                if v == "none" { return Ok(None); }
+                v.parse::<u16>().ok().filter(|&n| (n as u32) < size).map(Some).ok_or(format!("a node reports {what} {}, not a cheque of this book: try another node", clean(v)))
+            };
+            let list = |v: &str, what: &str| -> Result<Vec<u16>, String> { v.split(',').filter(|x| !x.trim().is_empty()).map(|x| num(x.trim(), what).map(Option::unwrap)).collect() };
+            let mut accts = vec![account()?];
+            for r in &rpcs[1..] { accts.push(account_at(r)?); }
+            let (mut top, mut queued, mut unspent): (Option<u16>, Vec<u16>, Vec<Vec<u16>>) = (None, vec![], vec![]);
+            for (r, a) in rpcs.iter().zip(&accts) {
+                if field(a, "book_size") != size.to_string() { return Err(format!("{r} says this book has {} cheques, not {size}: try another node", clean(&field(a, "book_size")))); }
+                top = top.max(num(&field(a, "nonce"), "nonce")?).max(num(&field(a, "open"), "open")?);   // a half-submitted cheque is abandoned by starting a higher one
+                unspent.push(list(&field(a, "unspent"), "unspent")?);
+                // never two cheques with one number: skip those waiting in a node's queue (asked fresh, failing hard if a node will not say)
+                queued.extend(list(&http(r, "GET", &format!("/queued/{id}"), "")?, "queued")?);
+            }
+            let a = &accts[0];
+            // the lowest cheque above everything consumed, queued or signed here before (a node's answers may be a few
+            // seconds old), and never 0, the honesty check's number
+            let floor = [used, top].iter().flatten().map(|&n| n + 1).max().unwrap_or(1).max(1);
+            let cheque = unspent[0].iter().copied().filter(|&n| n >= floor && !queued.contains(&n) && unspent.iter().all(|u| u.contains(&n))).min().ok_or("no unused cheques left")?;
+            // signing a cheque burns every lower one forever: a stale or lying node must not make this wallet jump far
+            if cheque - floor > 3 {
+                if !args.iter().any(|x| x == "--force-skip") { return Err(format!("the next free cheque looks like {cheque}, which would burn cheques {floor}-{} forever; the node may be stale or lying: try another (--rpc A,B asks both), or pass --force-skip if you are sure", cheque - 1)); }
+                eprintln!("warning: --force-skip: cheques {floor}-{} are burned forever", cheque - 1);
+            }
+            // the remaining checks happen here, from what the chain says publicly: no cell leaves this machine before the
+            // cheque is sent for real, and exactly one cheque is signed per payment
+            let balance: u64 = field(a, "balance").parse().map_err(|_| "the node gave no balance")?;
             let fee = tier as u64 * bitcheque::params::Params::mainnet().fee_unit;
             let amount = msg.amount().unwrap_or(0);
             if balance < amount + fee { return Err(format!("balance {} is less than {} coins and the fee", balance as f64 / COIN as f64, (amount + fee) as f64 / COIN as f64)); }
             if to != 0 && !http(&rpc, "GET", &format!("/account/{to}"), "").is_ok_and(|t| t.lines().any(|l| l.starts_with("number "))) {
                 return Err(format!("account {to} is not a final number yet (or does not exist)"));
             }
-            // never two cheques with one number: skip those waiting in the node's queue (asked fresh, and failing hard
-            // if the node will not say) and any this machine signed before (a node's answers may be a few seconds old)
-            let queued: Vec<u16> = http(&rpc, "GET", &format!("/queued/{id}"), "")?.trim().split(',').filter_map(|x| x.parse().ok()).collect();
-            let used_file = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config/bitcheque").join(format!("used-{id}")));
-            let used: Option<u16> = used_file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|t| t.trim().parse().ok());
-            let cheque = field(&a, "unspent").split(',').filter_map(|x| x.parse::<u16>().ok())
-                .filter(|&n| nonce.map_or(true, |k| n > k) && used.map_or(true, |k| n > k) && !queued.contains(&n)).min().ok_or("no unused cheques left")?;
             // the last cheque of a book is kept for the sweep to a new book (DESIGN.md §10.11): spent on anything
             // else, whatever is left in the account can never move again
-            if cmd == "send" && cheque as u32 == size - 1 && opt("--last").is_none() {
+            if cmd == "send" && cheque as u32 == size - 1 && !args.iter().any(|x| x == "--last") {
                 return Err(format!("cheque {cheque} is the last one in this book: keep it for `wallet sweep --to <new book>`, or pass --last to spend it anyway"));
             }
             let pieces = book.sign(cheque, &msg);
             // recorded before anything is sent: once its cells may have left this machine, the number is used
-            if let Some(f) = &used_file { let _ = std::fs::create_dir_all(f.parent().unwrap()); std::fs::write(f, cheque.to_string()).map_err(|e| format!("{}: {e}", f.display()))?; }
+            rec.write(cheque)?;
             post_all(&pieces)?;
+            drop(rec);
             if cmd == "sweep" { println!("cheque {cheque} sent: {} sweeps the whole balance to {to}, fee tier {tier}", msg.display()); }
             else { println!("cheque {cheque} sent: {} to {to}, {} coins, fee tier {tier}", msg.display(), msg.amount().unwrap_or(0) as f64 / COIN as f64); }
         }
         _ => return Err("wallet commands: new, info, register, more, send, sweep, pieces".into()),
     }
     Ok(())
+}
+
+/// The used-cheque record of one book: `used-<id>` holds the highest cheque number this machine signed, replaced
+/// atomically (temporary file, fsync, rename, fsync of the directory) and never lowered. `used-<id>.lock` is held
+/// exclusively from reading the record until the cheque is posted, so two runs never pick the same number.
+struct Record { dir: std::path::PathBuf, path: std::path::PathBuf, size: u32, _lock: std::fs::File }
+impl Record {
+    fn open(dir: &std::path::Path, id: &str, size: u32) -> Result<Record, String> {
+        let err = |e: std::io::Error| format!("{}: {e}", dir.display());
+        std::fs::create_dir_all(dir).map_err(err)?;
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(format!("used-{id}.lock"))).map_err(err)?;
+        let t = std::time::Instant::now();
+        loop { match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if t.elapsed().as_secs() < 60 => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(std::fs::TryLockError::WouldBlock) => return Err(format!("another wallet run holds {}/used-{id}.lock", dir.display())),
+            Err(std::fs::TryLockError::Error(e)) => return Err(err(e)),
+        } }
+        Ok(Record { dir: dir.to_path_buf(), path: dir.join(format!("used-{id}")), size, _lock: lock })
+    }
+    fn read(&self) -> Result<Option<u16>, String> {
+        match std::fs::read_to_string(&self.path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", self.path.display())),
+            Ok(t) => t.trim().parse::<u16>().ok().filter(|&n| (n as u32) < self.size).map(Some)
+                .ok_or(format!("{}: not a cheque number below {}: fix it by hand (the highest cheque this machine signed) before going on", self.path.display(), self.size)),
+        }
+    }
+    fn write(&self, n: u16) -> Result<(), String> {
+        use std::io::Write;
+        let n = self.read()?.map_or(n, |o| o.max(n));
+        let tmp = self.path.with_extension("tmp");
+        let err = |e: std::io::Error| format!("{}: {e}", self.path.display());
+        let mut f = std::fs::File::create(&tmp).map_err(err)?;
+        f.write_all(n.to_string().as_bytes()).and_then(|_| f.sync_all()).map_err(err)?;
+        std::fs::rename(&tmp, &self.path).map_err(err)?;
+        std::fs::File::open(&self.dir).and_then(|d| d.sync_all()).map_err(err)
+    }
 }
 
 /// "1.5" -> 150_000_000 base units, exact (8 decimals at most).
