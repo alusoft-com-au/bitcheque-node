@@ -206,6 +206,8 @@ pub extern "C" fn qr_read() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The tests share the one io buffer (the page calls in from a single thread; the test runner does not).
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn call(f: extern "C" fn() -> usize, input: &[u8]) -> String { *io() = input.to_vec(); let n = f(); String::from_utf8(io()[..n].to_vec()).unwrap() }
     /// (column, cell) of every piece in some lines of hex txs.
     fn cells_of(lines: &str) -> Vec<(u8, String)> {
@@ -217,6 +219,7 @@ mod tests {
     }
     #[test]
     fn cells_match_pieces() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let seed = [9u8; 32];
         for (q, d) in [(1u16, [3u8; 18]), (255, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 7])] {
             let input = [&seed[..], &q.to_le_bytes(), &d].concat();
@@ -236,6 +239,7 @@ mod tests {
     }
     #[test]
     fn cell_commit_matches_the_cheque_commitments() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let seed = [7u8; 32];
         let b = book(&seed).unwrap();
         for q in [1u16, 200] {
