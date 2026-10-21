@@ -74,21 +74,21 @@ fn the_record_fails_hard() {
     let seed = h.join("seed");
     let s = seed.to_str().unwrap();
     let to = num(7);
-    let (ok, out) = run(None, &h, &["send", "--to", &to, "--amount", "1", "--seed-file", s, "--rpc", &f.addr], &[]);
+    let (ok, out) = run(None, &h, &["send", "--fresh", "--to", &to, "--amount", "1", "--seed-file", s, "--rpc", &f.addr], &[]);
     assert!(!ok && out.contains("nowhere to keep"), "{out}");
     assert!(f.posts.lock().unwrap().is_empty());
     // --state-dir or BITCHEQUE_STATE stand in for HOME
     let st = h.join("state");
     let (ok, out) = run(None, &h, &["send", "--to", &to, "--amount", "1", "--fresh", "--seed-file", s, "--rpc", &f.addr, "--state-dir", st.to_str().unwrap()], &[]);
     assert!(ok, "{out}");
-    let (ok, out) = run(None, &h, &["send", "--to", &to, "--amount", "2", "--seed-file", s, "--rpc", &f.addr], &[("BITCHEQUE_STATE", st.to_str().unwrap())]);
+    let (ok, out) = run(None, &h, &["send", "--fresh", "--to", &to, "--amount", "2", "--seed-file", s, "--rpc", &f.addr], &[("BITCHEQUE_STATE", st.to_str().unwrap())]);
     assert!(ok, "{out}");
     assert_eq!(cheques(&f), vec![1, 2]);
     // an empty or garbled record is not "nothing used"
     let used = std::fs::read_dir(&st).unwrap().flatten().map(|e| e.path()).find(|p| p.file_name().unwrap().to_string_lossy().starts_with("used-") && p.extension().is_none()).unwrap();
     for bad in ["", "abc", "300", "-1"] {
         std::fs::write(&used, bad).unwrap();
-        let (ok, out) = run(None, &h, &["sweep", "--to", &to, "--seed-file", s, "--rpc", &f.addr, "--state-dir", st.to_str().unwrap()], &[]);
+        let (ok, out) = run(None, &h, &["sweep", "--fresh", "--to", &to, "--seed-file", s, "--rpc", &f.addr, "--state-dir", st.to_str().unwrap()], &[]);
         assert!(!ok && out.contains("not a cheque number"), "{bad:?}: {out}");
     }
     assert_eq!(cheques(&f), vec![1, 2]);

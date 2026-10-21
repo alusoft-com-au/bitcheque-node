@@ -173,6 +173,29 @@ fn registration_target_tightens_and_loosens() {
     assert_eq!(s.reg_target, p.reg_pow_target, "never easier than the genesis target");
 }
 
+/// Audit 5: the retarget multiplies before it divides and rounds up, so a long run of full blocks can never round the
+/// target to 0 (where 0 × (W+1)/W stayed 0 for good: no registration ever again), and quiet always eases it back.
+#[test]
+fn registration_target_never_sticks_at_zero() {
+    use bitcheque::state::State;
+    let p = Params { reg_pow_target: U256::one_shl(240), ..Params::mainnet() };
+    let mut s = State::new(&p);
+    for h in 1..5_000 { s.reg_block_count = p.reg_pow_per_block_cap; s.begin_block(&p, h); }
+    let low = s.reg_target;
+    assert!(!low.is_zero() && low < U256::from_u64(100), "full blocks bottom out a few hashes' worth above 0, never at 0");
+    for h in 5_000..5_010 { s.begin_block(&p, h); }
+    assert_eq!(s.reg_target, low.add(&U256::from_u64(10)), "each empty block eases even the hardest target");
+    for h in 5_010..300_000 { s.begin_block(&p, h); }
+    assert_eq!(s.reg_target, p.reg_pow_target, "and quiet brings it all the way back");
+    // a target near the top of the range is divided first: no overflow, still capped
+    let p = Params { reg_pow_target: U256::MAX, ..Params::mainnet() };
+    let mut s = State::new(&p);
+    s.begin_block(&p, 1);
+    assert_eq!(s.reg_target, U256::MAX);
+    s.reg_block_count = 1; s.begin_block(&p, 2);
+    assert!(s.reg_target < U256::MAX && s.reg_target > U256::MAX.div_u64(2));
+}
+
 /// A 256-cheque book registers 16 cheques at a time, each batch paying its own proof of work, on one account number.
 #[test]
 fn a_book_grows_a_batch_at_a_time() {

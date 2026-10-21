@@ -33,12 +33,15 @@ pub fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Params)
     run(cmd, args, opt, p, &book.0)
 }
 
+/// A completed cheque as an account's /history lists it: (height, cheque, to, amount, fee).
+type Send = (u32, u16, u32, u64, u64);
+
 /// What one node says about the book: the whole /id text, and the fields every decision rests on, which every node
 /// asked must report alike (`key`).
 struct View { a: Vec<(String, String)>, nonce: Option<u16>, open: Vec<u16>, expires: Vec<(u16, u32)> }
 impl View {
     fn field(&self, k: &str) -> String { self.a.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default() }
-    fn key(&self) -> (Option<u16>, Vec<u16>, String, Vec<(u16, u32)>) { (self.nonce, self.open.clone(), self.field("revealed"), self.expires.clone()) }
+    fn key(&self) -> (Option<u16>, Vec<u16>, String, Vec<(u16, u32)>, String) { (self.nonce, self.open.clone(), self.field("revealed"), self.expires.clone(), self.field("number")) }
     /// Cheque n is over: its number is used (nonce reached it) and it is not the open one: completed, voided, or gone.
     fn done(&self, n: u16) -> bool { self.nonce.is_some_and(|x| x >= n) && !self.open.contains(&n) }
     /// The digits an open cheque shows on chain, None for a column not revealed (or a cheque not open).
@@ -52,9 +55,9 @@ impl View {
 
 fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Params, book: &Book) -> Result<(), String> {
     let flag = |k: &str| args.iter().any(|a| a == k);
-    // --rpc may be given several times, each one node or a comma list
+    // --rpc may be given several times, each one node or a comma list; a node named twice counts once
     let rpcs: Vec<String> = args.iter().enumerate().filter(|(_, a)| *a == "--rpc").filter_map(|(i, _)| args.get(i + 1))
-        .flat_map(|v| v.split(',')).map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect();
+        .flat_map(|v| v.split(',')).map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).fold(vec![], |mut a, r| { if !a.contains(&r) { a.push(r); } a });
     let rest_only = cmd == "pieces" && flag("--rest");
     if rpcs.is_empty() && (cmd != "pieces" || rest_only) { return Err("--rpc ADDR needed".into()); }
     if rpcs.len() == 1 && (matches!(cmd, "send" | "sweep" | "void") || rest_only) {
@@ -110,7 +113,7 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
         for r in &rpcs { match view_at(r) { Ok(v) => views.push(v), Err(e) if !lenient => return Err(e), Err(_) => return Ok(None) } }
         if views.windows(2).any(|w| w[0].key() != w[1].key()) {
             if lenient { return Ok(None); }
-            return Err("the nodes disagree on this book (its last cheque, open cheque, revealed digits or expiry): wait a block and try again".into());
+            return Err("the nodes disagree on this book (its number, last cheque, open cheque, revealed digits or expiry): wait a block and try again".into());
         }
         Ok(views.into_iter().next())
     };
@@ -129,8 +132,51 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
         if left < EXPIRY_MARGIN { return Err(format!("cheque {n}'s opening expires in {left} blocks: too close to send its amount (it could land after the opening is gone). Run `wallet void` to close it, then send again")); }
         Ok(low + 1 >= exp.saturating_sub(p.piece_lifetime) + confirmations)
     };
+    // the account's completed cheques by one node's /history (newest first, its last block::HISTORY_CAP events); an
+    // account with no final number has none
+    let sends_at = |r: &str, v: &View| -> Result<Vec<Send>, String> {
+        let n = v.field("number");
+        if n.is_empty() { return Ok(vec![]); }
+        Ok(http(r, "GET", &format!("/history/{n}"), "")?.lines().filter_map(|l| {
+            let mut w = l.split_whitespace();
+            let h = w.next()?.parse().ok()?;
+            if w.next()? != "send" { return None; }
+            let kv: Vec<(&str, &str)> = w.filter_map(|x| x.split_once('=')).collect();
+            let g = |k: &str| kv.iter().find(|e| e.0 == k).map(|e| e.1);
+            Some((h, g("cheque")?.parse().ok()?, g("to")?.parse().ok()?, g("amount")?.parse().ok()?, g("fee")?.parse().ok()?))
+        }).collect())
+    };
+    // a completed cheque that is this payment: its recipient, amount (a sweep: any) and fee
+    let pays = |s: &Send, m: &Message| s.2 == m.payee && s.4 == m.tier as u64 * p.fee_unit && m.amount().map_or(true, |a| a == s.3);
+    // what became of cheque n by every node's history: Some((block, whether it paid `m`)) once it completed, None if no
+    // node lists it (voided, overtaken by a later cheque, expired, or too old to be listed). The nodes must agree.
+    let fate = |v: &View, n: u16, m: &Message| -> Result<Option<(u32, bool)>, String> {
+        let mut seen = None;
+        for (i, r) in rpcs.iter().enumerate() {
+            let f = sends_at(r, v)?.iter().find(|s| s.1 == n).map(|s| (s.0, pays(s, m)));
+            if i > 0 && f != seen { return Err(format!("the nodes' histories disagree on cheque {n}: wait a block and try again")); }
+            seen = f;
+        }
+        Ok(seen)
+    };
     let tampered = |n: u16| format!("cheque {n} shows cells this machine never sent (someone holds a printed part of it?): nothing more is sent on it. \
         Run `wallet void` to close it, and sweep to a new book: a part of this book's cheques may be exposed");
+    // other digits on cheque n: from another send from this seed (another machine or state dir) when the nodes read a
+    // whole recipient from its cells, on chain or waiting to be mined; else cells never sent from here (tampered)
+    let taken = |n: u16| -> String {
+        let to = view_at(&rpc).ok().and_then(|v| { let r = v.revealed(n); r[..=PAYEE_DIGITS].iter().copied().collect::<Option<Vec<u8>>>() })
+            .filter(|d| damm::valid(d)).map(|d| d[..PAYEE_DIGITS].iter().fold(0u64, |a, &x| a * 10 + x as u64).to_string())
+            .or_else(|| http(&rpc, "GET", "/mempool", "").ok()?.lines().find_map(|l| {
+                let kv: Vec<(&str, &str)> = l.strip_prefix("cheque ")?.split_whitespace().filter_map(|x| x.split_once('=')).collect();
+                let g = |k: &str| kv.iter().find(|e| e.0 == k).map(|e| e.1);
+                (g("account")? == id && g("cheque")? == n.to_string()).then(|| g("to").map(clean)).flatten()
+            }));
+        match to {
+            Some(to) => format!("cheque {n} was taken by another send from this seed (another machine or state dir, to {to}): nothing was sent on it here. \
+                Once that one is finished or voided, run this again: it goes on a new cheque"),
+            None => tampered(n),
+        }
+    };
     // a dry run of `txs` on every node: Ok(the txs the first node still needs) when each says "ok" with the rows of our
     // digits, or that it has the cells already; Err (tampered or refused) otherwise
     let dry_run = |n: u16, txs: &[Tx], digits: &[u8; COLS], again: &str| -> Result<Vec<Tx>, String> {
@@ -147,7 +193,7 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
                     if rows != ours { return Err(format!("{r} reads cheque {n}'s cells as {}, not {ours}: it does not hold this book as registered; nothing more is sent. Try another node", clean(rows))); }
                     if r == &rpc { send.push(t.clone()); }
                 }
-                else if matches!(l, "column revealed with other digits" | "cheque open with other digits") { return Err(tampered(n)); }
+                else if matches!(l, "column revealed with other digits" | "cheque open with other digits") { return Err(taken(n)); }
                 else if !matches!(l, "column already revealed" | "cheque already open") { return Err(format!("{r} refuses cheque {n}: {}\ncheque {n} may still be live: {again}", clean(l))); }
             }
         }
@@ -238,7 +284,7 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
             if tier == 0 && cmd != "void" { return Err("--fee 0 is only for a void (zero coins to nobody): use `wallet void`, or a fee tier from 1 to 9".into()); }
             // a sweep (mantissa 0000, exponent 9) moves the whole balance minus the fee: how a used-up book moves on.
             // A void is zero coins to nobody: once in a block, no lower cheque can ever complete (§10.13)
-            let to = if cmd == "void" { 0 } else { payee(&opt("--to").ok_or("--to NUMBER needed: the recipient's 12 digits, as NNNNNNNNNNN-C")?)? };
+            let to = if cmd == "void" { 0 } else { payee(&opt("--to").ok_or("--to NUMBER needed: the recipient's number and check digit, as NNNNNNNNNNN-C (or N-C)")?)? };
             let (mantissa, exponent) = if cmd == "sweep" { (0, 9) } else if cmd == "void" { (0, 0) } else {
                 let units = coins(&opt("--amount").ok_or("--amount COINS needed")?)?;
                 (0..=9u32).find_map(|e| { let d = 10u64.pow(e); (units % d == 0 && units / d <= 9999).then(|| ((units / d) as u16, e as u8)) })
@@ -252,6 +298,7 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
                 return Err("number 0 is nobody: coins sent to it go to the block's miner. Pass --burn if that is really what you want".into());
             }
             let digits = msg.digits();
+            let again_flag = flag("--again");
             // locked from here until the cheque is in a block: another run waits, then sees this cheque's number
             let rec = record()?;
             let used = rec.read()?;
@@ -264,22 +311,82 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
             // the same payment as the cheque recorded here (same recipient, amount and fee)
             let same = used.filter(|&(n, d)| !honesty(n, d) && d == Some(digits)).map(|u| u.0);
             if let Some(n) = same.filter(|&n| v.done(n) && cmd != "void") {
-                if !flag("--again") { return Err(format!("payment already made (cheque {n}): this machine wrote this same cheque as cheque {n}, and it is over \
-                    (paid, or closed unfinished: `wallet info` and the account's history show which). Pass --again to pay the same again on a new cheque")); }
+                // over: what the account's history says became of it
+                match fate(&v, n, &msg)? {
+                    Some((h, true)) if !again_flag => return Err(format!("payment already made (cheque {n}): this machine wrote this same cheque as cheque {n}, \
+                        and it paid in block {h}. Pass --again to pay the same again on a new cheque")),
+                    Some((_, false)) => eprintln!("cheque {n} carried another payment from this seed (another machine or state dir) and never this one: it goes on a new cheque"),
+                    None if !again_flag => return Err(format!("payment already made (cheque {n})? This machine wrote this same cheque as cheque {n}, and it is over \
+                        but not in the account's recent history: closed unpaid (voided, overtaken by a later cheque, or expired), or paid too long ago to be listed. \
+                        `wallet info` and the account's history show which. Pass --again to pay it on a new cheque")),
+                    _ => {}
+                }
             }
+            // the record's cheque may still be in flight (not over, or over but not in the account's history): one node
+            // alone could hide what became of it, or a cheque sent from elsewhere, so every opening needs two that agree
+            let in_flight = |n: u16| -> Result<bool, String> { Ok(!v.done(n) || fate(&v, n, &msg)?.is_none()) };
+            let one_node = |n: u16| format!("cheque {n}, the last this machine signed, may still be in flight (it is not in the account's history as finished), \
+                and only one node was asked: it could be hiding what became of it, or a cheque sent from another machine. Give another node too (--rpc A --rpc B)");
+            // what the chain would refuse at completion, from what it says publicly, before any cell leaves this machine:
+            // the balance, and a recipient every node knows as a final number (a cheque to a number nobody holds yet is void)
+            let funds = |v: &View| -> Result<(), String> {
+                let balance: u64 = v.field("balance").parse().map_err(|_| "the node gave no balance")?;
+                let fee = tier as u64 * p.fee_unit;
+                let amount = msg.amount().unwrap_or(0);
+                if balance < amount + fee { return Err(format!("balance {} is less than {} coins and the fee", balance as f64 / COIN as f64, (amount + fee) as f64 / COIN as f64)); }
+                if to != 0 { for r in &rpcs {
+                    let t = http(r, "GET", &format!("/account/{to}"), "").unwrap_or_default();
+                    if !t.lines().any(|l| l == format!("number {to}")) { return Err(format!("{r}: account {to} is not a final number yet (or does not exist)")); }
+                    if !t.lines().any(|l| l == "funded true") && r == &rpc {
+                        eprintln!("warning: account {to} is not permanent yet: until it holds {} coin(s) at once it expires with its balance, so smaller amounts sent to it may be burned", p.min_fund as f64 / COIN as f64);
+                    }
+                } }
+                Ok(())
+            };
             // a void again after a void that is over: nothing new is live (it would be the record's cheque), so that void stands
-            let cheque = if let Some(n) = same.filter(|_| live.is_some() || cmd == "void") {
+            let resumed = same.filter(|_| live.is_some() || cmd == "void");
+            let cheque = if let Some(n) = resumed {
                 // the same cheque again (a lost reply, a half-sent cheque): finished, never re-written on another number
-                if live.is_some() { eprintln!("cheque {n} is this same cheque and is not finished yet: finishing it"); } else { eprintln!("cheque {n} is this same void, done already"); }
+                if live.is_some() { eprintln!("cheque {n} is this same cheque and is not finished yet: finishing it"); funds(&v)?; } else { eprintln!("cheque {n} is this same void, done already"); }
                 n
             } else {
                 if let Some((n, _)) = live.filter(|_| cmd != "void") {
                     return Err(format!("cheque {n} may still be live: wait for it, or run `wallet void` (a zero cheque on the next number that kills it once in a block); never re-write a payment on the next number"));
                 }
-                // no payment signed here before (a new machine, a restored seed, a new --state-dir): one node could hide
-                // an open or queued cheque, so two that agree are needed, or the holder's word that the book is fresh
-                if used.map_or(true, |(n, _)| n == 0) && !flag("--fresh") && rpcs.len() < 2 {
-                    return Err("this machine has no record of the book's cheques: give two or more nodes that agree (--rpc A --rpc B), or pass --fresh if this book has never signed a cheque anywhere else".into());
+                // one node could hide an open or queued cheque sent from elsewhere (another machine, the website, a restored
+                // seed), so a new cheque needs two that agree, or the holder's word that this book signs here only; and
+                // never one node while the record's cheque may still be in flight
+                if rpcs.len() < 2 {
+                    if let Some((n, _)) = used.filter(|&(n, d)| !honesty(n, d)) { if in_flight(n)? { return Err(one_node(n)); } }
+                    if !flag("--fresh") { return Err(if used.map_or(true, |(n, _)| n == 0) {
+                        "this machine has no record of the book's cheques: give two or more nodes that agree (--rpc A --rpc B), or pass --fresh if this book has never signed a cheque anywhere else".into()
+                    } else {
+                        "only one node was asked: it could be hiding a cheque sent from another machine, the website or a restored seed, and a new cheque on top of that \
+                         would put a second message on its number. Give two or more nodes that agree (--rpc A --rpc B), or pass --fresh if this book signs cheques on this machine only".into()
+                    }); }
+                }
+                // this same payment made already from anywhere (another machine, a restored seed, a new --state-dir): in
+                // the account's history over about the last day, open on chain with these digits, or waiting to be mined.
+                // An opening lives piece_lifetime blocks, so an older one still in flight is caught as open or waiting.
+                if cmd != "void" && !again_flag {
+                    let day = 86_400 / p.block_target_seconds.max(1);
+                    let tip = heights()?.1;
+                    for r in &rpcs { if let Some(s) = sends_at(r, &v)?.into_iter().find(|s| pays(s, &msg) && tip.saturating_sub(s.0) < day) {
+                        return Err(format!("payment already made (cheque {}): the account's history shows this same payment (to {to}, same amount and fee) in block {}, \
+                            sent from another machine or state dir. Pass --again to pay the same again on a new cheque", s.1, s.0));
+                    } }
+                    if let Some(n) = v.open.iter().copied().find(|&n| v.revealed(n)[..=PART_A].iter().zip(&digits).all(|(r, d)| *r == Some(*d))) {
+                        return Err(format!("cheque {n} is open on chain with this same payment (to {to}), sent from another machine or state dir: finish it there, or wait for it. \
+                            Pass --again to pay the same again on a new cheque (which ends cheque {n} unfinished)"));
+                    }
+                    for r in &rpcs { for l in http(r, "GET", "/mempool", "")?.lines() {
+                        let kv: Vec<(&str, &str)> = l.strip_prefix("cheque ").unwrap_or("").split_whitespace().filter_map(|x| x.split_once('=')).collect();
+                        let g = |k: &str| kv.iter().find(|e| e.0 == k).map(|e| e.1);
+                        if g("account") == Some(id.as_str()) && g("to") == Some(to.to_string().as_str()) && g("amount").map_or(true, |a| msg.amount().map_or(true, |m| a == m.to_string())) {
+                            return Err(format!("cheque {} is waiting to be mined to this same recipient ({to}), sent from another machine or state dir: wait for the next block and run \
+                                this again (if it is this same payment it is then refused as made). Pass --again to pay the same again on a new cheque", clean(g("cheque").unwrap_or("?"))));
+                        }
+                    } }
                 }
                 let (mut queued, mut unspent): (Vec<u16>, Vec<Vec<u16>>) = (v.open.clone(), vec![]);
                 for r in &rpcs {
@@ -298,18 +405,7 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
                 }
                 // the remaining checks happen here, from what the chain says publicly: no cell leaves this machine before
                 // the cheque is sent for real, and exactly one cheque is signed per payment
-                let balance: u64 = v.field("balance").parse().map_err(|_| "the node gave no balance")?;
-                let fee = tier as u64 * p.fee_unit;
-                let amount = msg.amount().unwrap_or(0);
-                if balance < amount + fee { return Err(format!("balance {} is less than {} coins and the fee", balance as f64 / COIN as f64, (amount + fee) as f64 / COIN as f64)); }
-                // every node must know the recipient as a final number: a cheque to a number nobody holds yet is void
-                if to != 0 { for r in &rpcs {
-                    let t = http(r, "GET", &format!("/account/{to}"), "").unwrap_or_default();
-                    if !t.lines().any(|l| l == format!("number {to}")) { return Err(format!("{r}: account {to} is not a final number yet (or does not exist)")); }
-                    if !t.lines().any(|l| l == "funded true") && r == &rpc {
-                        eprintln!("warning: account {to} is not permanent yet: until it holds {} coin(s) at once it expires with its balance, so smaller amounts sent to it may be burned", p.min_fund as f64 / COIN as f64);
-                    }
-                } }
+                funds(&v)?;
                 // the last cheque of a book is kept for the sweep to a new book (DESIGN.md §10.11): spent on anything
                 // else, whatever is left in the account can never move again
                 if cmd == "send" && cheque as u32 == size - 1 && !flag("--last") {
@@ -326,35 +422,59 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
             // recipient and one amount column), and its 5 remaining pieces only once that is deep enough in a block (§10.12)
             let (open, rest) = if cmd == "void" { (book.open_all(cheque, &digits), vec![]) } else { book.halves(cheque, &digits) };
             let v = agreed(false)?.unwrap();
-            if other(&v) { return Err(tampered(cheque)); }
+            if other(&v) { return Err(taken(cheque)); }
             if !v.done(cheque) && !v.open.contains(&cheque) {
+                // an opening for the record's cheque from an earlier run: it may be in flight, so never on one node's word
+                if resumed.is_some() && rpcs.len() < 2 { return Err(one_node(cheque)); }
                 let send = dry_run(cheque, std::slice::from_ref(&open), &digits, again)?;
-                if !send.is_empty() { post_all(&send).map_err(|e| format!("{e}\ncheque {cheque} may still be live: {again}"))?; }
+                // opened by someone else between the dry run and the post (two of the user's machines at once)
+                if !send.is_empty() { post_all(&send).map_err(|e| if e.contains("cheque already open") || e.contains("with other digits") { taken(cheque) } else { format!("{e}\ncheque {cheque} may still be live: {again}") })?; }
             }
+            // the cheque numbers waiting in some node's mempool
+            let waiting = || -> Result<bool, String> { for r in &rpcs { if list(&http(r, "GET", &format!("/queued/{id}"), "")?, "queued")?.contains(&cheque) { return Ok(true); } } Ok(false) };
+            let mut pending = false;
             let in_block = if cmd == "void" { poll(&|v| Ok(v.done(cheque)))? } else {
                 // the opening counts once every node shows exactly our digits on this open cheque, deep enough
                 let ready = poll(&|v| {
-                    if other(v) { return Err(tampered(cheque)); }
+                    if other(v) { return Err(taken(cheque)); }
                     if v.done(cheque) { return Ok(true); }
                     Ok(v.open.contains(&cheque) && v.revealed(cheque)[..=PART_A].iter().zip(&digits).all(|(r, d)| *r == Some(*d)) && deep(v, cheque)?)
                 })?;
                 if !ready { return Err(format!("cheque {cheque} is half sent: its opening is not {confirmations} blocks deep on every node after {wait} seconds; {again}")); }
                 // released only now, and only on what every node agrees on: our digits, deep enough, not near expiry
                 let v = agreed(false)?.unwrap();
-                if other(&v) { return Err(tampered(cheque)); }
+                if other(&v) { return Err(taken(cheque)); }
                 if !v.done(cheque) {
                     if !deep(&v, cheque)? { return Err(format!("cheque {cheque}'s opening is no longer {confirmations} blocks deep on every node (a reorganisation?); {again}")); }
-                    let send = dry_run(cheque, &rest, &digits, again)?;
-                    if !send.is_empty() { post_all(&send).map_err(|e| format!("{e}\ncheque {cheque} may still be live: {again}"))?; }
+                    // pieces of it waiting to be mined already (a lost reply): a node's dry run reads them as finishing it
+                    pending = waiting()?;
+                    if pending { eprintln!("cheque {cheque}: waiting for the pieces already sent to be mined"); } else {
+                        let send = dry_run(cheque, &rest, &digits, again)?;
+                        if !send.is_empty() { post_all(&send).map_err(|e| format!("{e}\ncheque {cheque} may still be live: {again}"))?; }
+                    }
                 }
-                poll(&|v| { if other(v) { return Err(tampered(cheque)); } Ok(v.done(cheque)) })?
+                poll(&|v| { if other(v) { return Err(taken(cheque)); } Ok(v.done(cheque)) })?
             };
+            // over: a payment counts as made only when the account's history shows this cheque paying it (a void from
+            // another machine, a later cheque, an expiry or a recipient not final at completion all end it unpaid)
+            if in_block && cmd != "void" {
+                let v = agreed(false)?.unwrap();
+                match fate(&v, cheque, &msg)? {
+                    Some((_, true)) => {}
+                    Some(_) => return Err(format!("cheque {cheque} was finished carrying another payment from this seed (another machine or state dir): this payment was not made. \
+                        Run this again to write it on a new cheque")),
+                    None => return Err(format!("cheque {cheque} closed without paying {to}: {}. Nothing was paid; pass --again to write it on a new cheque",
+                        match v.nonce { Some(x) if x > cheque => format!("cheque {x} went into a block after it (a void or a send from another machine with this seed), which ends every lower cheque"),
+                                        _ => "it expired, or its recipient was not a final number when it completed".into() })),
+                }
+            }
             drop(rec);
             let what = if cmd == "sweep" { format!("{} sweeps the whole balance to {to}, fee tier {tier}", msg.display()) }
                 else if cmd == "void" { format!("{} voids every lower cheque", msg.display()) }
                 else { format!("{} to {to}, {} coins, fee tier {tier}", msg.display(), msg.amount().unwrap_or(0) as f64 / COIN as f64) };
             if in_block { println!("cheque {cheque} sent: {what}"); }
             else if cmd == "void" { return Err(format!("void cheque {cheque} posted but not in a block after {wait} seconds: the cheque it voids may still complete; {again}")); }
+            else if pending { return Err(format!("cheque {cheque}: still waiting for the pieces already sent to be mined after {wait} seconds: {what}; run this again later")); }
             else { println!("cheque {cheque} posted, not in a block after {wait} seconds: {what}; `wallet info` shows it done when nonce reaches {cheque}"); }
         }
         _ => return Err("wallet commands: new, info, register, more, send, sweep, void, pieces".into()),
@@ -402,11 +522,12 @@ fn read_seed_file(f: &str, text: &mut String) -> Result<(), String> {
     std::io::Read::read_to_string(&mut file, text).map(drop).map_err(|e| format!("{f}: {e}"))
 }
 
-/// --to: the recipient as printed, 11 digits and the Damm check digit (NNNNNNNNNNN-C or all 12 together). The check
-/// digit is the holder's, never computed here, so a mistyped number is caught instead of paying a stranger.
+/// --to: the recipient as printed, 11 digits and the Damm check digit (NNNNNNNNNNN-C or all 12 together), or as the
+/// explorer shows it, the number without its leading zeros (N-C, the check digit still over all 11). The check digit is
+/// the holder's, never computed here, so a mistyped number is caught instead of paying a stranger.
 fn payee(s: &str) -> Result<u32, String> {
-    let bad = || format!("--to takes the recipient's 12-digit number with its check digit, as printed (NNNNNNNNNNN-C), not {}", clean(s));
-    let all = match s.split_once('-') { Some((n, c)) if n.len() == PAYEE_DIGITS && c.len() == 1 => format!("{n}{c}"), None if s.len() == RECIPIENT => s.to_string(), _ => return Err(bad()) };
+    let bad = || format!("--to takes the recipient's number with its check digit, as printed (NNNNNNNNNNN-C) or as the explorer shows it (N-C), not {}", clean(s));
+    let all = match s.split_once('-') { Some((n, c)) if (1..=PAYEE_DIGITS).contains(&n.len()) && c.len() == 1 => format!("{n:0>PAYEE_DIGITS$}{c}"), None if s.len() == RECIPIENT => s.to_string(), _ => return Err(bad()) };
     if !all.bytes().all(|c| c.is_ascii_digit()) { return Err(bad()); }
     let d: Vec<u8> = all.bytes().map(|c| c - b'0').collect();
     if !damm::valid(&d) { return Err(format!("--to {}: the check digit does not match: the number is mistyped", clean(s))); }

@@ -39,11 +39,23 @@ pub struct St { pub nonce: String, pub open: String, pub pool: Vec<(u16, u8)>, p
                 /// posts of cheque pieces only (an amount half) reach the pool but get no reply
                 pub drop_piece_replies: usize,
                 /// GET /id requests served
-                pub ids: usize }
+                pub ids: usize,
+                /// cheques finished, (height, cheque): GET /history/5 lists them as sends, newest first, unless `history` says otherwise
+                pub completed: Vec<(u32, u16)>, pub history: Option<String> }
 impl St {
     fn expires(&self) -> String {
         if self.open == "none" { return "none".into(); }
         self.open.split(',').map(|c| { let n: u16 = c.parse().unwrap_or(0); format!("{c}:{}", self.opened.get(&n).copied().unwrap_or(self.height) + self.lifetime) }).collect::<Vec<_>>().join(",")
+    }
+    /// The book's account history as a node's /history lists it: its finished cheques as sends (a payee that does not
+    /// read back as a cheque is left out, as a void to a number nobody holds is).
+    pub fn history(&self) -> String {
+        if let Some(h) = &self.history { return h.clone(); }
+        self.completed.iter().rev().filter_map(|&(h, c)| {
+            let d: [u8; 18] = (0..18u8).map(|col| self.digits.get(&(c, col)).copied()).collect::<Option<Vec<u8>>>()?.try_into().ok()?;
+            let m = bitcheque::message::parse(&d).ok()?;
+            Some(format!("{h} send cheque={c} to={} amount={} fee={}", m.payee, m.amount().unwrap_or(1_000_000_000), m.tier as u64 * 1000))
+        }).collect::<Vec<_>>().join("\n")
     }
     fn started(&self, c: u16) -> bool { self.pool.iter().any(|p| p.0 == c) || self.chain.contains_key(&c) }
     /// The node's /check answer for one line.
@@ -79,6 +91,7 @@ impl St {
             let s = self.chain.entry(c).or_default();
             s.insert(col);
             if s.len() == 18 {
+                self.completed.push((self.height, c));
                 if self.open == c.to_string() { self.open = "none".into(); }
             } else { self.open = c.to_string(); }
         }
@@ -96,7 +109,7 @@ pub fn fake(r: Reply) -> Fake {
     let addr = l.local_addr().unwrap().to_string();
     let posts = Arc::new(Mutex::new(Vec::new()));
     let st = Arc::new(Mutex::new(St { nonce: r.nonce.into(), open: r.open.into(), pool: vec![], chain: BTreeMap::new(), digits: BTreeMap::new(), mining: true, lose: 0, drop_replies: 0, refuse: None, mine_below: 18,
-                                      height: 100, extra: 5, lifetime: 10_000, opened: BTreeMap::new(), registered: true, drop_piece_replies: 0, ids: 0 }));
+                                      height: 100, extra: 5, lifetime: 10_000, opened: BTreeMap::new(), registered: true, drop_piece_replies: 0, ids: 0, completed: vec![], history: None }));
     let relay: Arc<Mutex<Vec<Arc<Mutex<St>>>>> = Arc::new(Mutex::new(Vec::new()));
     let (p, s0, rl) = (posts.clone(), st.clone(), relay.clone());
     std::thread::spawn(move || for s in l.incoming() {
@@ -154,6 +167,7 @@ pub fn fake(r: Reply) -> Fake {
                 for (c, _) in &g.pool { if !q.contains(&c.to_string()) { q.push(c.to_string()); } }
                 q.join(",")
             }
+            else if path == "/history/5" { st.lock().unwrap().history() }
             else if path == "/regtarget" { r.regtarget.clone() }
             else if path == "/tip" { "00".repeat(32) }
             else if path == "/height" { let g = st.lock().unwrap(); (g.height + g.extra).to_string() }

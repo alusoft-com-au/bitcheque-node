@@ -76,11 +76,12 @@ impl Params {
             min_fund: COIN,                // permanence costs a coin held, not one base unit
             renew_window: 43_200,          // the last 30 days of a batch's life
             max_reorg: 100,                // as deep as number_maturity: replacing a final number takes twice the work
-            // a day. Worst-case state of unfunded registrations (each 16 cheques × 180 cells × 16 bytes ≈ 46 KB): the target
-            // settles at one per 10 blocks, so at the floor target 1,440 / 10 = 144 live ≈ 6.6 MB (the edge node's Durable
-            // Object has 128 MB; at the former one a block for 4,320 blocks it was ~200 MB). More needs more work: within
-            // one lifetime, every further 144 registrations (6.6 MB) make each one e ≈ 2.7 times harder, so 128 MB would
-            // need its last registrations to cost ~10^8 floor registrations' work each
+            // a day. Worst-case state of unfunded registrations (each 16 cheques × 180 cells × 16 bytes ≈ 46 KB, twice that
+            // for an n32 book's 32-byte cells): the target settles at one per 10 blocks, so at the floor target 1,440 / 10 =
+            // 144 live ≈ 6.6 MB, about 13 MB if every one is an n32 book (the edge node's Durable Object has 128 MB; at the
+            // former one a block for 4,320 blocks it was ~200 MB). More needs more work: within one lifetime, every further
+            // 144 registrations (6.6-13 MB) make each one e ≈ 2.7 times harder, so 128 MB would need its last registrations
+            // to cost ~10^4-10^8 floor registrations' work each
             unfunded_pow_lifetime: 1_440,
             number_quarantine: 525_600,    // a year
             batch_lifetime: 2_100_000,     // about four years

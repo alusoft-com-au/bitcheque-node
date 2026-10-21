@@ -17,11 +17,15 @@
 //!   The used-cheque record lives in --state-dir, else $BITCHEQUE_STATE, else ~/.config/bitcheque (absolute, yours alone).
 //!   Several --rpc nodes (repeated, or a comma list): the first gets the cheque, every one dry-runs it, and every decision
 //!   needs all of them to report the book alike.
-//!   With no record of a payment signed here, two agreeing nodes are needed, or --fresh for a book never used elsewhere.
-//!   --to is the recipient as printed, check digit included (never computed here); a non-zero amount to 0 needs --burn.
+//!   A new cheque needs two agreeing nodes, or --fresh: the holder's word that this book signs cheques on this machine only
+//!   (one node could hide a cheque sent from elsewhere). Never one node while the last cheque signed here is not in the
+//!   account's history as finished.
+//!   --to is the recipient as printed, check digit included (never computed here), or as the explorer shows it (N-C); a
+//!   non-zero amount to 0 needs --burn. "sent" only once the account's history shows the cheque paying it.
 //!   A payment goes in two halves: the opening (recipient and first amount digit), and once it is --confirmations blocks
 //!   deep (3) the 5 remaining pieces. A send that fails part way says so: run the same command again (the same cheque is
-//!   finished, never re-written; a payment already made is refused unless --again), or `wallet void`, which confirms a
+//!   finished, never re-written; a payment already made, here or from another machine within about a day, or open or
+//!   waiting with the same recipient, is refused unless --again), or `wallet void`, which confirms a
 //!   zero cheque on the next number so the earlier one can never complete (DESIGN.md §10.13).
 //!   The RPC is plain HTTP: anyone on the path can withhold or forge replies (never forge a cheque). Use --rpc A --rpc B with
 //!   nodes reached over different paths.

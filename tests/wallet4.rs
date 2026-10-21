@@ -15,19 +15,19 @@ fn the_same_payment_is_never_made_twice_by_accident() {
     let to = num(7);
     let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5", "--fresh"]);
     assert!(ok && out.contains("cheque 1 sent"), "{out}");
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5"]);
+    let (ok, out) = wallet(&h, &f, &["send", "--fresh", "--to", &to, "--amount", "5"]);
     assert!(!ok && out.contains("payment already made (cheque 1)") && out.contains("--again"), "{out}");
     assert_eq!(cheques(&f), vec![1]);
     // the amount half's reply lost (it lands all the same): the rerun refuses, never cheque 3
     let to2 = num(8);
     f.set(|s| s.drop_piece_replies = 1);
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &to2, "--amount", "5"]);
+    let (ok, out) = wallet(&h, &f, &["send", "--fresh", "--to", &to2, "--amount", "5"]);
     assert!(!ok && out.contains("cheque 2 may still be live"), "{out}");
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &to2, "--amount", "5"]);
+    let (ok, out) = wallet(&h, &f, &["send", "--fresh", "--to", &to2, "--amount", "5"]);
     assert!(!ok && out.contains("payment already made (cheque 2)"), "{out}");
     assert_eq!(cheques(&f), vec![1, 2]);
     // on purpose
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &to2, "--amount", "5", "--again"]);
+    let (ok, out) = wallet(&h, &f, &["send", "--fresh", "--to", &to2, "--amount", "5", "--again"]);
     assert!(ok && out.contains("cheque 3 sent"), "{out}");
     assert_eq!(cheques(&f), vec![1, 2, 3]);
     never_two_messages(&[&f]);
@@ -50,13 +50,13 @@ fn an_open_payment_of_ours_is_resumed() {
         let mut s = st.lock().unwrap();
         if s.ids >= ids + 2 { s.mine_below = 18; s.mine(); break; }
     });
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5"]);
+    let (ok, out) = wallet(&h, &f, &["send", "--fresh", "--to", &to, "--amount", "5"]);
     assert!(ok && out.contains("finishing it") && out.contains("cheque 1 sent"), "{out}");
     assert_eq!(columns(&f, 1), (0..18).collect::<Vec<u8>>(), "nothing sent twice");
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5"]);
+    let (ok, out) = wallet(&h, &f, &["send", "--fresh", "--to", &to, "--amount", "5"]);
     assert!(!ok && out.contains("payment already made (cheque 1)"), "{out}");
-    assert!(wallet(&h, &f, &["void"]).0);
-    let (ok, out) = wallet(&h, &f, &["void"]);
+    assert!(wallet(&h, &f, &["void", "--fresh"]).0);
+    let (ok, out) = wallet(&h, &f, &["void", "--fresh"]);
     assert!(ok && out.contains("done already") && out.contains("cheque 2 sent"), "{out}");
     assert_eq!(cheques(&f), vec![1, 2]);
     assert_eq!(openings(&f).iter().map(|o| (o.0, o.1.len())).collect::<Vec<_>>(), vec![(1, 13), (2, 18)]);   // a void: one opening of all 18
@@ -75,14 +75,14 @@ fn the_amount_waits_for_confirmations() {
     // two more blocks while it waits: then it goes on
     let st = f.st.clone();
     std::thread::spawn(move || { std::thread::sleep(std::time::Duration::from_secs(2)); st.lock().unwrap().extra = 2; });
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "5"]);
+    let (ok, out) = wallet(&h, &f, &["send", "--fresh", "--to", &to, "--amount", "5"]);
     assert!(ok && out.contains("finishing it") && out.contains("cheque 1 sent"), "{out}");
     assert_eq!(columns(&f, 1), (0..18).collect::<Vec<u8>>());
     // --confirmations 1 trusts a single block
     f.set(|s| s.extra = 0);
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "6", "--confirmations", "1"]);
+    let (ok, out) = wallet(&h, &f, &["send", "--fresh", "--to", &to, "--amount", "6", "--confirmations", "1"]);
     assert!(ok && out.contains("cheque 2 sent"), "{out}");
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &to, "--amount", "6", "--confirmations", "0", "--again"]);
+    let (ok, out) = wallet(&h, &f, &["send", "--fresh", "--to", &to, "--amount", "6", "--confirmations", "0", "--again"]);
     assert!(!ok && out.contains("--confirmations"), "{out}");
 }
 
@@ -95,10 +95,12 @@ fn the_amount_is_not_sent_near_the_openings_expiry() {
     let (ok, out) = wallet(&h, &f, &["send", "--to", &num(7), "--amount", "5", "--fresh"]);
     assert!(!ok && out.contains("expires in 45 blocks") && out.contains("wallet void"), "{out}");
     assert_eq!(columns(&f, 1), (0..13).collect::<Vec<u8>>());
-    let (ok, out) = wallet(&h, &f, &["send", "--to", &num(7), "--amount", "5"]);
+    let (ok, out) = wallet(&h, &f, &["send", "--fresh", "--to", &num(7), "--amount", "5"]);
     assert!(!ok && out.contains("expires in"), "{out}");
     assert_eq!(columns(&f, 1), (0..13).collect::<Vec<u8>>());
-    let (ok, out) = wallet(&h, &f, &["void"]);
+    let (ok, out) = wallet(&h, &f, &["void", "--fresh"]);
+    assert!(!ok && out.contains("may still be in flight"), "{out}");
+    let (ok, out) = wallet_rpcs(&h, &[&f.addr, &f.addr.replace("127.0.0.1", "[::ffff:127.0.0.1]")], &["void"]);
     assert!(ok && out.contains("cheque 2 sent"), "{out}");
 }
 
@@ -123,8 +125,10 @@ fn every_node_must_agree_on_every_decision() {
                 s.opened = a.st.lock().unwrap().opened.clone(); s.height = a.st.lock().unwrap().height; });
     let (ok, out) = wallet_rpcs(&h, &[&a.addr, &b.addr], &["send", "--to", &to, "--amount", "5"]);
     assert!(ok && out.contains("cheque 1 sent"), "{out}");
-    // one node alone: a note
+    // one node alone: never for a new cheque on its word only (audit 5), and with --fresh (this book signs here only), a note
     let (ok, out) = wallet(&h, &a, &["send", "--to", &to, "--amount", "6"]);
+    assert!(!ok && out.contains("only one node was asked") && out.contains("--rpc A --rpc B"), "{out}");
+    let (ok, out) = wallet(&h, &a, &["send", "--to", &to, "--amount", "6", "--fresh"]);
     assert!(ok && out.contains("only one node"), "{out}");
     never_two_messages(&[&a, &b]);
 }
@@ -140,7 +144,7 @@ fn a_garbled_record_digit_is_refused() {
     let good = std::fs::read_to_string(&used).unwrap();
     for bad in [good.replacen('0', "x", 1), good.replacen('0', "-0", 1), format!("{}0", good.trim())] {
         std::fs::write(&used, &bad).unwrap();
-        let (ok, out) = wallet(&h, &f, &["send", "--to", &num(7), "--amount", "2"]);
+        let (ok, out) = wallet(&h, &f, &["send", "--fresh", "--to", &num(7), "--amount", "2"]);
         assert!(!ok && out.contains("not a cheque number"), "{bad:?}: {out}");
     }
     assert_eq!(cheques(&f), vec![1]);

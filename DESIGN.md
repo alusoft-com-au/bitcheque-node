@@ -246,25 +246,33 @@ is how miners, pools and exchanges use the chain:
   or more than 3 cheques ahead (`--force-skip` burns the skipped ones), and
   refuses to spend cheque 255 on anything but `sweep` unless told `--last`.
   `--to` is the recipient as printed, check digit included, verified and
-  never computed; coins to number 0 need `--burn`. With no record of a
-  payment signed on this machine it needs two nodes that agree on the
-  book (`--rpc A --rpc B`), or `--fresh`. With several nodes every decision
-  (choosing a number, releasing the amount, deciding a cheque is done) needs
-  all of them to report the book alike (nonce, open cheque, revealed digits,
-  expiry), else it stops; one node alone works, with a note. Every node
+  never computed (or the explorer's short form `N-C`, the check digit over
+  all 11 digits); coins to number 0 need `--burn`. A new cheque needs two
+  nodes that agree on the book (`--rpc A --rpc B`), or `--fresh`, the
+  holder's word that the book signs cheques on this machine only: one node
+  could hide a cheque sent from elsewhere, and a cheque on top of it would
+  put a second message on its number. While the last cheque signed here is
+  not in the account's history as finished, one node is never enough. With
+  several nodes every decision (choosing a number, releasing the amount,
+  deciding a cheque is done) needs all of them to report the book alike
+  (number, nonce, open cheque, revealed digits, expiry), else it stops. Every node
   given dry-runs each half (`POST /check`, whose rows must be the cheque's
   own digits) and must know the recipient as final before anything is
   posted. A payment goes in two halves (§10.12): the opening (columns 0–12),
   then, once it is 3 blocks deep on every node (`--confirmations`) and more
   than 100 blocks from its expiry (else: void it), the 5 remaining pieces;
-  it reports "sent" only once the cheque is in a block. While the last cheque
+  it reports "sent" only once every node's history shows the cheque paying
+  this recipient this amount (a cheque overtaken by a later one, voided or
+  expired is reported as not paid, and the run fails). While the last cheque
   it signed is not shown over by every node, it only finishes that same
   cheque (the same command again, the same recorded digits) or voids it:
   `wallet void` confirms a zero-coin, fee tier 0 cheque to number 0 on the
   next number, as one opening of all 18 columns, and waits for its block
   (§10.13, failed-broadcast rule). The same payment again (same recipient,
-  amount and fee as the recorded cheque, now over) is refused as "payment
-  already made" unless `--again`. A fee tier 0 is refused but for a void.
+  amount and fee as the recorded cheque, now over and paid; or in the
+  account's history within about a day, or open on chain with these digits,
+  or waiting to be mined to the same recipient, sent from another machine)
+  is refused as "payment already made" unless `--again`. A fee tier 0 is refused but for a void.
   The RPC is plain HTTP, so anyone on the path can withhold or forge replies
   (never a cheque): give nodes reached over different paths.
 - The one-time nature remains. A software wallet restored from seed must

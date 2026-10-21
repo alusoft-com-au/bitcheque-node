@@ -92,9 +92,16 @@ impl State {
     }
     fn key(&self, salt: &[u8; 16]) -> Key { key(salt, &self.net) }
     /// The registration target of the next block (`begin_block` moves it by this block's registrations).
+    /// target × (W+1) / (W+R·k), multiplied first and rounded up: it never rounds to 0 (where it would stay for good),
+    /// and an empty block always eases it. A target too large to multiply exactly (above 2^192) is divided first, which
+    /// loses nothing that matters there.
     pub fn next_reg_target(&self, p: &Params) -> U256 {
-        let w = p.reg_pow_window as u64;
-        let t = self.reg_target.div_u64(w + p.reg_per_blocks as u64 * self.reg_block_count as u64).mul_u64(w + 1);
+        let (n, d) = (p.reg_pow_window as u64 + 1, p.reg_pow_window as u64 + p.reg_per_blocks as u64 * self.reg_block_count as u64);
+        let t = if self.reg_target.bits() > 192 { self.reg_target.div_u64(d).mul_u64(n) } else {
+            let x = self.reg_target.mul_u64(n);
+            let q = x.div_u64(d);
+            if q.mul_u64(d) == x { q } else { q.add(&U256::from_u64(1)) }
+        };
         if t > p.reg_pow_target { p.reg_pow_target } else { t }
     }
 
