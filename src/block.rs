@@ -187,6 +187,9 @@ impl Blocks {
 pub const HISTORY_CAP: usize = 50;
 #[derive(Clone, Debug)]
 pub struct Entry { pub height: u32, pub event: Event }
+/// A completed cheque of an account, as /sends lists it: (height, cheque, to, amount, fee). Every one is kept, newest last:
+/// a cheque number completes once per account id and a book has book_size of them, so at most that many per account.
+pub type Sent = (u32, u16, u32, u64, u64);
 
 /// Lifetime counters, updated once per block (O(1)) and rebuilt with the chain. Not consensus.
 #[derive(Clone, Debug, Default)]
@@ -214,10 +217,10 @@ pub fn relieved_bits(p: &Params, headers: &[Header], time: u32) -> u32 {
 /// `headers`/`hashes` hold heights `base ..= height()`. A node keeps them all (`keep` None, `base` 0); the edge node
 /// keeps only the most recent `keep` (a Durable Object has 128 MB, and the rules look back 60 blocks at most).
 pub struct Chain { pub params: Params, pub blocks: Blocks, pub headers: Vec<Header>, pub hashes: Vec<[u8; 32]>, pub state: State,
-                   pub history: HashMap<AccountId, VecDeque<Entry>>, pub totals: Totals, pub base: u32, pub keep: Option<usize> }
+                   pub history: HashMap<AccountId, VecDeque<Entry>>, pub sends: HashMap<AccountId, Vec<Sent>>, pub totals: Totals, pub base: u32, pub keep: Option<usize> }
 
 impl Chain {
-    /// History and totals as bytes, for a state snapshot.
+    /// History, sends and totals as bytes, for a state snapshot.
     pub fn encode_index(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
         w.u32(self.history.len() as u32);
@@ -229,6 +232,8 @@ impl Chain {
                 Event::Transfer { from, cheque, to, amount, fee, digits } => { w.u8(2); w.bytes(from); w.u16(*cheque); w.u32(*to); w.u64(*amount); w.u64(*fee); w.0.extend_from_slice(digits) } } }
         }
         for x in [self.totals.txs, self.totals.pieces, self.totals.registrations, self.totals.transfers, self.totals.rewards] { w.u64(x); }
+        w.u32(self.sends.len() as u32);
+        for (id, ss) in &self.sends { w.bytes(id); w.u32(ss.len() as u32); for s in ss { w.u32(s.0); w.u16(s.1); w.u32(s.2); w.u64(s.3); w.u64(s.4); } }
         w.0
     }
     pub fn decode_index(&mut self, r: &mut R) -> Result<(), &'static str> {
@@ -242,8 +247,14 @@ impl Chain {
                 _ => return Err("bad history") }; es.push_back(Entry { height, event }); }
             h.insert(id, es);
         }
-        self.history = h;
-        self.totals = Totals { txs: r.u64()?, pieces: r.u64()?, registrations: r.u64()?, transfers: r.u64()?, rewards: r.u64()? };
+        let totals = Totals { txs: r.u64()?, pieces: r.u64()?, registrations: r.u64()?, transfers: r.u64()?, rewards: r.u64()? };
+        let mut sends = HashMap::new();
+        for _ in 0..r.u32()? {
+            let id = r.bytes()?; let n = r.u32()?; let mut ss = Vec::new();
+            for _ in 0..n { ss.push((r.u32()?, r.u16()?, r.u32()?, r.u64()?, r.u64()?)); }
+            sends.insert(id, ss);
+        }
+        (self.history, self.sends, self.totals) = (h, sends, totals);   // all or nothing
         Ok(())
     }
     /// Block 0 (§12): coinbase to number 0, zero state root by definition, mined.
@@ -257,7 +268,7 @@ impl Chain {
         if !genesis.header.meets_target() || genesis.header.bits != p.initial_bits { return Err("bad genesis"); }
         // block 0's hash is no registration anchor: it is known before launch, so work anchored to it could be done early
         let state = State::new(&p);
-        Ok(Chain { params: p, blocks: Blocks::Mem(vec![genesis.clone()]), headers: vec![genesis.header.clone()], hashes: vec![genesis.header.hash()], state, history: HashMap::new(), totals: Totals::default(), base: 0, keep: None })
+        Ok(Chain { params: p, blocks: Blocks::Mem(vec![genesis.clone()]), headers: vec![genesis.header.clone()], hashes: vec![genesis.header.hash()], state, history: HashMap::new(), sends: HashMap::new(), totals: Totals::default(), base: 0, keep: None })
     }
     pub fn height(&self) -> u32 { self.base + self.headers.len() as u32 - 1 }
     /// The header and hash at height `h`, while it is in memory.
@@ -314,6 +325,7 @@ impl Chain {
                 Event::Reward { number, .. } => s.numbers.get(number).map(|(id, _)| id.clone()).into_iter().collect(),
                 Event::Transfer { from, to, .. } => [Some(from.clone()), s.numbers.get(to).map(|(id, _)| id.clone())].into_iter().flatten().collect(),
             };
+            if let Event::Transfer { from, cheque, to, amount, fee, .. } = &e { self.sends.entry(from.clone()).or_default().push((height, *cheque, *to, *amount, *fee)); }
             ids.dedup();
             for id in ids {
                 let h = self.history.entry(id).or_default();

@@ -33,7 +33,7 @@ pub fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Params)
     run(cmd, args, opt, p, &book.0)
 }
 
-/// A completed cheque as an account's /history lists it: (height, cheque, to, amount, fee).
+/// A completed cheque as an account's /sends (or /history) lists it: (height, cheque, to, amount, fee).
 type Send = (u32, u16, u32, u64, u64);
 
 /// What one node says about the book: the whole /id text, and the fields every decision rests on, which every node
@@ -132,12 +132,20 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
         if left < EXPIRY_MARGIN { return Err(format!("cheque {n}'s opening expires in {left} blocks: too close to send its amount (it could land after the opening is gone). Run `wallet void` to close it, then send again")); }
         Ok(low + 1 >= exp.saturating_sub(p.piece_lifetime) + confirmations)
     };
-    // the account's completed cheques by one node's /history (newest first, its last block::HISTORY_CAP events); an
-    // account with no final number has none
+    // the account's completed cheques by one node's /sends (newest first, every one); a node older than /sends: its
+    // /history, which lists only the last block::HISTORY_CAP events (rewards push sends out). No final number: none
+    let limited = std::cell::Cell::new(false);
     let sends_at = |r: &str, v: &View| -> Result<Vec<Send>, String> {
         let n = v.field("number");
         if n.is_empty() { return Ok(vec![]); }
-        Ok(http(r, "GET", &format!("/history/{n}"), "")?.lines().filter_map(|l| {
+        let text = match http(r, "GET", &format!("/sends/{n}"), "") {
+            Err(e) if e.ends_with(": unknown route") => {
+                if !limited.replace(true) { eprintln!("warning: {r} has no /sends (an older node): the account's payments are checked in its recent history only, so a payment made long ago or before many mined blocks may be missed"); }
+                http(r, "GET", &format!("/history/{n}"), "")?
+            }
+            t => t?,
+        };
+        Ok(text.lines().filter_map(|l| {
             let mut w = l.split_whitespace();
             let h = w.next()?.parse().ok()?;
             if w.next()? != "send" { return None; }
@@ -148,8 +156,8 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
     };
     // a completed cheque that is this payment: its recipient, amount (a sweep: any) and fee
     let pays = |s: &Send, m: &Message| s.2 == m.payee && s.4 == m.tier as u64 * p.fee_unit && m.amount().map_or(true, |a| a == s.3);
-    // what became of cheque n by every node's history: Some((block, whether it paid `m`)) once it completed, None if no
-    // node lists it (voided, overtaken by a later cheque, expired, or too old to be listed). The nodes must agree.
+    // what became of cheque n by every node's sends: Some((block, whether it paid `m`)) once it completed, None if no
+    // node lists it (voided, overtaken by a later cheque, expired, or too old for an older node's history). The nodes must agree.
     let fate = |v: &View, n: u16, m: &Message| -> Result<Option<(u32, bool)>, String> {
         let mut seen = None;
         for (i, r) in rpcs.iter().enumerate() {
@@ -366,13 +374,13 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
                     }); }
                 }
                 // this same payment made already from anywhere (another machine, a restored seed, a new --state-dir): in
-                // the account's history over about the last day, open on chain with these digits, or waiting to be mined.
+                // the account's sends over about the last day, open on chain with these digits, or waiting to be mined.
                 // An opening lives piece_lifetime blocks, so an older one still in flight is caught as open or waiting.
                 if cmd != "void" && !again_flag {
                     let day = 86_400 / p.block_target_seconds.max(1);
                     let tip = heights()?.1;
                     for r in &rpcs { if let Some(s) = sends_at(r, &v)?.into_iter().find(|s| pays(s, &msg) && tip.saturating_sub(s.0) < day) {
-                        return Err(format!("payment already made (cheque {}): the account's history shows this same payment (to {to}, same amount and fee) in block {}, \
+                        return Err(format!("payment already made (cheque {}): the account's sends show this same payment (to {to}, same amount and fee) in block {}, \
                             sent from another machine or state dir. Pass --again to pay the same again on a new cheque", s.1, s.0));
                     } }
                     if let Some(n) = v.open.iter().copied().find(|&n| v.revealed(n)[..=PART_A].iter().zip(&digits).all(|(r, d)| *r == Some(*d))) {

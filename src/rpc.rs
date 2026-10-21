@@ -7,6 +7,7 @@
 //!   GET /commits/<account id hex>/<cheque> (a registered unspent cheque's commitments: 18 lines, one per column, of 10 hex, one per row)
 //!   GET /proof/<number>   GET /regtarget (4 LE limbs, hex)   GET /queued/<account id hex> (cheque numbers of that account waiting in the mempool, comma-separated)
 //!   GET  /history/<number>  (newest first, the last block::HISTORY_CAP events: height kind key=value...; a cheque to yourself is listed as receive, then send)
+//!   GET  /sends/<number>  (every completed cheque of the account, newest first, as /history writes a send: height send cheque=N to=P amount=A fee=F; or "none")
 //!   GET  /stats   (lifetime totals, and the reward schedule: reward of the next block, base, halving interval, next halving, maturity)
 //!   GET  /mempool (count, then one line per waiting transaction in the /summary format (the first MEMPOOL_LIST), then a cheque line per waiting cheque whose recipient is readable)
 //!   GET  /top[/N]  (richest N accounts, default 50: number balance book_size last_cheque unspent pending)
@@ -307,6 +308,12 @@ impl Node {
                     Event::Transfer { from, cheque, amount, .. } => vec![format!("{} receive from={} cheque={cheque} amount={amount}", e.height, number_of(from))],
                 }).collect()).unwrap_or_default();
                 Ok(lines.join("\n"))
+            }
+            ("GET", ["sends", n]) => {
+                let num: u32 = n.parse().map_err(|_| "bad number")?;
+                let (id, _) = c.state.numbers.get(&num).filter(|_| is_final(c, num)).ok_or("no such number")?;
+                let lines: Vec<String> = c.sends.get(id).map(|ss| ss.iter().rev().map(|(h, cheque, to, amount, fee)| format!("{h} send cheque={cheque} to={to} amount={amount} fee={fee}")).collect()).unwrap_or_default();
+                Ok(if lines.is_empty() { "none".into() } else { lines.join("\n") })
             }
             ("GET", ["mempool"]) => {
                 // store before mempool, the same lock order as submit_tx

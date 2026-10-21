@@ -261,7 +261,7 @@ is how miners, pools and exchanges use the chain:
   posted. A payment goes in two halves (§10.12): the opening (columns 0–12),
   then, once it is 3 blocks deep on every node (`--confirmations`) and more
   than 100 blocks from its expiry (else: void it), the 5 remaining pieces;
-  it reports "sent" only once every node's history shows the cheque paying
+  it reports "sent" only once every node's `/sends` shows the cheque paying
   this recipient this amount (a cheque overtaken by a later one, voided or
   expired is reported as not paid, and the run fails). While the last cheque
   it signed is not shown over by every node, it only finishes that same
@@ -270,7 +270,10 @@ is how miners, pools and exchanges use the chain:
   next number, as one opening of all 18 columns, and waits for its block
   (§10.13, failed-broadcast rule). The same payment again (same recipient,
   amount and fee as the recorded cheque, now over and paid; or in the
-  account's history within about a day, or open on chain with these digits,
+  account's `/sends` within about a day (every completed cheque: `/history`
+  keeps only the last 50 events, and an account that mines pushes its sends
+  out of it; an older node without `/sends` is read by its `/history`, and
+  the wallet warns that the check is limited), or open on chain with these digits,
   or waiting to be mined to the same recipient, sent from another machine)
   is refused as "payment already made" unless `--again`. A fee tier 0 is refused but for a void.
   The RPC is plain HTTP, so anyone on the path can withhold or forge replies
@@ -1185,7 +1188,11 @@ RPC (non-consensus): `/height`, `/tip`, `/peers`, `/addrs`,
 their numbers once final, completed cheques with sender and recipient),
 `/account/<number>`, `/id/<account id>`, `/lookup/<code>`,
 `/history/<number>` (last 50 events; a cheque to yourself is listed as
-receive and send), `/proof/<number>`, `/regtarget`, `/stats`, `/top[/N]`,
+receive and send), `/sends/<number>` (every completed cheque of the account,
+newest first, one `HEIGHT send cheque=N to=P amount=A fee=F` line each, as
+`/history` writes a send, or `none`; at most a book's 256, kept for the
+account's lifetime in the node's index and its snapshots, rebuilt on a
+reorg), `/proof/<number>`, `/regtarget`, `/stats`, `/top[/N]`,
 `/mempool` (with decoded waiting cheques, §10.12), `POST /tx`, `POST /check`
 (dry run of up to 64 transactions, at most 2 of them registrations; a
 repeated line is answered "duplicate transaction"; an empty body answers

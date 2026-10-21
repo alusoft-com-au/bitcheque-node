@@ -48,7 +48,7 @@ const CACHE_S = 15;              // seconds the front worker caches a GET reply 
 // the RPC's paths, spelt one way only (numbers without sign or leading zeros, ids of the right length, no trailing slash:
 // /proof/7, /proof/07 and /proof/+7 would be three cache keys). Anything else is refused here, without waking a Durable Object.
 const N = '(?:0|[1-9]\\d{0,9})', ID = '[0-9a-f]{34}(?:[0-9a-f]{32})?';
-const GETS = new RegExp(`^/(?:height|peers|addrs|tip|regtarget|stats|mempool|edge|top(?:/${N})?|(?:block|summary|account|proof|history|template)/${N}|(?:id|queued)/${ID}|lookup/[0-9a-f]{8,64}|commits/${ID}/${N})$`);
+const GETS = new RegExp(`^/(?:height|peers|addrs|tip|regtarget|stats|mempool|edge|top(?:/${N})?|(?:block|summary|account|proof|history|sends|template)/${N}|(?:id|queued)/${ID}|lookup/[0-9a-f]{8,64}|commits/${ID}/${N})$`);
 const POSTS = /^\/(?:tx|check|block)$/;
 const HEAVY = /^\/(?:check$|tx$|template\/)/;   // the public's costlier requests: RL_HEAVY's lower limit applies too
 const TOP_MAX = 200;             // the most accounts /top/N lists (rpc.rs)
