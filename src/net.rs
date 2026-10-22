@@ -320,6 +320,7 @@ pub struct Node {
     sync: Mutex<Option<(u64, u32, std::time::Instant)>>,   // (peer, our height when its window started, when): the one source we pull batches from
     pub rpc_limit: Mutex<(std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>, Option<Instant>)>,   // per address; last sweep
     pub top_cache: Mutex<Option<(u32, String, Vec<String>)>>,   // height, header, ranked rows
+    pub proof_cache: Mutex<Option<([u8; 32], Vec<Vec<[u8; 32]>>, [u8; 32])>>,   // tip, the account Merkle tree there, its rest hash (/proof)
     next: Mutex<Option<State>>,        // the tip state with the mempool applied; None = rebuild on next use
     banned: Mutex<HashMap<std::net::IpAddr, Instant>>,
     strikes: Mutex<(HashMap<std::net::IpAddr, (u32, Instant)>, Option<Instant>)>,   // bad messages per address (ban_key), since when; last sweep
@@ -387,7 +388,7 @@ impl Node {
         let params = store.chain.params.clone();
         Arc::new(Node { store: Mutex::new(store), mempool: Mutex::default(), peers: Mutex::new(Vec::new()), next_id: Mutex::new(1), magic,
                         book: Mutex::new(BTreeMap::new()), book_path: Mutex::new(None), advertise: Mutex::new(None),
-                        sync: Mutex::new(None), rpc_limit: Mutex::default(), top_cache: Mutex::new(None),
+                        sync: Mutex::new(None), rpc_limit: Mutex::default(), top_cache: Mutex::new(None), proof_cache: Mutex::new(None),
                         next: Mutex::new(None), banned: Mutex::default(), strikes: Mutex::default(), bars: Mutex::default(), shunned: Mutex::default(), addr_sources: Mutex::default(), bad_txs: Mutex::default(),
                         mempool_text: Mutex::new(None), params, upstream: Mutex::new(Vec::new()),
                         mempool_cap: AtomicUsize::new(MEMPOOL_BYTES), tpl_cache: Mutex::new(None), own: Mutex::default() })
@@ -688,7 +689,7 @@ impl Node {
         let Some(head) = payload.get(..112) else { return Err("decode") };
         let h = Header::decode(head.try_into().unwrap());
         let p = &self.params;
-        if crate::u256::U256::from_compact(h.bits) > crate::u256::U256::from_compact(p.min_bits.max(p.initial_bits)) { return Err("bits"); }
+        if crate::u256::U256::from_compact(h.bits) > p.easiest_target() { return Err("bits"); }
         if !h.meets_target() { return Err("pow"); }
         let hash = h.hash();
         { let mut st = self.store.lock().unwrap(); if st.knows(&hash) { *height = st.height_of(&hash); return Err("known"); } if st.bad_header(&h) { return Err("invalid chain"); } }

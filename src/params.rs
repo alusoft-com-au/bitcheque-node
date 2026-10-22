@@ -104,6 +104,9 @@ impl Params {
         Params { block_target_seconds: 60, initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, reward_maturity: 10, number_maturity: 10,
                  reg_pow_target: U256::one_shl(240), stall_relief: true, magic: [0xBC, 0x4E, 0x51, 0x02], ..Params::mainnet() }
     }
+    /// The easiest target any block of this network may carry (block 0's or the floor, whichever is easier), compared as
+    /// targets: the compact encodings are not ordered as integers (a larger exponent with a small mantissa can be harder).
+    pub fn easiest_target(&self) -> U256 { U256::from_compact(self.min_bits).max(U256::from_compact(self.initial_bits)) }
     /// Block subsidy at `height` (§12.5): nothing for block 0, `launch_reward` through the launch year, then
     /// `reward_base` halving every `halving_interval` blocks.
     pub fn block_reward(&self, height: u32) -> u64 {

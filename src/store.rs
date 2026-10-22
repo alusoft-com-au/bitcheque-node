@@ -206,7 +206,7 @@ impl Store {
         if self.bad.contains_key(&b.header.prev) { self.mark_bad(h, "bad parent"); return Err("bad parent"); }
         let p = &self.chain.params;
         // a target easier than any block may have is invalid wherever the block would go (and cheap to fake)
-        if U256::from_compact(b.header.bits) > U256::from_compact(p.min_bits.max(p.initial_bits)) { return Err("bits"); }
+        if U256::from_compact(b.header.bits) > p.easiest_target() { return Err("bits"); }
         if !b.header.meets_target() { return Err("pow"); }
         if b.header.prev != self.chain.tip() && !self.index.contains_key(&b.header.prev) && !self.side.contains_key(&b.header.prev) { return Err("prev unknown"); }
         // the header commits to the body only through the tx root: checked before anything is remembered by hash

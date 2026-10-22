@@ -235,8 +235,10 @@ is how miners, pools and exchanges use the chain:
 - `m = 1`, as in the standard book: the machine holding the seed is
   trusted, the ordinary hot-wallet position.
 - The command-line wallet (`bitcheque wallet`) drives one book from one
-  seed: `register` registers the first 16 cheques (`--cheques N` for more),
-  `more` the next ones. It keeps a locked, fsynced record of the last
+  seed: `register` registers the first 16 cheques (`--cheques N` for the
+  first N; a node that took only some of the batches, its next block's
+  registration cap reached, is given the rest by running it again), `more`
+  the next ones. It keeps a locked, fsynced record of the last
   cheque it signed and its 18 digits (written before signing, in an
   absolute directory only its user can write; cheque 0 is only ever the
   honesty check; `pieces`, the raw signer, is recorded too, prints only the
@@ -1172,7 +1174,9 @@ reverse proxy on the same machine the client is the last
 `X-Forwarded-For` entry, which assumes exactly one proxy hop; a request
 must arrive within 20 s, plus a second per 32 KB of body actually
 received, and its reply be taken within 60 s; bodies must be ASCII;
-`/mempool` is cached per mempool version and tip), `wallet` (§4.2
+`/mempool` is cached per mempool version and tip, and `/proof` serves every
+account from one Merkle tree built per tip, so a proof costs microseconds
+rather than a hash per account), `wallet` (§4.2
 derivation, registration mining, non-consensus), `main` (`bitcheque
 genesis | node | wallet`). Tests: `tests/chain.rs` (life of the chain),
 `tests/net.rs` (sync and relay), `tests/store.rs` (reorg, persistence,

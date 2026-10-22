@@ -86,7 +86,8 @@ fn mine(opt: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     let rpc = opt("--rpc").ok_or("--rpc ADDR needed (host:port of a node's RPC)")?;
     let to: u32 = opt("--to").ok_or("--to NUMBER needed (the account that gets the reward; 0 burns it)")?.parse().map_err(|_| "bad --to")?;
     let threads = opt("--threads").and_then(|t| t.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())).max(1);
-    let min = U256::from_compact(bitcheque::params::Params::testnet().min_bits.max(bitcheque::params::Params::local().min_bits));
+    // the easiest target of any network this miner may be pointed at (a template at a mainnet target is far below it)
+    let min = Params::testnet().easiest_target().max(Params::local().easiest_target());
     eprintln!("mining for account {to} on {threads} threads against {rpc}");
     loop {
         let tpl = match http(&rpc, "GET", &format!("/template/{to}"), "") {

@@ -443,7 +443,7 @@ impl State {
         level[0]
     }
     /// SHA256 of everything outside the accounts that they do not determine, each list prefixed with its length.
-    fn rest_hash(&self) -> [u8; 32] {
+    pub fn rest_hash(&self) -> [u8; 32] {
         let mut v = Vec::new();
         let u = |v: &mut Vec<u8>, x: u64| v.extend_from_slice(&x.to_le_bytes());
         u(&mut v, self.height as u64); u(&mut v, self.next_number as u64);
@@ -459,21 +459,30 @@ impl State {
     }
     /// state_root = SHA256(merkle(account leaves in id order) || rest_hash).
     pub fn root(&self) -> [u8; 32] { sha256(&[Self::merkle(self.leaves()), self.rest_hash()].concat()) }
+    /// Every level of the account Merkle tree: the leaves in id order (zero-padded to a power of two) first, the root
+    /// last. Built once per block by the RPC and shared by every proof asked for at that tip (a proof costs one hash
+    /// per account otherwise, a CPU hole with many accounts).
+    pub fn merkle_levels(&self) -> Vec<Vec<[u8; 32]>> {
+        let mut level = self.leaves();
+        if level.is_empty() { return vec![vec![[0u8; 32]]]; }   // merkle() of no accounts
+        while !level.len().is_power_of_two() { level.push([0u8; 32]); }
+        let mut levels = vec![level];
+        while levels.last().unwrap().len() > 1 { let next = levels.last().unwrap().chunks(2).map(|p| Self::pair(&p[0], &p[1])).collect(); levels.push(next); }
+        levels
+    }
+    /// The proof of the account at `pos` (in id order) from `levels` (`merkle_levels`) and the rest hash: (leaf, sibling
+    /// path bottom-up with the rest hash as its last element, state root).
+    pub fn proof_at(levels: &[Vec<[u8; 32]>], rest: [u8; 32], pos: usize) -> ([u8; 32], Vec<[u8; 32]>, [u8; 32]) {
+        let (mut path, mut i) = (Vec::new(), pos);
+        for lv in &levels[..levels.len() - 1] { path.push(lv[i ^ 1]); i /= 2; }
+        path.push(rest);
+        (levels[0][pos], path, sha256(&[levels.last().unwrap()[0], rest].concat()))
+    }
     /// Merkle proof of one account: (leaf, sibling path bottom-up, and the `rest` hash is the last element), and the
     /// state root, computed from the same (cached) leaves.
     pub fn account_proof(&self, id: &AccountId) -> Option<([u8; 32], Vec<[u8; 32]>, [u8; 32])> {
         let pos = self.accounts.keys().position(|k| k == id)?;
-        let mut level = self.leaves();
-        while !level.len().is_power_of_two() { level.push([0u8; 32]); }
-        let (leaf, mut path, mut i) = (level[pos], Vec::new(), pos);
-        while level.len() > 1 {
-            path.push(level[i ^ 1]);
-            level = level.chunks(2).map(|p| Self::pair(&p[0], &p[1])).collect();
-            i /= 2;
-        }
-        let rest = self.rest_hash();
-        path.push(rest);
-        Some((leaf, path, sha256(&[level[0], rest].concat())))
+        Some(Self::proof_at(&self.merkle_levels(), self.rest_hash(), pos))
     }
 }
 

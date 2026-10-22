@@ -204,7 +204,9 @@ fn a_full_mempool_is_mined_over_several_blocks_not_into_one_oversized_block() {
     mine(&node, 0).unwrap();   // block 0 is no registration anchor
     for k in 0..10u8 {
         let b = Book { salt: [k; 16], n256: false, book_size: 256, domains: vec![Domain([k + 1; 32])], net: Params::mainnet().magic };
-        let target = node.store.lock().unwrap().chain.state.next_reg_target(&p);
+        // mined well below the target: the registrations mined into the first block tighten it for the next (by
+        // (W+1)/(W+10k)), and one mined to exactly the old target could then fall out of the mempool as insufficient
+        let target = node.store.lock().unwrap().chain.state.next_reg_target(&p).shr(1);
         node.submit_tx(mine_registration(b.register(0, 16, Payment::Pow([0; 32], 0)), tip(&node), target), None).unwrap();
     }
     let mut mined = 0;

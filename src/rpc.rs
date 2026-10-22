@@ -390,7 +390,14 @@ impl Node {
             ("GET", ["proof", n]) => {
                 let num: u32 = n.parse().map_err(|_| "bad number")?;
                 let (id, _) = c.state.numbers.get(&num).filter(|_| is_final(c, num)).ok_or("no such number")?;   // not final: as if unknown
-                let (leaf, path, root) = c.state.account_proof(id).ok_or("no proof")?;
+                let pos = c.state.accounts.keys().position(|k| k == id).ok_or("no proof")?;
+                // the tree is built once per tip and shared by every proof asked for at it: a proof costs a hash per account
+                // otherwise, which with many accounts would make this route a cheap way to burn the node's CPU (lock order:
+                // store, then proof_cache)
+                let mut cache = self.proof_cache.lock().unwrap();
+                if cache.as_ref().map_or(true, |(tip, _, _)| *tip != c.tip()) { *cache = Some((c.tip(), c.state.merkle_levels(), c.state.rest_hash())); }
+                let (_, levels, rest) = cache.as_ref().unwrap();
+                let (leaf, path, root) = crate::state::State::proof_at(levels, *rest, pos);
                 Ok(format!("state_root {}\nleaf {}\npath {}", hex(&root), hex(&leaf), path.iter().map(|x| hex(x)).collect::<Vec<_>>().join(" ")))
             }
             ("POST", ["tx"]) => {

@@ -13,7 +13,8 @@ const CONFIRMATIONS: u32 = 3;
 const EXPIRY_MARGIN: u32 = 100;
 
 /// A software wallet for one book from one seed: the same 256-cheque book the website prints, so a seed works in both.
-/// `register` registers the first cheques (16 by default, `--cheques` for more), `more` the next ones, 16 per proof of work.
+/// `register` registers the first cheques (16 by default, `--cheques N` for the first N), `more` the next ones, 16 per proof
+/// of work. A `register` the node took only part of (its next block's registration cap) is finished by running it again.
 /// The book salt is derived from the seed, so the seed alone recreates the book. Talks to a node's RPC; keeps one
 /// small file per book (~/.config/bitcheque/used-<id>: the last cheque number it signed, and its digits), so a number
 /// never carries two messages. Cheque 0 is only ever the honesty check, sent with `register`; `send` and `sweep` never sign it.
@@ -252,14 +253,26 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
             Err(_) => println!("id {id}\nnot registered"),
         },
         "register" | "more" => {
-            // a rerun of a registration that went through (a lost reply, say) has nothing left to do
-            if cmd == "register" && account().is_ok() { println!("id {id}\nalready registered"); return Ok(()); }
-            // `more` starts after the highest cheque the chain knows (unspent or used), at a batch boundary
-            let first = if cmd == "register" { 0 } else {
-                let a = account()?;
-                let top = field(&a, "unspent").split(',').chain([field(&a, "nonce").as_str()]).filter_map(|x| x.parse::<u32>().ok()).max().ok_or("account has no cheques")?;
-                (top / BATCH).checked_add(1).and_then(|b| b.checked_mul(BATCH)).ok_or("the node reports a cheque past any book: try another node")?
+            let known = if cmd == "register" { account().ok() } else { Some(account()?) };
+            // the batch after the highest cheque the chain knows of this book (unspent or used): where `more` starts, and
+            // how far a `register` got (None: the chain knows no cheque of it)
+            let next_batch = |a: &[(String, String)]| -> Result<Option<u32>, String> {
+                field(a, "unspent").split(',').chain([field(a, "nonce").as_str()]).filter_map(|x| x.parse::<u32>().ok()).max()
+                    .map(|top| (top / BATCH).checked_add(1).and_then(|b| b.checked_mul(BATCH)).ok_or("the node reports a cheque past any book: try another node".to_string())).transpose()
             };
+            let first = match (cmd, &known) {
+                ("register", None) => 0,
+                // a rerun of a registration that went through (a lost reply, say) has nothing left to do; one the node took
+                // only part of (its next block already held other registrations, up to its cap) goes on with the batches
+                // still missing, so they are not left out for good
+                ("register", Some(a)) => match next_batch(a)? {
+                    Some(h) if h < cheques => { eprintln!("cheques 0-{} are registered already: registering the rest", h - 1); h }
+                    _ => { println!("id {id}\nalready registered"); return Ok(()); }
+                },
+                (_, a) => next_batch(a.as_deref().unwrap_or(&[]))?.ok_or("account has no cheques")?,
+            };
+            // `register --cheques N` ensures cheques 0..N-1 are registered; `more` adds N more
+            let want = if cmd == "register" { cheques - 1 } else { first + cheques - 1 };
             if first >= size { return Err("every cheque of this book is registered already".into()); }
             let rec = if cmd == "register" { Some(record()?) } else { None };   // held until the honesty check is posted
             let limbs: Vec<u64> = http(&rpc, "GET", "/regtarget", "")?.split_whitespace().map(|w| u64::from_str_radix(w, 16).unwrap_or(0)).collect();
@@ -272,15 +285,18 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
             let target = target.div_u64(16).mul_u64(15);
             // the proof of work names the node's tip, so it is valid for the next reg_anchor_window blocks only
             let anchor: [u8; 32] = bitcheque::rpc::unhex(&http(&rpc, "GET", "/tip", "")?).and_then(|v| v.try_into().ok()).ok_or("bad tip")?;
-            let regs = book.registrations(first, first + cheques - 1);
+            let regs = book.registrations(first, want);
             let mut txs: Vec<_> = regs.iter().map(|reg| mine_registration(reg.clone(), anchor, target)).collect(); // each batch of 16 pays its own proof of work
             // honesty check: cheque 0, zero coins, to nobody, one opening of all 18 columns. Recorded before it is signed,
-            // so if it never reaches the chain no later cheque takes number 0
+            // so if it never reaches the chain no later cheque takes number 0. Not again once the chain shows cheque 0 used
+            // (a rerun after a partly taken registration): the node would refuse it, and the batches with it
             let mut honesty = false;
             let zero = Message::new(0, 0, 0, 0);
+            let used_0 = known.as_ref().is_some_and(|a| field(a, "nonce") != "none");
             if let Some(r) = &rec { match r.read()? {
-                None | Some((0, _)) => { r.write(0, &zero.digits())?; txs.push(book.open_all(0, &zero.digits())); honesty = true; }
-                Some((n, _)) => eprintln!("warning: this machine signed cheques up to {n} already: the honesty check (cheque 0) is not sent again"),
+                None | Some((0, _)) if !used_0 => { r.write(0, &zero.digits())?; txs.push(book.open_all(0, &zero.digits())); honesty = true; }
+                Some((n, _)) if n > 0 => eprintln!("warning: this machine signed cheques up to {n} already: the honesty check (cheque 0) is not sent again"),
+                _ => {}
             } }
             post_all(&txs)?;
             let last = ((first / BATCH + regs.len() as u32) * BATCH).min(size) - 1;
