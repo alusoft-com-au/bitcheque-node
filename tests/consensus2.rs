@@ -229,7 +229,7 @@ fn synth_state(p: &Params, accounts: usize, cheques: u16) -> State {
         let mut batches = BTreeMap::new(); batches.insert(0u32, (16u32, 2_000_000u32));
         let number = i as u32 + 1;
         s.numbers.insert(number, (id.clone(), 0));
-        s.accounts.insert(id, Arc::new(Account { number, balance: 5, nonce: None, book_size: 256, salt: [1; 16], pow_paid: true, funded: true, batches, commits, open: BTreeMap::new(), leaf: OnceLock::new() }));
+        s.accounts.insert(id, Arc::new(Account { number, balance: 5, nonce: None, book_size: 256, salt: [1; 16], funded: true, batches, commits, open: BTreeMap::new(), leaf: OnceLock::new() }));
     }
     s.next_number = accounts as u32 + 1;
     s

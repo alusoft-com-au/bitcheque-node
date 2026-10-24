@@ -34,7 +34,7 @@ pub fn wallet(args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Params)
     run(cmd, args, opt, p, &book.0)
 }
 
-/// A completed cheque as an account's /sends (or /history) lists it: (height, cheque, to, amount, fee).
+/// A completed cheque as an account's /sends lists it: (height, cheque, to, amount, fee).
 type Send = (u32, u16, u32, u64, u64);
 
 /// What one node says about the book: the whole /id text, and the fields every decision rests on, which every node
@@ -133,8 +133,8 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
         if left < EXPIRY_MARGIN { return Err(format!("cheque {n}'s opening expires in {left} blocks: too close to send its amount (it could land after the opening is gone). Run `wallet void` to close it, then send again")); }
         Ok(low + 1 >= exp.saturating_sub(p.piece_lifetime) + confirmations)
     };
-    // the account's completed cheques by one node's /sends (newest first, every one); a node older than /sends: its
-    // /history, which lists only the last block::HISTORY_CAP events (rewards push sends out). No final number: none
+    // every completed cheque of the account by one node's /sends (each a "HEIGHT send cheque=N to=P amount=A fee=F" line,
+    // or "none"). No final number: none
     let sends_at = |r: &str, v: &View| -> Result<Vec<Send>, String> {
         let n = v.field("number");
         if n.is_empty() { return Ok(vec![]); }
@@ -225,7 +225,7 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
         let rec = record()?;
         let (open, rest) = book.halves(cheque, &digits);
         if rest_only {
-            if rec.read()? != Some((cheque, Some(digits))) { return Err(format!("this machine has no record of cheque {cheque} with these digits: print its opening first (without --rest)")); }
+            if rec.read()? != Some((cheque, digits)) { return Err(format!("this machine has no record of cheque {cheque} with these digits: print its opening first (without --rest)")); }
             let v = agreed(false)?.unwrap();
             if v.revealed(cheque).iter().zip(digits).any(|(r, d)| r.is_some_and(|r| r != d)) { return Err(tampered(cheque)); }
             if !v.open.contains(&cheque) || v.revealed(cheque)[..=PART_A].iter().zip(&digits).any(|(r, d)| *r != Some(*d)) { return Err(format!("cheque {cheque} is not open with these digits on chain: send its opening first, and wait for it")); }
@@ -233,7 +233,7 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
             for t in rest { println!("{}", hex(&t.encode())); }
             return Ok(());
         }
-        if let Some((n, d)) = rec.read()? { if cheque < n || (cheque == n && d != Some(digits)) {
+        if let Some((n, d)) = rec.read()? { if cheque < n || (cheque == n && d != digits) {
             return Err(format!("this machine signed cheques up to {n} already: cheque {cheque} is never signed with other digits"));
         } }
         rec.write(cheque, &digits)?;
@@ -323,10 +323,10 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
             let v = agreed(false)?.unwrap();
             // the cheque this machine signed last, if it is not over yet (cheque 0 as the honesty check moves nothing and
             // has nothing below it to void)
-            let honesty = |n: u16, d: Option<[u8; COLS]>| n == 0 && d.map_or(true, |d| d == [0; COLS]);
+            let honesty = |n: u16, d: [u8; COLS]| n == 0 && d == [0; COLS];
             let live = used.filter(|&(n, d)| !honesty(n, d) && !v.done(n));
             // the same payment as the cheque recorded here (same recipient, amount and fee)
-            let same = used.filter(|&(n, d)| !honesty(n, d) && d == Some(digits)).map(|u| u.0);
+            let same = used.filter(|&(n, d)| !honesty(n, d) && d == digits).map(|u| u.0);
             if let Some(n) = same.filter(|&n| v.done(n) && cmd != "void") {
                 // over: what the account's history says became of it
                 match fate(&v, n, &msg)? {
@@ -561,7 +561,7 @@ fn coins(s: &str) -> Result<u64, String> {
 }
 
 /// The used-cheque record of one book: `used-<id>` holds the highest cheque number this machine signed and its 18
-/// digits ("N DIGITS"; an older "N" alone is read too), replaced atomically (temporary file, fsync, rename, fsync of the
+/// digits ("N DIGITS"), replaced atomically (temporary file, fsync, rename, fsync of the
 /// directory) and never lowered. `used-<id>.lock` is held exclusively from reading the record until the cheque is in a
 /// block, so two runs never pick the same number. The directory must be this user's alone; the lock and temporary
 /// files are never opened through a symbolic link.
@@ -587,7 +587,7 @@ impl Record {
         } }
         Ok(Record { dir: dir.to_path_buf(), path: dir.join(format!("used-{id}")), size, _lock: lock })
     }
-    fn read(&self) -> Result<Option<(u16, Option<[u8; COLS]>)>, String> {
+    fn read(&self) -> Result<Option<(u16, [u8; COLS])>, String> {
         let bad = || format!("{}: not a cheque number below {}: fix it by hand (the highest cheque this machine signed) before going on", self.path.display(), self.size);
         match std::fs::read_to_string(&self.path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -595,10 +595,9 @@ impl Record {
             Ok(t) => {
                 let mut w = t.split_whitespace();
                 let n = w.next().and_then(|n| n.parse::<u16>().ok()).filter(|&n| (n as u32) < self.size).ok_or_else(bad)?;
-                let d = match w.next() {
-                    None => None,
-                    Some(d) if d.bytes().all(|c| c.is_ascii_digit()) => Some(d.bytes().map(|c| c - b'0').collect::<Vec<_>>().try_into().map_err(|_| bad())?),
-                    Some(_) => return Err(bad()),
+                let d: [u8; COLS] = match w.next() {
+                    Some(d) if d.bytes().all(|c| c.is_ascii_digit()) => d.bytes().map(|c| c - b'0').collect::<Vec<_>>().try_into().map_err(|_| bad())?,
+                    _ => return Err(bad()),
                 };
                 if w.next().is_some() { return Err(bad()); }
                 Ok(Some((n, d)))
@@ -609,7 +608,7 @@ impl Record {
         use std::io::Write;
         match self.read()? {
             Some((o, _)) if o > n => return Ok(()),
-            Some((o, Some(d))) if o == n && d != *digits => return Err(format!("cheque {n} was signed here with other digits: it is never signed twice")),
+            Some((o, d)) if o == n && d != *digits => return Err(format!("cheque {n} was signed here with other digits: it is never signed twice")),
             _ => {}
         }
         let tmp = self.path.with_extension("tmp");

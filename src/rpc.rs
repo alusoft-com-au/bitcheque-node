@@ -456,7 +456,7 @@ fn tx_line(t: &Tx) -> String {
     match t {
         Tx::Coinbase { payee, .. } => format!("reward to={payee}
 "),
-        Tx::RegisterBook { m, n256, book_size, root, batch, .. } => format!("register m={m} book_size={book_size} root={} cheques={} reg=pow account={}\n", hex(root), batch.cheques.len(), hex(&crate::tx::account_id(*m, *n256, root))),
+        Tx::RegisterBook { m, n256, book_size, root, batch, .. } => format!("register m={m} book_size={book_size} root={} cheques={} account={}\n", hex(root), batch.cheques.len(), hex(&crate::tx::account_id(*m, *n256, root))),
         Tx::RegisterBatch { account, batch, .. } => format!("batch account={} start={} count={}\n", hex(account), batch.start, batch.count),
         Tx::ChequePiece { account, cheque, column, shares } => format!("piece account={} cheque={cheque} column={column} txid={} share={}\n", hex(account), hex(&t.txid()), shares.iter().map(|s| hex(s)).collect::<Vec<_>>().join(",")),
         Tx::Renew { account, start } => format!("renew account={} start={start}\n", hex(account)),

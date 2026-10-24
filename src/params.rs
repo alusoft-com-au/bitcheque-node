@@ -29,7 +29,6 @@ pub struct Params {
     pub reg_anchor_window: u32, // a registration's proof of work names one of the last this many block hashes
     pub reg_pow_per_block_cap: u32,
     pub fee_unit: u64,
-    pub reg_fee: u64,
     pub renew_fee: u64,
     pub min_fund: u64,         // a balance this large makes an account permanent (funded)
     pub renew_window: u32,     // a batch may be renewed only this close to its expiry (so a renewal, which anyone may send, costs its owner one fee per lifetime at most)
@@ -71,7 +70,6 @@ impl Params {
             reg_anchor_window: 144,        // a mined registration must be mined into a block within about 2.4 hours
             reg_pow_per_block_cap: 16,     // about what fits in a block (a registration of 16 cheques is ~58 KB)
             fee_unit: 1000,
-            reg_fee: 100 * 1000,
             renew_fee: 10 * 1000,
             min_fund: COIN,                // permanence costs a coin held, not one base unit
             renew_window: 43_200,          // the last 30 days of a batch's life

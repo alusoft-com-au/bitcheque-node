@@ -65,15 +65,14 @@ fn sends_outlive_history_and_survive_snapshot_restart_and_reorg() {
 fn two(f: &Fake) -> [String; 2] { [f.addr.clone(), f.addr.replace("127.0.0.1", "[::ffff:127.0.0.1]")] }
 fn wallet2(h: &std::path::Path, f: &Fake, args: &[&str]) -> (bool, String) { let r = two(f); wallet_rpcs(h, &[&r[0], &r[1]], args) }
 
-/// The finding: an account that mines pushes its sends out of /history (its last 50 events), so a second state dir saw
-/// no earlier payment and paid it again. /sends lists every one: refused.
+/// The finding: an account that mines pushed its sends out of /history (its last 50 events), so a second state dir saw
+/// no earlier payment and paid it again. The wallet reads /sends, which lists every one: refused.
 #[test]
 fn a_payment_mined_out_of_history_is_still_refused() {
     let (h1, h2) = (home("sends-dirA"), home("sends-dirB"));
     let f = fake(reply("none", &first16()));
     let to = num(7);
     assert!(wallet(&h1, &f, &["send", "--to", &to, "--amount", "1.5", "--fresh"]).1.contains("cheque 1 sent"));
-    f.set(|s| s.pushed_out = 1);
     let (ok, out) = wallet2(&h2, &f, &["send", "--to", &to, "--amount", "1.5"]);
     assert!(!ok && out.contains("payment already made (cheque 1)") && out.contains("--again"), "{out}");
     assert_eq!(cheques(&f), vec![1]);

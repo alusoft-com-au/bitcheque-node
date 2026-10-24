@@ -40,10 +40,8 @@ pub struct St { pub nonce: String, pub open: String, pub pool: Vec<(u16, u8)>, p
                 pub drop_piece_replies: usize,
                 /// GET /id requests served
                 pub ids: usize,
-                /// cheques finished, (height, cheque): GET /sends/5 and /history/5 list them as sends, newest first, unless `history` says otherwise
-                pub completed: Vec<(u32, u16)>, pub history: Option<String>,
-                /// /history/5 leaves out cheques up to this one (mined rewards pushed them out of its last 50)
-                pub pushed_out: u16 }
+                /// cheques finished, (height, cheque): GET /sends/5 lists them as sends, newest first, unless `history` says otherwise
+                pub completed: Vec<(u32, u16)>, pub history: Option<String> }
 impl St {
     fn expires(&self) -> String {
         if self.open == "none" { return "none".into(); }
@@ -111,7 +109,7 @@ pub fn fake(r: Reply) -> Fake {
     let addr = l.local_addr().unwrap().to_string();
     let posts = Arc::new(Mutex::new(Vec::new()));
     let st = Arc::new(Mutex::new(St { nonce: r.nonce.into(), open: r.open.into(), pool: vec![], chain: BTreeMap::new(), digits: BTreeMap::new(), mining: true, lose: 0, drop_replies: 0, refuse: None, mine_below: 18,
-                                      height: 100, extra: 5, lifetime: 10_000, opened: BTreeMap::new(), registered: true, drop_piece_replies: 0, ids: 0, completed: vec![], history: None, pushed_out: 0 }));
+                                      height: 100, extra: 5, lifetime: 10_000, opened: BTreeMap::new(), registered: true, drop_piece_replies: 0, ids: 0, completed: vec![], history: None }));
     let relay: Arc<Mutex<Vec<Arc<Mutex<St>>>>> = Arc::new(Mutex::new(Vec::new()));
     let (p, s0, rl) = (posts.clone(), st.clone(), relay.clone());
     std::thread::spawn(move || for s in l.incoming() {
@@ -168,10 +166,6 @@ pub fn fake(r: Reply) -> Fake {
                 let mut q: Vec<String> = r.queued.split(',').filter(|x| !x.is_empty()).map(String::from).collect();
                 for (c, _) in &g.pool { if !q.contains(&c.to_string()) { q.push(c.to_string()); } }
                 q.join(",")
-            }
-            else if path == "/history/5" {
-                let g = st.lock().unwrap();
-                g.history().lines().filter(|l| l.split("cheque=").nth(1).and_then(|x| x.split(' ').next()?.parse::<u16>().ok()).map_or(true, |c| c > g.pushed_out)).collect::<Vec<_>>().join("\n")
             }
             else if path == "/sends/5" {
                 let g = st.lock().unwrap();

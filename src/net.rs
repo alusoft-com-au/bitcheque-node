@@ -82,8 +82,8 @@ const REJECTS: u32 = 200;              // refused transactions a peer may send p
 const NEVER_VALID: &[&str] = &["no commitment matches", "piece malformed", "coinbase out of place", "batch not aligned", "batch cheque count", "cheque hashes malformed", "batch does not match root"];
 const TPL_PAYEES: usize = 16;          // templates kept per tip and mempool, one per payee
 
-/// Seed nodes a fresh node dials when it knows nobody else (DESIGN.md §7). Placeholders: the
-/// project has no domain yet, so these names do not resolve and a node just moves on.
+/// Seed nodes a fresh node dials when it knows nobody else (DESIGN.md §7). The research network's are the edge nodes;
+/// mainnet has none yet, so its names are placeholders that do not resolve, and a node just moves on.
 pub fn seeds(magic: &[u8; 4]) -> &'static [&'static str] {
     match magic[3] {
         0x00 => &["seed1.bitcheque.example:8730", "seed2.bitcheque.example:8730"],

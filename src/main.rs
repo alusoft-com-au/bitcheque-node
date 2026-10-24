@@ -1,4 +1,4 @@
-//! bitcheque genesis [--mainnet|--local]   (default: the public research network; --testnet is the same)
+//! bitcheque genesis [--mainnet|--local]   (default: the public research network)
 //! bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR]... [--upstream HOST:PORT]... [--no-upstream]
 //! bitcheque mine --rpc ADDR --to NUMBER [--threads N] [--light]   (mines against any node's RPC, e.g. node-ap.bitcheque.org:80; 0 burns
 //!       the reward; builds the proof of work's 2 GiB table on every core, --light does without it at a thousandth of the rate)

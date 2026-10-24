@@ -23,7 +23,7 @@ pub const HOST_KEEP: usize = 2000;
 const SIDE_CAP: usize = 2000;       // side blocks kept in memory
 const SIDE_BYTES: usize = 32 << 20; // ...and their bytes (a host-backed store keeps less: HOST_SIDE_BYTES)
 const HOST_SIDE_BYTES: usize = 8 << 20;
-const SNAP_MAGIC: &[u8; 4] = b"BCS2";   // BCS1 had no /sends index: such a snapshot is ignored and the chain replayed once
+const SNAP_MAGIC: &[u8; 4] = b"BCS2";   // the snapshot format: anything else is ignored and the chain replayed
 const BAD_CAP: usize = 4096;        // hashes of blocks that failed validation, remembered so a resend is refused at once
 
 struct Snap { height: u32, tip: [u8; 32], state: State, index: Vec<u8>, disk: bool }   // disk: written out (or handed to the host), not just kept in memory

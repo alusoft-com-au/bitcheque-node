@@ -261,7 +261,7 @@ export class EdgeNode extends DurableObject {
   async call(up, path, init, extra = {}) {
     if (!secret(this.env)) throw new Error('no EDGE_SECRET');
     if ((this.down[up] || 0) > Date.now()) throw new Error('left alone for now');
-    const via = up.startsWith('do:') ? null : this.env[JSON.parse(this.env.SERVICES || '{}')[new URL(up).host]] || this.env.UPSTREAM_SVC
+    const via = up.startsWith('do:') ? null : this.env[JSON.parse(this.env.SERVICES || '{}')[new URL(up).host]]
       || (/^http:\/\/(?:localhost|127\.0\.0\.1)[:/]/.test(up + '/') ? globalThis : null);   // wrangler dev with a local devnet node
     if (!up.startsWith('do:') && !via) throw new Error(`${up}: no service binding`);
     const peer = { ...init, headers: { ...extra, 'X-Edge-Peer': this.env.EDGE_SECRET, 'X-Edge-Chain': CHAIN_VERSION, 'X-Edge-From': this.meta('region') || '' } };

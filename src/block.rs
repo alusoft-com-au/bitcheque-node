@@ -183,8 +183,6 @@ impl Blocks {
         }
     }
     pub fn truncate(&mut self, k: usize) { match self { Blocks::Mem(v) => v.truncate(k), Blocks::File { at, .. } => at.truncate(k), Blocks::Host { n, .. } | Blocks::Count(n) => *n = (*n).min(k) } }
-    /// The same kind of store holding only block 0.
-    pub fn empty_like(&self) -> Blocks { self.prefix(1) }
     /// The first `k` blocks (genesis included), sharing the same storage: nothing is read or written.
     pub fn prefix(&self, k: usize) -> Blocks {
         match self {
@@ -196,7 +194,7 @@ impl Blocks {
     }
 }
 
-/// Recent events per account, newest last, at most HISTORY_CAP each. Rebuilt with the chain (startup, reorg), never persisted.
+/// Recent events per account, newest last, at most HISTORY_CAP each. Rebuilt with the chain on a reorg; snapshots carry it.
 pub const HISTORY_CAP: usize = 50;
 #[derive(Clone, Debug)]
 pub struct Entry { pub height: u32, pub event: Event }

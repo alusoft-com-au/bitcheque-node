@@ -35,7 +35,6 @@ pub struct Account {
     pub nonce: Option<u16>,
     pub book_size: u32,
     pub salt: [u8; 16],
-    pub pow_paid: bool,
     pub funded: bool,
     pub batches: BTreeMap<u32, (u32, u32)>,      // start -> (count, expiry height)
     pub commits: BTreeMap<u16, Commits>,          // unspent registered cheques
@@ -159,7 +158,7 @@ impl State {
         w.u32(self.accounts.len() as u32);
         for (id, a) in &self.accounts {
             w.bytes(id); w.u32(a.number); w.u64(a.balance); w.u8(a.nonce.is_some() as u8); w.u16(a.nonce.unwrap_or(0)); w.u32(a.book_size);
-            w.0.extend_from_slice(&a.salt); w.u8(a.pow_paid as u8); w.u8(a.funded as u8);
+            w.0.extend_from_slice(&a.salt); w.u8(a.funded as u8);
             w.u32(a.batches.len() as u32); for (s, (c, e)) in &a.batches { w.u32(*s); w.u32(*c); w.u32(*e); }
             w.u32(a.commits.len() as u32);
             for (nn, c) in &a.commits { w.u16(*nn); w.0.extend_from_slice(&c.cells); }
@@ -181,14 +180,14 @@ impl State {
         let (mut accounts, mut wake) = (BTreeMap::new(), BTreeMap::<u32, Vec<AccountId>>::new());
         for _ in 0..r.u32()? {
             let id = r.bytes()?; let number = r.u32()?; let balance = r.u64()?; let has_nonce = r.u8()? == 1; let nonce = r.u16()?; let book_size = r.u32()?;
-            let salt: [u8; 16] = r.take(16)?.try_into().unwrap(); let pow_paid = r.u8()? == 1; let funded = r.u8()? == 1;
+            let salt: [u8; 16] = r.take(16)?.try_into().unwrap(); let funded = r.u8()? == 1;
             let mut batches = BTreeMap::new(); for _ in 0..r.u32()? { let s = r.u32()?; batches.insert(s, (r.u32()?, r.u32()?)); }
             let mut commits = BTreeMap::new();
             for _ in 0..r.u32()? { let nn = r.u16()?; commits.insert(nn, Commits::new(r.take(COLS * ROWS * id_n(&id))?.to_vec())); }
             let mut open = BTreeMap::new();
             for _ in 0..r.u32()? { let n = r.u16()?; let expiry = r.u32()?; let mut digits = [None; COLS]; for d in digits.iter_mut() { let x = r.u8()?; *d = if x == 255 { None } else { Some(x) }; } open.insert(n, OpenCheque { digits, expiry }); }
             for e in open.values().map(|o| o.expiry).chain(batches.values().map(|&(_, e)| e)) { wake.entry(e).or_default().push(id.clone()); }
-            accounts.insert(id, Arc::new(Account { number, balance, nonce: if has_nonce { Some(nonce) } else { None }, book_size, salt, pow_paid, funded, batches, commits, open, leaf: OnceLock::new() }));
+            accounts.insert(id, Arc::new(Account { number, balance, nonce: if has_nonce { Some(nonce) } else { None }, book_size, salt, funded, batches, commits, open, leaf: OnceLock::new() }));
         }
         let mut numbers = BTreeMap::new(); for _ in 0..r.u32()? { let n = r.u32()?; let id = r.bytes()?; numbers.insert(n, (id, r.u32()?)); }
         let mut free = VecDeque::new(); for _ in 0..r.u32()? { free.push_back((r.u32()?, r.u32()?)); }
@@ -262,7 +261,7 @@ impl State {
                 self.log.push(Event::Register { id: id.clone(), number });
                 // registered before and expired: the cheques it used stay used
                 let nonce = self.gone.remove(&id);
-                let mut a = Account { number, balance: 0, nonce, book_size: *book_size, salt: *salt, pow_paid: true, funded: false,
+                let mut a = Account { number, balance: 0, nonce, book_size: *book_size, salt: *salt, funded: false,
                                       batches: BTreeMap::new(), commits: BTreeMap::new(), open: BTreeMap::new(), leaf: OnceLock::new() };
                 a.batches.insert(batch.start, (batch.count, height + p.batch_lifetime));
                 for (nn, c) in cheques { if nonce.map_or(true, |x| nn > x) { a.commits.insert(nn, Commits::new(c)); } }
@@ -422,7 +421,7 @@ impl State {
         let mut v = Vec::new();
         let u = |v: &mut Vec<u8>, x: u64| v.extend_from_slice(&x.to_le_bytes());
         u(&mut v, id.len() as u64); v.extend_from_slice(id); v.extend_from_slice(&a.salt); u(&mut v, a.number as u64); u(&mut v, since as u64); u(&mut v, a.balance);
-        u(&mut v, a.nonce.map_or(u64::MAX, |x| x as u64)); v.push(a.funded as u8); v.push(a.pow_paid as u8); u(&mut v, a.book_size as u64);
+        u(&mut v, a.nonce.map_or(u64::MAX, |x| x as u64)); v.push(a.funded as u8); u(&mut v, a.book_size as u64);
         u(&mut v, a.batches.len() as u64);
         for (s, (c, e)) in &a.batches { u(&mut v, *s as u64); u(&mut v, *c as u64); u(&mut v, *e as u64); }
         u(&mut v, a.open.len() as u64);

@@ -338,8 +338,7 @@ is how miners, pools and exchanges use the chain:
   amount and fee as the recorded cheque, now over and paid; or in the
   account's `/sends` within about a day (every completed cheque: `/history`
   keeps only the last 50 events, and an account that mines pushes its sends
-  out of it; an older node without `/sends` is read by its `/history`, and
-  the wallet warns that the check is limited), or open on chain with these digits,
+  out of it), or open on chain with these digits,
   or waiting to be mined to the same recipient, sent from another machine)
   is refused as "payment already made" unless `--again`. A fee tier 0 is refused but for a void.
   The RPC is plain HTTP, so anyone on the path can withhold or forge replies
@@ -405,7 +404,7 @@ minute), and one answered 429 or 5xx, or not answered, is sent again, waiting
 twice as long each time up to a minute, so nothing is dropped for being sent
 too fast. Our own transactions (from our RPC) not yet mined are offered to
 peers and upstreams again every 10 minutes. With no
-`--upstream` it follows the four seeds; `--no-upstream` turns this off. A
+`--upstream` it follows the five seeds; `--no-upstream` turns this off. A
 node following them and talking TCP to others bridges the two. The edge
 nodes do not pull from it, so its own blocks reach them only by that push.
 The RPC is plain HTTP (no TLS dependency): blocks and transactions check
@@ -426,7 +425,7 @@ trailing slash), so each has one cache key.
 
 Peer discovery over TCP follows Bitcoin's model (implemented in `net.rs`): seed node names
 compiled into the binary (none on the research network, whose seeds are the
-edge nodes above; placeholders on mainnet until the project has a domain), a
+edge nodes above; placeholders on mainnet, which has no seeds yet), a
 `getaddr`/`addr` exchange in which every node shares the addresses it knows
 (50 per reply, once per connection, 1,000 remembered, at most 100 taken per
 sending /16 or /32 per 10 minutes), an address book saved next to the data file,
@@ -1167,10 +1166,7 @@ release must be public at least one week before it.
    its own hardware for continuity, not for allocation, and publishes its
    account numbers.
 6. Hard-code checkpoints of every 10,000th block in later releases while
-   hashrate is small; optionally anchor the chain tip into Bitcoin hourly
-   (a non-consensus service, §8 item 1).
-7. Offer the AuxPoW specification to mining pools. Merge-mining is the
-   target state, not a launch requirement.
+   hashrate is small.
 
 ### 12.4 What is still open for genesis
 
@@ -1197,8 +1193,8 @@ impossible:
   thousands of blocks.
 - **Public release one week ahead and the timestamp rule** (§12.2) remove
   the insider head start. Anyone with a graphics card starts at the same second.
-- **Checkpoints and Bitcoin anchoring** (§12.3) bound reorg depth, so a
-  dominant miner can delay cheques but not rewrite history.
+- **Checkpoints** (§12.3) bound reorg depth, so a dominant miner can delay
+  cheques but not rewrite history.
 - **No merge-mining.** With SHA-256d, one mid-size Bitcoin pool joining at
   zero marginal cost would have ended any individual's dominance; it would
   also have been the party able to rewrite the chain for nothing. The table
@@ -1238,7 +1234,7 @@ none forking more than 2,000 blocks back); side-branch work summed from
 headers; reorg by replay from the latest snapshot at or below the fork),
 `net` (§7 discovery, connection caps,
 misbehaviour strikes, mempool, mining; no transport encryption yet), `rpc`
-(plain-text HTTP, 120 requests per minute per address (an IPv6 /64), 8
+(plain-text HTTP, 120 requests per minute per address (an IPv6 /48), 8
 connections at once per address (an IPv6 /56) and 256 in all; behind a
 reverse proxy on the same machine the client is the last
 `X-Forwarded-For` entry, which assumes exactly one proxy hop; a request
