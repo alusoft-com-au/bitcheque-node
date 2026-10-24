@@ -66,11 +66,10 @@ fn two(f: &Fake) -> [String; 2] { [f.addr.clone(), f.addr.replace("127.0.0.1", "
 fn wallet2(h: &std::path::Path, f: &Fake, args: &[&str]) -> (bool, String) { let r = two(f); wallet_rpcs(h, &[&r[0], &r[1]], args) }
 
 /// The finding: an account that mines pushes its sends out of /history (its last 50 events), so a second state dir saw
-/// no earlier payment and paid it again. /sends lists every one: refused. An older node without /sends: its /history
-/// only, and the wallet says the check is limited.
+/// no earlier payment and paid it again. /sends lists every one: refused.
 #[test]
 fn a_payment_mined_out_of_history_is_still_refused() {
-    let (h1, h2, h3) = (home("sends-dirA"), home("sends-dirB"), home("sends-dirC"));
+    let (h1, h2) = (home("sends-dirA"), home("sends-dirB"));
     let f = fake(reply("none", &first16()));
     let to = num(7);
     assert!(wallet(&h1, &f, &["send", "--to", &to, "--amount", "1.5", "--fresh"]).1.contains("cheque 1 sent"));
@@ -78,8 +77,4 @@ fn a_payment_mined_out_of_history_is_still_refused() {
     let (ok, out) = wallet2(&h2, &f, &["send", "--to", &to, "--amount", "1.5"]);
     assert!(!ok && out.contains("payment already made (cheque 1)") && out.contains("--again"), "{out}");
     assert_eq!(cheques(&f), vec![1]);
-    f.set(|s| s.old = true);
-    let (ok, out) = wallet2(&h3, &f, &["send", "--to", &to, "--amount", "1.5"]);
-    assert!(out.matches("has no /sends").count() == 1 && out.contains("recent history only"), "{out}");
-    assert!(ok && out.contains("cheque 2 sent"), "the limit of an older node: {out}");
 }

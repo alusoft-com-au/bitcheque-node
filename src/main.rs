@@ -1,6 +1,7 @@
 //! bitcheque genesis [--mainnet|--local]   (default: the public research network; --testnet is the same)
 //! bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR]... [--upstream HOST:PORT]... [--no-upstream]
-//! bitcheque mine --rpc ADDR --to NUMBER [--threads N]   (mines against any node's RPC, e.g. node-ap.bitcheque.org:80; 0 burns the reward)
+//! bitcheque mine --rpc ADDR --to NUMBER [--threads N] [--light]   (mines against any node's RPC, e.g. node-ap.bitcheque.org:80; 0 burns
+//!       the reward; builds the proof of work's 2 GiB table on every core, --light does without it at a thousandth of the rate)
 //!   With no --peer a node dials the compiled-in seeds, then keeps about 8 connections from the addresses peers share.
 //!   On the research network it also follows the edge nodes (node-ap/us/eu/oc/sa.bitcheque.org:80, the seeds) over their
 //!   HTTP RPC: pulls their blocks every minute and passes on what it accepts. --upstream picks others, --no-upstream none.
@@ -67,28 +68,32 @@ fn main() {
             if ups.is_empty() && !args.iter().any(|a| a == "--no-upstream") { ups = bitcheque::net::http_seeds(&p_magic).iter().map(|s| s.to_string()).collect(); }
             if !ups.is_empty() { eprintln!("following {}", ups.join(", ")); }
             node.follow(ups, std::time::Duration::from_secs(60));
-            if opt("--mine").is_some() { eprintln!("--mine is gone: the node no longer mines. Run `bitcheque mine --rpc ADDR --to NUMBER` against its RPC."); }
             loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
         }
-        Some("mine") => if let Err(e) = mine(&opt) { eprintln!("error: {e}"); std::process::exit(1) },
+        Some("mine") => if let Err(e) = mine(&opt, args.iter().any(|a| a == "--light")) { eprintln!("error: {e}"); std::process::exit(1) },
         Some("wallet") => if let Err(e) = cli_wallet::wallet(&args, &opt, &p) { eprintln!("error: {e}"); std::process::exit(1) },
-        _ => eprintln!("usage: bitcheque genesis [--mainnet|--local] | bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR] [--upstream HOST:PORT] [--no-upstream]\n       bitcheque mine --rpc ADDR --to NUMBER [--threads N]\n       bitcheque wallet new | info|register|more --seed-file FILE --rpc ADDR[,ADDR...] [--state-dir DIR] [--cheques N]\n       bitcheque wallet send --to NNNNNNNNNNN-C --amount COINS | sweep --to NNNNNNNNNNN-C | void  --seed-file FILE --rpc ADDR[,ADDR...] [--state-dir DIR] [--fee TIER] [--force-skip] [--last] [--burn] [--fresh] [--again] [--confirmations K] [--wait SECONDS]"),
+        _ => eprintln!("usage: bitcheque genesis [--mainnet|--local] | bitcheque node [--mainnet|--local] [--data FILE] [--listen ADDR] [--advertise ADDR] [--rpc ADDR] [--peer ADDR] [--upstream HOST:PORT] [--no-upstream]\n       bitcheque mine --rpc ADDR --to NUMBER [--threads N] [--light]\n       bitcheque wallet new | info|register|more --seed-file FILE --rpc ADDR[,ADDR...] [--state-dir DIR] [--cheques N]\n       bitcheque wallet send --to NNNNNNNNNNN-C --amount COINS | sweep --to NNNNNNNNNNN-C | void  --seed-file FILE --rpc ADDR[,ADDR...] [--state-dir DIR] [--fee TIER] [--force-skip] [--last] [--burn] [--fresh] [--again] [--confirmations K] [--wait SECONDS]"),
     }
 }
 
 /// A miner that keeps no chain: fetch a template from a node's RPC, search nonces on every core, send
 /// a found block back. A new template is fetched when the tip moves (checked every few seconds) and
-/// every TEMPLATE_SECONDS anyway, so new transactions and a fresh time get in.
-fn mine(opt: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
+/// every TEMPLATE_SECONDS anyway, so new transactions and a fresh time get in. The proof of work (pow.rs) reads a
+/// 2 GiB table, built here on every core whenever the template's epoch is new (a minute or two); `--light` mines
+/// without one, the way a node verifies, at about a thousandth of the rate.
+fn mine(opt: &dyn Fn(&str) -> Option<String>, light: bool) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use bitcheque::pow::{epoch, Table};
     const TEMPLATE_SECONDS: u64 = 20;
     let rpc = opt("--rpc").ok_or("--rpc ADDR needed (host:port of a node's RPC)")?;
     let to: u32 = opt("--to").ok_or("--to NUMBER needed (the account that gets the reward; 0 burns it)")?.parse().map_err(|_| "bad --to")?;
     let threads = opt("--threads").and_then(|t| t.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())).max(1);
     // the easiest target of any network this miner may be pointed at (a template at a mainnet target is far below it)
     let min = Params::testnet().easiest_target().max(Params::local().easiest_target());
-    eprintln!("mining for account {to} on {threads} threads against {rpc}");
+    let rate = |r: f64| if r >= 1e6 { format!("{:.2} MH/s", r / 1e6) } else { format!("{:.1} kH/s", r / 1e3) };
+    eprintln!("mining for account {to} on {threads} threads against {rpc}{}", if light { ", without the table" } else { "" });
+    let mut table: Option<Arc<Table>> = None;
     loop {
         let tpl = match http(&rpc, "GET", &format!("/template/{to}"), "") {
             Ok(t) => unhex(&t).and_then(|r| bitcheque::block::Block::decode(&r).ok()).ok_or("bad template")?,
@@ -98,19 +103,29 @@ fn mine(opt: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         // otherwise have our work pay someone else
         if !matches!(tpl.txs.first(), Some(bitcheque::tx::Tx::Coinbase { payee, .. }) if *payee == to) { return Err("the node's template pays someone else: use another node".into()); }
         if U256::from_compact(tpl.header.bits) > min { return Err("the node's template asks for less work than any block may have: use another node".into()); }
+        if !light && table.as_ref().map_or(true, |t| t.epoch != epoch(tpl.header.height)) {
+            let e = epoch(tpl.header.height);
+            eprintln!("building the 2 GiB table of epoch {e} (blocks {}-{}) on {threads} threads...", e * bitcheque::pow::EPOCH, (e + 1) * bitcheque::pow::EPOCH - 1);
+            let started = std::time::Instant::now();
+            table = Some(Arc::new(Table::build(e, threads)));
+            eprintln!("table built in {:.0} s", started.elapsed().as_secs_f64());
+            continue;   // a fresh template: this one has aged
+        }
         let (stop, hashes, found) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)), Arc::new(Mutex::new(None)));
+        let step: u32 = if light { 16 } else { 4096 };   // tries between counting (about a few milliseconds)
         let workers: Vec<_> = (0..threads).map(|i| {
-            let (mut b, stop, hashes, found) = (tpl.clone(), stop.clone(), hashes.clone(), found.clone());
+            let (mut b, stop, hashes, found, table) = (tpl.clone(), stop.clone(), hashes.clone(), found.clone(), table.clone());
             std::thread::spawn(move || {
                 b.header.nonce = i as u32;
                 while !stop.load(Ordering::Relaxed) {
-                    for _ in 0..100_000 {
-                        if b.header.meets_target() { *found.lock().unwrap() = Some(b.clone()); stop.store(true, Ordering::Relaxed); return; }
+                    for _ in 0..step {
+                        let pow = match &table { Some(t) => t.hash(&b.header.hash()), None => b.header.pow() };
+                        if b.header.meets(&pow) { *found.lock().unwrap() = Some(b.clone()); stop.store(true, Ordering::Relaxed); return; }
                         let (n, wrapped) = b.header.nonce.overflowing_add(threads as u32);
                         if wrapped { return; }   // this thread's share of the nonces is done
                         b.header.nonce = n;
                     }
-                    hashes.fetch_add(100_000, Ordering::Relaxed);
+                    hashes.fetch_add(step as u64, Ordering::Relaxed);
                 }
             })
         }).collect();
@@ -121,11 +136,11 @@ fn mine(opt: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         }
         stop.store(true, Ordering::Relaxed);
         for w in workers { let _ = w.join(); }
-        let rate = hashes.load(Ordering::Relaxed) as f64 / started.elapsed().as_secs_f64().max(0.001);
+        let r = hashes.load(Ordering::Relaxed) as f64 / started.elapsed().as_secs_f64().max(0.001);
         let block = found.lock().unwrap().take();
         if let Some(b) = block {
             match http(&rpc, "POST", "/block", &hex(&b.encode())) {
-                Ok(_) => eprintln!("mined a block on {} with {} transactions ({:.1} MH/s)", hex(&tpl.header.prev[..4]), b.txs.len() - 1, rate / 1e6),
+                Ok(_) => eprintln!("mined block {} on {} with {} transactions ({})", b.header.height, hex(&tpl.header.prev[..4]), b.txs.len() - 1, rate(r)),
                 Err(e) => eprintln!("block refused: {}", clean(&e)),
             }
         }

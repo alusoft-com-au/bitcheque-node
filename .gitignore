@@ -8,3 +8,4 @@ __pycache__/
 /edge/target/
 /edge/bitcheque_edge.wasm
 .wrangler/
+/miner/bitcheque-miner

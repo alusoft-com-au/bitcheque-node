@@ -57,6 +57,8 @@ const DELIVERING: Duration = Duration::from_secs(10);  // ahead (it delivers if 
 const BAN: Duration = Duration::from_secs(1800);       // a misbehaving peer's address is refused for this long
 const MAP_CAP: usize = 10_000;                         // entries in each map of bans, bars, strikes and shunned addresses
 const ORPHANS: usize = 64;                             // blocks with an unknown parent remembered per peer between our asks
+const SIDES_PER_MINUTE: u32 = 30;                      // side blocks (on a parent other than our tip) taken unasked from one peer a
+                                                       // minute: each costs a verification, and an honest peer offers few (a reorg's)
 const REASKS: usize = 12;                              // steps back (to find a fork) per peer until it gives us a new block
 const REBROADCAST: Duration = Duration::from_secs(600); // our own waiting transactions are offered again this often...
 const REBROADCAST_MAX: usize = 500;                    // ...the oldest this many of them
@@ -301,6 +303,7 @@ struct Peer {
     next_want: Mutex<u32>,             // the height of the next block of our last batch request (only those count toward got)
     orphans: Mutex<Vec<[u8; 32]>>,     // blocks with an unknown parent it sent since we last asked it: a resend is dropped undecoded
     reasks: AtomicUsize,               // times we stepped back to find a fork with it since it last gave us a new block
+    sides: Mutex<(u32, Instant)>,      // side blocks it sent unasked this minute, and when the minute began
 }
 
 /// An address book entry: its IP when it is a literal (names are looked up only when dialled), failed dials in a row, and
@@ -660,7 +663,7 @@ impl Node {
         let now = Instant::now();
         let peer = Arc::new(Peer { id, stream: Mutex::new(stream), out, queued, addr: Mutex::new(addr), outbound, ip, since: now, height: Mutex::new(0), barred: Mutex::new(barred),
                                    got: AtomicUsize::new(0), got_bytes: AtomicUsize::new(0), fresh: AtomicUsize::new(0), heard: Mutex::new(now), delivered: Mutex::new(None),
-                                   next_want: Mutex::new(0), orphans: Mutex::default(), reasks: AtomicUsize::new(0) });
+                                   next_want: Mutex::new(0), orphans: Mutex::default(), reasks: AtomicUsize::new(0), sides: Mutex::new((0, Instant::now())) });
         self.peers.lock().unwrap().push(peer.clone());
         let (node, p) = (self.clone(), peer.clone());
         let r = spawn(move || {
@@ -682,19 +685,27 @@ impl Node {
         if let Some(a) = self.advertise.lock().unwrap().as_ref() { v.extend_from_slice(a.as_bytes()); }
         v
     }
-    /// A BLOCK frame: its header's proof of work is checked, and a block we already have is recognised, before the
-    /// transactions are decoded (decoding takes several times the frame's size in memory). `height` is set to the block's
-    /// height when it is known (stored, or decoded: its coinbase says).
-    fn take_block(&self, payload: &[u8], from: u64, height: &mut Option<u32>) -> Result<bool, &'static str> {
+    /// A BLOCK frame: what lookups settle (a block we have, a chain our rules reject, a parent we do not know, a lie
+    /// about the height) is answered first, then the header's proof of work is checked (milliseconds), and only then
+    /// are the transactions decoded (decoding takes several times the frame's size in memory). `height` is what the
+    /// header says: a claim, like HELLO's, until the block is accepted. `sides` is the sender's budget of side blocks
+    /// (a parent other than our tip) offered unasked: past it they are dropped unverified, which is no strike.
+    fn take_block(&self, payload: &[u8], from: u64, height: &mut Option<u32>, sides: Option<&Mutex<(u32, Instant)>>) -> Result<bool, &'static str> {
         let Some(head) = payload.get(..112) else { return Err("decode") };
         let h = Header::decode(head.try_into().unwrap());
         let p = &self.params;
         if crate::u256::U256::from_compact(h.bits) > p.easiest_target() { return Err("bits"); }
-        if !h.meets_target() { return Err("pow"); }
         let hash = h.hash();
-        { let mut st = self.store.lock().unwrap(); if st.knows(&hash) { *height = st.height_of(&hash); return Err("known"); } if st.bad_header(&h) { return Err("invalid chain"); } }
+        *height = Some(h.height);
+        {
+            let mut st = self.store.lock().unwrap();
+            if st.knows(&hash) { return Err("known"); }
+            if st.bad_header(&h) { return Err("invalid chain"); }
+            match st.height_of(&h.prev) { None => return Err("prev unknown"), Some(ph) if h.height != ph + 1 => return Err("height"), _ => {} }
+            if h.prev != st.chain.tip() { if let Some(s) = sides { let mut g = s.lock().unwrap(); if g.1.elapsed() > Duration::from_secs(60) { *g = (0, Instant::now()); } if g.0 >= SIDES_PER_MINUTE { return Err("side blocks"); } g.0 += 1; } }
+        }
+        if !h.meets_target() { return Err("pow"); }
         let b = Block::decode(payload).map_err(|_| "decode")?;
-        if let Some(Tx::Coinbase { height: ch, .. }) = b.txs.first() { *height = Some(*ch); }
         let r = self.submit_block(&b, Some(from));
         // a failure our rules give every time (the store remembers the block as bad): the sender's chain is not ours
         if r.is_err() && self.store.lock().unwrap().bad_header(&h) { return Err("invalid chain"); }
@@ -810,12 +821,12 @@ impl Node {
                     let hash = payload.get(..112).map(|h| Header::decode(h.try_into().unwrap()).hash());
                     if hash.is_some_and(|h| peer.orphans.lock().unwrap().contains(&h)) { continue; }
                     let mut height = None;
-                    let res = self.take_block(&payload, peer.id, &mut height);
+                    let from_source = self.sync.lock().unwrap().is_some_and(|(id, _, _)| id == peer.id);
+                    let res = self.take_block(&payload, peer.id, &mut height, (!from_source).then_some(&peer.sides));
                     if res.is_ok() { *peer.delivered.lock().unwrap() = Some(Instant::now()); peer.reasks.store(0, Ordering::Relaxed); }
                     // what it sends tells us how far it has got (HELLO is said once, and a stalled source is reset to our
                     // height): a peer found ahead of us is asked by keep_syncing, so a node never stays behind for good
                     if let (Some(h), Ok(_) | Err("known" | "prev unknown")) = (height, res) { let mut ph = peer.height.lock().unwrap(); if *ph < h { *ph = h; } }
-                    let from_source = self.sync.lock().unwrap().is_some_and(|(id, _, _)| id == peer.id);
                     // a reply to our batch request: the block of the height we wait for next, whatever became of it (new,
                     // side, already known). A block from an earlier request, sent twice or out of turn, is not counted, so
                     // asking again never snowballs into batches of blocks we already have
@@ -852,7 +863,7 @@ impl Node {
                             }
                             Err("invalid chain") => { self.shun(&peer); return Err(std::io::Error::other("peer on a chain our rules reject dropped")); }
                             // invalid, not merely unknown: a time too far ahead can be clock skew, one at or below the median cannot
-                            Err("pow" | "bits" | "tx root" | "state root" | "decode" | "coinbase" | "block too large" | "duplicate transaction" | "old time" | "bad parent") => bad = true,
+                            Err("pow" | "bits" | "height" | "tx root" | "state root" | "decode" | "coinbase" | "block too large" | "duplicate transaction" | "old time" | "bad parent") => bad = true,
                             _ => {}
                     }
                 }

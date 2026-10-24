@@ -135,17 +135,10 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
     };
     // the account's completed cheques by one node's /sends (newest first, every one); a node older than /sends: its
     // /history, which lists only the last block::HISTORY_CAP events (rewards push sends out). No final number: none
-    let limited = std::cell::Cell::new(false);
     let sends_at = |r: &str, v: &View| -> Result<Vec<Send>, String> {
         let n = v.field("number");
         if n.is_empty() { return Ok(vec![]); }
-        let text = match http(r, "GET", &format!("/sends/{n}"), "") {
-            Err(e) if e.ends_with(": unknown route") => {
-                if !limited.replace(true) { eprintln!("warning: {r} has no /sends (an older node): the account's payments are checked in its recent history only, so a payment made long ago or before many mined blocks may be missed"); }
-                http(r, "GET", &format!("/history/{n}"), "")?
-            }
-            t => t?,
-        };
+        let text = http(r, "GET", &format!("/sends/{n}"), "")?;
         Ok(text.lines().filter_map(|l| {
             let mut w = l.split_whitespace();
             let h = w.next()?.parse().ok()?;
@@ -158,7 +151,7 @@ fn run(cmd: &str, args: &[String], opt: &dyn Fn(&str) -> Option<String>, p: &Par
     // a completed cheque that is this payment: its recipient, amount (a sweep: any) and fee
     let pays = |s: &Send, m: &Message| s.2 == m.payee && s.4 == m.tier as u64 * p.fee_unit && m.amount().map_or(true, |a| a == s.3);
     // what became of cheque n by every node's sends: Some((block, whether it paid `m`)) once it completed, None if no
-    // node lists it (voided, overtaken by a later cheque, expired, or too old for an older node's history). The nodes must agree.
+    // node lists it (voided, overtaken by a later cheque, or expired). The nodes must agree.
     let fate = |v: &View, n: u16, m: &Message| -> Result<Option<(u32, bool)>, String> {
         let mut seen = None;
         for (i, r) in rpcs.iter().enumerate() {

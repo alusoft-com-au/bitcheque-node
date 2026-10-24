@@ -122,7 +122,7 @@ fn snapshot_restart_and_reorg() {
     let n = 2 * SNAP_EVERY + 100;
     // blocks are made with 600 s spacing by an in-memory chain and fed to the file-backed store
     let mut maker = Chain::new(p.clone(), &g).unwrap();
-    let mut blk = |maker: &mut Chain, txs: Vec<bitcheque::tx::Tx>| { let b = maker.make_block(maker.headers.last().unwrap().time + 600, 1, txs).unwrap(); maker.add(&b, now()).unwrap(); b };
+    let blk = |maker: &mut Chain, txs: Vec<bitcheque::tx::Tx>| { let b = maker.make_block(maker.headers.last().unwrap().time + 600, 1, txs).unwrap(); maker.add(&b, now()).unwrap(); b };
     {
         let mut st = Store::open(p.clone(), &g, Some(&path)).unwrap();
         let b1 = { let b = maker.make_block(t0 + 600, 0, vec![]).unwrap(); maker.add(&b, now()).unwrap(); b };

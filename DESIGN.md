@@ -18,9 +18,10 @@ A Bitcoin-derived chain with six hard requirements:
    by hand, at most 255 per book. Throughput and convenience are not goals;
    exchanges and miners use software-driven books (§5).
 
-Proof of work (SHA-256d), the header chain, the transaction Merkle tree, the
-mempool and P2P gossip are borrowed from Bitcoin. Block timing, difficulty
-adjustment and the reward schedule are adapted (§1, §12.1).
+The header chain, the transaction Merkle tree, the mempool and P2P gossip are
+borrowed from Bitcoin. The proof of work is Bitcheque's own (§1.1): built on
+SHA-256, bound by memory bandwidth, not mineable by Bitcoin's chips. Block
+timing, difficulty adjustment and the reward schedule are adapted (§1, §12.1).
 
 ---
 
@@ -59,12 +60,75 @@ any m from 1 to 7. The website does not offer split books.
 
 | Area | Bitcoin | Bitcheque |
 |---|---|---|
-| Consensus | SHA-256d PoW, 10 min target | SHA-256d PoW, 60 s target (merge-mining is an open decision, §8) |
+| Consensus | SHA-256d PoW, 10 min target | the table proof of work (§1.1): memory-bound, for graphics cards; 60 s target; no merge-mining (§8) |
 | Supply | 21M, 50 coins, halving / 210,000 blocks | ≈ 21M: a launch year of 4 coins a block (10 % of the supply), then 4.5 coins halving / 2,100,000 blocks (§12.5) |
 | Difficulty | retarget every 2016 blocks | every block, LWMA over 60 blocks (§12.1); a small chain cannot survive a 2016-block window |
-| Header | 80 bytes | 80 bytes + 32-byte `state_root` = 112 bytes |
+| Header | 80 bytes, a version first | 112 bytes: the block's height in place of the version, then prev, tx root, a 32-byte `state_root`, time, bits, nonce |
 | Tx Merkle tree | SHA-256d | SHA-256d over txids, zero-padded to a power of two (no duplicate-last malleability) |
 | Block limit | 4M weight | 1,000,000 bytes (≈ 1,100 cheques) |
+
+### 1.1 Proof of work
+
+Bitcoin's SHA-256d was dropped on 2026-10-25 (chain version 12). Its hash
+power sits in chips that do nothing else, so a chain on it is mined by whoever
+owns those chips, and whoever rents them could rewrite a small chain's history.
+Bitcheque's proof of work is built on the same SHA-256 as the rest of the
+design, but it is bound by memory bandwidth, which graphics cards have most of
+(`src/pow.rs`):
+
+- A **table** of N = 2^26 elements of 32 bytes (2 GiB) serves EPOCH = 1,024
+  blocks (about 17 hours). Its seed is `SHA-256("bitcheque table" ‖ epoch)`,
+  epoch = height / 1,024, and element i is ROUNDS = 512 chained hashes:
+  `x_1 = SHA-256(seed ‖ i)`, `x_{k+1} = SHA-256(x_k)`. Each hash is one
+  64-byte block, so no midstate is shared between elements, and a chain of
+  hashes cannot be split across cores.
+- A **try**: the block id h = SHA-256d(header) picks K = 32 elements, the 32
+  words of `SHA-256(h ‖ c)`, c = 0..3, each cut to 26 bits. They are summed as
+  256-bit little-endian numbers (wrapping), and the proof-of-work hash is
+  `SHA-256(h ‖ sum)`, read little-endian and compared with the target (bits)
+  as before.
+- A miner holding the table spends about nine hashes and 32 random 32-byte
+  reads a try, about 1 KB of random reads, so a card's memory system sets its
+  rate (measured on a CMP 170HX: 0.3-0.45 G tries/s, bound by the rate of
+  distinct memory requests, about 2x below its SHA-256 ceiling); a processor
+  with the table in RAM does a few million. Without the table a try costs the
+  32 elements, 16,384 hashes: about 250 tries a second a core. ROUNDS is what
+  decides whether a chip built for SHA-256 alone recomputes elements or reads
+  them: at 128 (Autolykos v2's cost) recomputing was the cheaper path and such
+  a chip would have beaten a card 5-20x per watt; at 512 it must hold and read
+  the table like a card, and what is left to it is the memory path's few-fold
+  edge, as with Ethash (a purpose-built memory controller could be several
+  times more efficient per try than a card's). Never lower it. Bitcoin's miners
+  cannot mine it at all: their chips hash an 80-byte header and nothing else.
+- A **node** needs no table and no state to check a header: the header's
+  height names the table, and recomputing the 32 elements takes about four
+  milliseconds (six in WebAssembly). Headers carry their height for this
+  reason, in the field Bitcoin uses for a version; a block's height must be
+  its parent's plus one and the one its coinbase names.
+- The block id is unchanged (SHA-256d of the header), so nothing else in the
+  design moved. The registration proof of work (§2.2, §8 item 2) is a plain
+  SHA-256d grind over the transaction, unchanged.
+- Floors: block 0 asks about 2^6 tries on every network (nodes mine it at
+  start-up without a table). The research network's floor is about 2^8 tries
+  a block, a second or two for the edge nodes' backup miner, which has no
+  table (about 170 tries a second in WebAssembly, 4 s a wake: a floor block in
+  most wakes); mainnet's about 2^20 (§12.1).
+- Miners: `bitcheque mine` builds the table on every core (`--light` does
+  without it) and `miner/` is a CUDA miner for NVIDIA cards, kept outside the
+  dependency-free crate. `genesis.py` recomputes block 0 and its proof-of-work
+  hash independently, and the CUDA miner's self-test checks the same vectors
+  (`tests/pow.rs`) on the card.
+- Consequences: merge-mining with Bitcoin is impossible (§8 item 1). A card
+  arriving at a floor-difficulty chain mines a burst of blocks until the LWMA
+  window (60 blocks) is full of hard targets, as any large hashrate always did
+  (§12.5), and when it leaves, stall relief brings the target back down in
+  about 40 minutes (§12.1). Each verification costs milliseconds, so a node
+  verifies a header once (a cache of checked block ids), and only after what
+  lookups settle: a block it has, a parent it does not know (answered "prev
+  unknown" without work, as the parent itself was), a lie about the height.
+  A header without work, or with work but a lie about its height, is a strike
+  (§7); side blocks offered unasked are taken from one peer 30 a minute, and
+  `POST /block` counts against the RPC's costly budget.
 
 ## 2. What changes, and why
 
@@ -179,7 +243,7 @@ onlookers but plays no part in validity.
 | 8. Decoding | broadcasting computer | `H(addr, cell)` for each cell | finds the row whose stored commit matches; shows the decoded recipient and amount | sees only revealed cells |
 | 9. Piece validation | every node | `commit' = H(addr, H(addr, cell_1) ‖ … ‖ H(addr, cell_m))` per row | some row's `commit'` == stored commit; account exists; batch registered and unexpired. An opening: `N > nonce`, N not open, columns 0–11 and some of 12–17, every one matching, all or nothing; then `nonce := N` and every lower cheque, open or not, is deleted. A piece: N open, column not yet revealed | no |
 | 10. Completion | every node | Damm over P1–P12; amount = mantissa × 10^E (sweep: balance − fee); fee = F × FEE_UNIT | Damm result == 0; recipient is 0 or an existing number 100 blocks old, otherwise the cheque is void (nothing moves); balance ≥ amount + fee; then transfer, prune cheque N's commits | no |
-| 11. Block | miner, then every node | SHA-256d over the header; tx Merkle root (leaf `SHA256d(0 ‖ txid)`, node `SHA256d(1 ‖ left ‖ right)`); state root | header meets difficulty (targets compared, not their encodings); every piece re-validated; state root matches | no |
+| 11. Block | miner, then every node | the block id SHA-256d(header), then its table proof of work (§1.1); tx Merkle root (leaf `SHA256d(0 ‖ txid)`, node `SHA256d(1 ‖ left ‖ right)`); state root | header meets difficulty (targets compared, not their encodings); every piece re-validated; state root matches | no |
 | 12. Afterwards | anyone, light clients | — | Merkle proofs against `state_root` for balance, nonce, number | no |
 
 What an attacker can see: everything in rows 4–12. What they would need:
@@ -467,8 +531,9 @@ build each.
 
 ## 8. Open decisions
 
-1. **Merge-mining.** Launch merge-mined with Bitcoin or not at all. AuxPoW
-   is not implemented.
+1. **Merge-mining.** Closed on 2026-10-25: the table proof of work (§1.1)
+   cannot be merge-mined with Bitcoin, by design. AuxPoW will not be
+   implemented.
 2. **Registration PoW target.** Set: initial target 2^228 (≈ 2^28 ≈ 2.7 × 10^8
    SHA-256 tries over the txid, using a midstate so each try costs a few
    blocks), a minute or two in a browser running the WebAssembly wallet on
@@ -816,7 +881,7 @@ computer prints them:
   laid over a QR page it shows one box at a time, so the camera sees only
   the cell being scanned. Never photograph a whole page: that would hand
   the device every cell of that cheque. The browser's QR reader and encoder
-  are part of the WebAssembly wallet (`web/wasm`).
+  are part of the WebAssembly wallet (`wallet-wasm/`).
 - **Sheet QR code.** Each sheet header carries the lookup code and a QR link
   to the explorer's find page (§10.4).
 - **Tear-off tabs** (design only): each cell on a perforated tab, 18 tabs
@@ -1041,11 +1106,11 @@ is unspendable, as in Bitcoin.
 | Reward | blocks 1–525,000 (~1 year): 4 coins; then 4.5 coins, halving every 2,100,000 blocks (~4 years) | the launch year mines 2,100,000 coins, 10 % of the supply; the rest 18,900,000 less integer rounding, so the total stays under 21M; 10^8 base units per coin; see §12.5 |
 | Reward maturity | credited to the miner's account 100 blocks later | state keeps a pending-reward queue by height |
 | Difficulty | per-block LWMA over the last 60 blocks, solve times clamped to ±6 targets, result clamped ×3 / ÷3 per block | survives hashrate arriving or leaving at once |
-| Stall relief (research network only) | a block more than two targets (plus the 720 s future allowance) late may use a target doubled for every further two targets of silence, up to the easiest target | a chain abandoned at a high difficulty can be restarted by whoever is left; mainnet relies on hashrate instead |
-| Initial target | 2^224 (`0x1E00FFFF`), also the easiest target | adjusts within an hour of real hashrate |
+| Stall relief (research network only) | a block more than two targets (plus the 720 s future allowance) late may use a target doubled for every further target of silence, up to the easiest target | a chain abandoned at a high difficulty can be restarted by whoever is left (from one graphics card's difficulty, ~2^34 tries, to the floor in about 40 minutes); mainnet relies on hashrate instead |
+| Initial target | 2^250 (`0x20040000`) on every network: about 2^6 tries, mined at start-up by every node without a table | the floor (easiest later target): 2^236 (`0x1E100000`, about 2^20 tries) on mainnet, 2^248 (`0x20010000`, about 2^8 tries) on the research network; adjusts within an hour of real hashrate |
 | Timestamps | above the median of the last 11 blocks, at most 720 s in the future | twelve blocks, as Bitcoin's two hours are twelve of its blocks |
-| Proof-of-work | SHA-256d over the 112-byte header | AuxPoW (merge-mining) not implemented, §8 item 1 |
-| Header | version 4 B, prev 32 B, tx root 32 B, state root 32 B, time 4 B, bits 4 B, nonce 4 B | 112 B |
+| Proof-of-work | the table proof of work over the block id (§1.1): N = 2^26 elements, K = 32 reads, ROUNDS = 512 hashes per element, a table per 1,024 blocks | SHA-256 throughout; Bitcoin's chips cannot mine it; merge-mining closed, §8 item 1 |
+| Header | height 4 B, prev 32 B, tx root 32 B, state root 32 B, time 4 B, bits 4 B, nonce 4 B | 112 B; the height is the parent's plus one and the coinbase's |
 | Block limit | 1,000,000 bytes (encoded block) | §6 |
 | Registration PoW | target 2^228 initially, adjusting every block toward one registration per 10 blocks (time constant 1,440 blocks); anchored to one of the last 144 block hashes (not block 0's); at most 16 PoW registrations per block | §8 item 2 |
 | Funding | an account becomes permanent once it holds 1 coin (`min_fund`) after a cheque, or is mined to | §2.2 |
@@ -1058,10 +1123,10 @@ is unspendable, as in Bitcoin.
 | Account maturity | 100 blocks before a number can receive a cheque | §10.4 |
 | Network magic | `0xBC 0x4E 0x51 0x00` mainnet, `…0x01` research network, `…0x02` local | non-consensus |
 
-The public research network uses the mainnet parameters except: initial
-target ≈ 2^240 (`0x1F00FFFF`), easiest later target 2^237 (`0x1E200000`,
-about 2^19 hashes a block: under a second for one CPU core), the same launch year,
-stall relief on. The difficulty is set by the hash power present: with one
+The public research network uses the mainnet parameters except: easiest later
+target 2^248 (`0x20010000`, about 2^8 tries a block: a second for one processor
+core without the table, a second or two for the edge nodes' backup miner in
+WebAssembly), the same launch year, stall relief on. The difficulty is set by the hash power present: with one
 small miner it sits at the floor, and each block can raise it up to 3× when
 more join. So the chain never stalls for want of miners, the edge nodes
 carry a backup miner: when no block has come for 50 seconds, one region
@@ -1115,7 +1180,8 @@ release must be public at least one week before it.
 ### 12.5 Early dominance
 
 Proof-of-work cannot stop whoever brings the most hashrate from producing
-most blocks, and SHA-256 means ASIC owners, so one party will likely
+most blocks; with the table proof of work (§1.1) that is whoever brings the
+most graphics cards (Bitcoin's chips cannot take part), so one party may still
 dominate the first days. The rules aim to make that worthless rather than
 impossible:
 
@@ -1130,22 +1196,26 @@ impossible:
   hashrate arriving, so an easy initial target cannot be ground into
   thousands of blocks.
 - **Public release one week ahead and the timestamp rule** (§12.2) remove
-  the insider head start. Anyone with an ASIC starts at the same second.
+  the insider head start. Anyone with a graphics card starts at the same second.
 - **Checkpoints and Bitcoin anchoring** (§12.3) bound reorg depth, so a
   dominant miner can delay cheques but not rewrite history.
-- **Merge-mining offered at launch** is the only measure that ends
-  dominance rather than defusing it: one mid-size Bitcoin pool joining at
-  zero marginal cost outweighs any individual.
+- **No merge-mining.** With SHA-256d, one mid-size Bitcoin pool joining at
+  zero marginal cost would have ended any individual's dominance; it would
+  also have been the party able to rewrite the chain for nothing. The table
+  proof of work gives that up: the chain is as safe as the cards mining it.
 
 Rejected: limiting consecutive blocks per miner (trivially evaded with
-many accounts); a CPU-friendly PoW such as RandomX (forfeits
-merge-mining, and botnets dominate CPU chains anyway).
+many accounts); a CPU-friendly PoW such as RandomX (botnets dominate CPU
+chains); keeping SHA-256d for the sake of merge-mining (the first choice,
+dropped on 2026-10-25, §1.1).
 
 
 ## 13. Reference implementation
 
-Rust, standard library only (`Cargo.toml` lists no dependencies). About 2,500
-lines. Module map: `sha256` (own FIPS 180-4, with midstate), `u256`,
+Rust, standard library only (`Cargo.toml` lists no dependencies). About 4,700
+lines. Module map: `sha256` (own FIPS 180-4, with midstate), `u256`, `pow`
+(§1.1: the table proof of work, the light hash a node uses and the table a
+miner builds),
 `crypto` (§3.1), `damm` and `message` (§10.2, §10.4), `book` (§3.2 rows
 4–6), `tx` (§2.2), `params` (§12.1: mainnet, research network, local),
 `state` (§2.1, §10.11, §10.12, Merkle state root with account proofs),
@@ -1178,7 +1248,11 @@ received, and its reply be taken within 60 s; bodies must be ASCII;
 account from one Merkle tree built per tip, so a proof costs microseconds
 rather than a hash per account), `wallet` (§4.2
 derivation, registration mining, non-consensus), `main` (`bitcheque
-genesis | node | wallet`). Tests: `tests/chain.rs` (life of the chain),
+genesis | node | mine | wallet`; `mine` builds the proof of work's table on
+every core, or runs without it with `--light`). `miner/` is a CUDA miner for
+NVIDIA cards, outside the crate (it needs the CUDA toolkit), speaking the
+same RPC. Tests: `tests/chain.rs` (life of the chain), `tests/pow.rs` (the
+proof of work: vectors, the height rule, the epoch boundary, strikes),
 `tests/net.rs` (sync and relay), `tests/store.rs` (reorg, persistence,
 proofs, RPC), `tests/hardening.rs`, `tests/net2.rs` (network, storage and RPC abuse), `tests/consensus2.rs` and
 `tests/consensus3.rs` (consensus audits), `tests/wallet2.rs` and `tests/wallet3.rs` (the command-line wallet against a
@@ -1203,12 +1277,12 @@ repeated line is answered "duplicate transaction"; an empty body answers
 at once). Explorer addresses: `#block=N`,
 `#account=N`, `#code=XXXX-XXXX-XXXX`, `#mempool`.
 
-Browser wallet: `web/wasm` compiles the same crate to WebAssembly for the
+Browser wallet: `wallet-wasm/` compiles the same crate to WebAssembly for the
 website: the 256-cheque book from a seed, the registration (mined in slices
 by workers on all cores), the honesty check, cheque pieces, the lookup
 code, and a QR encoder (levels M and H) and camera reader.
 
-Not implemented: transport encryption (§7), AuxPoW (§8), the fee-unit
+Not implemented: transport encryption (§7), the fee-unit
 adjustment rule (§8), checkpoints (§12.3), threshold books (§10.6a), the
 pre-registered recipient mode (§10.8), column C (§10.13), tear-off tabs,
 split books on the website, and the website's restore and reprint flows,

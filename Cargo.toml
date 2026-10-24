@@ -14,6 +14,11 @@ license = "MIT"
 members = ["wallet-wasm"]
 exclude = ["edge"]
 
+# Tests mine blocks: the proof of work's 16,000 hashes a try would take 100 ms unoptimised, so debug builds are optimised
+# too (the crate is small and has no dependencies: compile time hardly moves). `cargo test` and `cargo test --release` both work.
+[profile.dev]
+opt-level = 2
+
 [profile.wasm]
 inherits = "release"
 opt-level = 3

@@ -19,7 +19,7 @@ pub struct Params {
     pub number_maturity: u32,
     pub lwma_window: usize,
     pub lwma_clamp: u64,
-    pub initial_bits: u32,     // block 0's target (mined at startup, so it must be cheap)
+    pub initial_bits: u32,     // block 0's target (every node mines block 0 at start-up, without a table, so it must be cheap)
     pub min_bits: u32,         // the easiest target any later block may use
     pub max_block_bytes: usize,
     pub max_future_seconds: u32,
@@ -40,7 +40,7 @@ pub struct Params {
     pub piece_lifetime: u32,
     pub max_batch: u32,
     pub book_size: u32,
-    pub stall_relief: bool,   // a block more than 2 targets late may use a doubled target per 2 targets of silence (testnets)
+    pub stall_relief: bool,   // a block more than 2 targets late may use a doubled target per further target of silence (testnets)
     pub magic: [u8; 4],
 }
 
@@ -60,8 +60,8 @@ impl Params {
             number_maturity: 100,
             lwma_window: 60,
             lwma_clamp: 3,
-            initial_bits: 0x1E00_FFFF,
-            min_bits: 0x1E00_FFFF,
+            initial_bits: 0x2004_0000,     // ~2^6 tries: a quarter of a second at start-up
+            min_bits: 0x1E10_0000,         // the floor, ~2^20 tries: an hour for a processor without the table, nothing for a graphics card
             max_block_bytes: 1_000_000,    // about 1 MB a minute: well within what home connections relay
             max_future_seconds: 720,       // twelve blocks, as Bitcoin's two hours are twelve of its blocks
             reg_pow_target: U256::one_shl(228), // 2^256 / 2^28
@@ -93,11 +93,11 @@ impl Params {
         }
     }
     pub fn testnet() -> Params {
-        // no slow start and stall relief: a public test network should hand out coins at once and never get stranded
-        // the easiest target is about 2^19 hashes a block: under a second for any computer, and about a second for
-        // the edge node's backup miner (WebAssembly, ~0.8 MH/s), which mines only when nobody else has for 50
-        // seconds. Real miners joining raise it within a few blocks (LWMA, up to 3x per block).
-        Params { initial_bits: 0x1F00_FFFF, min_bits: 0x1E20_0000, stall_relief: true, magic: TESTNET_MAGIC, ..Params::mainnet() }
+        // no slow start and stall relief: a public test network should hand out coins at once and never get stranded.
+        // The floor is about 2^8 tries a block: a second for a processor without the table (about 250 tries a second a
+        // core), and a second or two for the edge node's backup miner (WebAssembly, ~170 tries a second), which mines only
+        // when nobody else has for 50 seconds. Real miners joining raise it within the LWMA window (up to 3x per block).
+        Params { initial_bits: 0x2004_0000, min_bits: 0x2001_0000, stall_relief: true, magic: TESTNET_MAGIC, ..Params::mainnet() }
     }
     /// Private network for running several nodes on one machine: 1-minute blocks, short maturities, easy work.
     pub fn local() -> Params {

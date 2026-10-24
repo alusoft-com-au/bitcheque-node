@@ -27,9 +27,11 @@ const HDR_KEEP = 2000;           // headers handed to the node on a cold start (
 const PART = 1_000_000;          // snapshot bytes per row (rows hold at most 2 MB)
 const QUIET_S = 50;              // the backup miner mines when no block has come for this long: with nobody else
                                  // mining it finds one each wake, about one a minute (the block target)
-const MINE_MS = 3000;            // at most this long per wake (the floor is ~2^19 hashes: about a second here)
-const MINE_TRIES = 50_000;       // nonces per call into the wasm, between clock checks
-const CHAIN_VERSION = '11';        // bump to reset the network: each region forgets its chain and starts from block 0
+const MINE_MS = 4000;            // at most this long per wake (the floor is ~2^8 tries, each ~16,000 hashes without the
+                                 // table, src/pow.rs: about two seconds here)
+const MINE_TRIES = 50;           // nonces per call into the wasm, between clock checks (~0.3 s)
+const RETRY_MS = 10_000;         // a quiet wake that mined nothing tries again after this, not after SYNC_MS
+const CHAIN_VERSION = '12';        // bump to reset the network: each region forgets its chain and starts from block 0
 const FALLBACK_S = 120;          // each further region in MINE_REGIONS waits this much longer (if the first is down)
 const RERELAY_MAX = 50;          // waiting transactions offered again to each other region per wake
 const RERELAY_TIMES = 2;         // ...each only if the public sent it here, after it waited a wake, and at most this often
@@ -50,7 +52,7 @@ const CACHE_S = 15;              // seconds the front worker caches a GET reply 
 const N = '(?:0|[1-9]\\d{0,9})', ID = '[0-9a-f]{34}(?:[0-9a-f]{32})?';
 const GETS = new RegExp(`^/(?:height|peers|addrs|tip|regtarget|stats|mempool|edge|top(?:/${N})?|(?:block|summary|account|proof|history|sends|template)/${N}|(?:id|queued)/${ID}|lookup/[0-9a-f]{8,64}|commits/${ID}/${N})$`);
 const POSTS = /^\/(?:tx|check|block)$/;
-const HEAVY = /^\/(?:check$|tx$|template\/)/;   // the public's costlier requests: RL_HEAVY's lower limit applies too
+const HEAVY = /^\/(?:check$|tx$|block$|template\/)/;   // the public's costlier requests: RL_HEAVY's lower limit applies too
 const TOP_MAX = 200;             // the most accounts /top/N lists (rpc.rs)
 const TX_REGS = 16;              // registrations taken from one of the public's /tx (a whole book: 16 batches of 16, sent with
                                  // cheque 0); the rest of its registrations are answered 429, to be sent again
@@ -110,16 +112,6 @@ export class EdgeNode extends DurableObject {
                    CREATE TABLE IF NOT EXISTS snap (part INTEGER PRIMARY KEY, data BLOB NOT NULL);
                    CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
                    CREATE TABLE IF NOT EXISTS pool (id INTEGER PRIMARY KEY AUTOINCREMENT, tx TEXT NOT NULL UNIQUE, own INTEGER NOT NULL DEFAULT 0, age INTEGER NOT NULL DEFAULT 0, src TEXT NOT NULL DEFAULT '')`);
-    // older layouts: pool rows without their origin (own: from the public), wakes waited (age) or sender (src: the address's
-    // limitKey, carried along by the peers that pass it on); headers 1000 to a row in `headers` (split into rows of HDR_CHUNK in `hdr`)
-    const cols = this.sql.exec("SELECT name FROM pragma_table_info('pool')").toArray().map(r => r.name);
-    for (const c of ['own', 'age']) if (!cols.includes(c)) this.sql.exec(`ALTER TABLE pool ADD COLUMN ${c} INTEGER NOT NULL DEFAULT 0`);
-    if (!cols.includes('src')) this.sql.exec("ALTER TABLE pool ADD COLUMN src TEXT NOT NULL DEFAULT ''");
-    if (this.sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'headers'").toArray().length) {
-      for (const r of this.sql.exec('SELECT chunk, data FROM headers').toArray()) { const d = new Uint8Array(r.data), n = HDR_CHUNK * 112;
-        for (let i = 0; i * n < d.length; i++) this.sql.exec('INSERT OR REPLACE INTO hdr VALUES (?, ?)', r.chunk * (1000 / HDR_CHUNK) + i, d.subarray(i * n, (i + 1) * n)); }
-      this.sql.exec('DROP TABLE headers');
-    }
     this.x = null; this.ready = false; this.starting = null; this.replaying = false;
     this.relayed = Promise.resolve();   // forwards go out one after another, in the order they were accepted
     this.pushed = 0;                    // when a block sent here last moved the chain
@@ -362,12 +354,13 @@ export class EdgeNode extends DurableObject {
       // hand the block to the other regions before the alarm returns: background work started in an alarm is
       // cut off when it ends, which left the others a minute behind until their own sync
       if (r === 1) { const body = this.out(x.io_len()); note({ found: true });
-        await Promise.allSettled(this.upstreams().map(up => this.call(up, '/block', { method: 'POST', body }))); return; }
+        await Promise.allSettled(this.upstreams().map(up => this.call(up, '/block', { method: 'POST', body }))); return true; }
       if (r === 2) { const why = this.out(x.io_len());
         if (payee && /payee/.test(why)) { payee = 0; continue; }   // the account does not exist yet: mine to nobody
         note({ error: why }); return; }
     }
     note({ found: false });
+    return false;
   }
   // offer what the public sent here to the other regions again, oldest first: one lost on the way (or refused there
   // because it overtook the transaction it depends on) gets through. Only after it has waited a wake (the push went out
@@ -395,9 +388,10 @@ export class EdgeNode extends DurableObject {
   // every SYNC_S; straight away again while catching up (a wake that fetched its fill and raised the height) or when a
   // peer pushed a block on another branch meanwhile. A failure is logged, not thrown: a thrown alarm is retried at once.
   async alarm() {
-    let s = { fetched: 0 };
-    try { s = await this.sync(); if (s.fetched < MAX_PER_WAKE) await this.backup(); } catch (e) { console.error(`edge node wake: ${e.stack || e}`); }
-    await this.ctx.storage.setAlarm(Date.now() + (this.from || s.rose && s.fetched >= MAX_PER_WAKE ? 1000 : this.every()));
+    let s = { fetched: 0 }, mined;
+    try { s = await this.sync(); if (s.fetched < MAX_PER_WAKE) mined = await this.backup(); } catch (e) { console.error(`edge node wake: ${e.stack || e}`); }
+    // a quiet chain whose wake found no block (about one wake in twelve at the floor) is tried again soon, not next minute
+    await this.ctx.storage.setAlarm(Date.now() + (this.from || s.rose && s.fetched >= MAX_PER_WAKE ? 1000 : mined === false ? RETRY_MS : this.every()));
   }
 
   async fetch(req) {

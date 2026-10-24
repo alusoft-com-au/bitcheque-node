@@ -92,20 +92,20 @@ fn life_of_the_chain() {
     assert_eq!(net.chain.state.clone().apply(&p, &mine_registration(small.register(0, 16, Payment::Pow([0; 32], 0)), net.chain.tip(), p.reg_pow_target)), Err("bad book parameters"));
 }
 
-/// Block 0 of mainnet with the placeholder message and launch time must equal the Python
-/// cross-check (`genesis.py`). Slow in debug builds: `cargo test --release -- --ignored`.
+/// Block 0 of mainnet with the placeholder message and launch time must equal the Python cross-check (`genesis.py`,
+/// an independent implementation of the header, the Merkle leaf and the table proof of work).
 #[test]
-#[ignore]
 fn genesis_vector() {
     let g = Chain::genesis(&Params::mainnet(), 1_798_761_600, b"Bitcheque genesis. Message text and launch timestamp to be set (DESIGN.md 12.4).");
     let mut h = g.header.hash(); h.reverse();
-    assert_eq!(bitcheque::crypto::hex(&h), "0000006873330276025a60ea1afd7497498d3ee30edacdfbcbb632be90227e4c");
-    assert_eq!(g.header.nonce, 1434074);
+    assert_eq!(bitcheque::crypto::hex(&h), "c34f82dae00c040af552d140a130988541bf33182d0b7ddb82735e455ffd7a25");
+    assert_eq!(g.header.nonce, 60);
+    assert_eq!(bitcheque::crypto::hex(&g.header.pow()), "b90c85cd6874ea35cb76009c43cca25dd95fa1d5f7b4da2964e3929241c76100");
 }
 
 /// Stall relief: after fast blocks the difficulty is high; once the chain has been silent for two
 /// targets beyond the latest recent timestamp and the future-time allowance, the target doubles per
-/// further two targets; an on-time block may not use it.
+/// further target; an on-time block may not use it.
 #[test]
 fn stall_relief_restarts_an_abandoned_chain() {
     use bitcheque::block::{next_bits, relieved_bits};
@@ -123,6 +123,7 @@ fn stall_relief_restarts_an_abandoned_chain() {
     assert_eq!(relieved_bits(&p, &c.headers, start), base, "within the future-time allowance: no relief");
     let eased = relieved_bits(&p, &c.headers, start + 1);
     assert_eq!(U256::from_compact(eased), U256::from_compact(base).shl(1), "two targets past the allowance: target doubled");
+    assert_eq!(U256::from_compact(relieved_bits(&p, &c.headers, start + 1 + 3 * t)), U256::from_compact(base).shl(4), "three more targets of silence: three more doublings");
     assert_eq!(relieved_bits(&p, &c.headers, start + 1000 * t), p.min_bits, "long silence: back to the easiest target");
     let late = c.make_block(start + 1, 0, vec![]).unwrap();
     assert_eq!(late.header.bits, eased);

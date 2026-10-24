@@ -1,6 +1,7 @@
 # Bitcheque node
 
-Bitcheque is an experimental proof-of-work blockchain (SHA-256d, 60-second blocks) where coins move with
+Bitcheque is an experimental proof-of-work blockchain (a memory-bound table proof of work made for graphics cards,
+60-second blocks) where coins move with
 hand-copied cheques printed offline from a hash-based cheque book (256 cheques on one account, printed as needed). Rust, no dependencies.
 
 - `DESIGN.md`: every rule and parameter, and why.
@@ -10,13 +11,16 @@ hand-copied cheques printed offline from a hash-based cheque book (256 cheques o
 - `bitcheque wallet` (see the top of `src/main.rs` for every flag) drives one book from a seed file. Its RPC is plain
   HTTP: anyone between you and the node can withhold or forge replies (never a cheque), so give it two nodes reached
   over different paths (`--rpc A,B`). If a send fails part way, run the same command again, or `wallet void`.
-- `tests/`: `cargo test`.
+- `bitcheque mine --rpc ADDR --to NUMBER` mines on the processor (it builds the proof of work's 2 GiB table on every
+  core; `--light` does without it); `miner/` is a CUDA miner for NVIDIA cards (`miner/build.sh`, needs the CUDA
+  toolkit; the node itself stays dependency-free). See `DESIGN.md` §1.1.
+- `tests/`: `cargo test --release` (debug builds hash slowly).
 - `wallet-wasm/`: the same Rust book and registration code compiled to WebAssembly for the website:
   `cd wallet-wasm && cargo build --release --target wasm32-unknown-unknown`.
 - `edge/`: the edge node, the node's chain, mempool and RPC compiled to WebAssembly and run by Cloudflare
-  Durable Objects in three regions (`node-ap`, `node-us`, `node-eu`.bitcheque.org). No sockets and no miner:
-  each wakes every minute, pulls new blocks from upstream nodes' RPC, keeps them in SQLite, and forwards
-  posted transactions upstream. Each keeps only the last 2,000 block headers in memory (older blocks stay in
+  Durable Objects in three regions (`node-ap`, `node-us`, `node-eu`.bitcheque.org). No sockets; each wakes every
+  minute, pulls new blocks from upstream nodes' RPC, keeps them in SQLite, forwards posted transactions upstream,
+  and mines a block only as a backup, when nobody else has for 50 seconds. Each keeps only the last 2,000 block headers in memory (older blocks stay in
   SQLite), so memory stays flat however long the chain grows. `edge/build.sh`, then `npx wrangler deploy` in `edge/`.
   Two more, `node-oc` (Oceania) and `node-sa` (South America), run as their own Workers (`edge/wrangler.oc.jsonc`,
   `edge/wrangler.sa.jsonc`; they wake every 30 seconds and do not mine). All five form a mesh: each pushes what it

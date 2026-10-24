@@ -1,4 +1,4 @@
-//! Headers, proof-of-work, LWMA difficulty, block validation and the chain (DESIGN.md §1, §12).
+//! Headers, the proof-of-work rule (the hash itself is pow.rs), LWMA difficulty, block validation and the chain (DESIGN.md §1, §12).
 use crate::crypto::sha256d;
 use crate::params::Params;
 use crate::state::{Event, State};
@@ -8,12 +8,12 @@ use crate::tx::{Tx, R, W};
 use crate::u256::U256;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Header { pub version: u32, pub prev: [u8; 32], pub tx_root: [u8; 32], pub state_root: [u8; 32], pub time: u32, pub bits: u32, pub nonce: u32 }
+pub struct Header { pub height: u32, pub prev: [u8; 32], pub tx_root: [u8; 32], pub state_root: [u8; 32], pub time: u32, pub bits: u32, pub nonce: u32 }
 
 impl Header {
     pub fn encode(&self) -> [u8; 112] {
         let mut b = [0u8; 112];
-        b[..4].copy_from_slice(&self.version.to_le_bytes()); b[4..36].copy_from_slice(&self.prev);
+        b[..4].copy_from_slice(&self.height.to_le_bytes()); b[4..36].copy_from_slice(&self.prev);
         b[36..68].copy_from_slice(&self.tx_root); b[68..100].copy_from_slice(&self.state_root);
         b[100..104].copy_from_slice(&self.time.to_le_bytes()); b[104..108].copy_from_slice(&self.bits.to_le_bytes());
         b[108..].copy_from_slice(&self.nonce.to_le_bytes());
@@ -21,11 +21,24 @@ impl Header {
     }
     pub fn decode(b: &[u8; 112]) -> Header {
         let g = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
-        Header { version: g(0), prev: b[4..36].try_into().unwrap(), tx_root: b[36..68].try_into().unwrap(),
+        Header { height: g(0), prev: b[4..36].try_into().unwrap(), tx_root: b[36..68].try_into().unwrap(),
                  state_root: b[68..100].try_into().unwrap(), time: g(100), bits: g(104), nonce: g(108) }
     }
+    /// The block id.
     pub fn hash(&self) -> [u8; 32] { sha256d(&self.encode()) }
-    pub fn meets_target(&self) -> bool { U256::from_le_bytes(&self.hash()) < U256::from_compact(self.bits) }
+    /// The proof-of-work hash (pow.rs), computed without a table: about 16,000 hashes, from the header alone.
+    pub fn pow(&self) -> [u8; 32] { let s = crate::pow::seed(crate::pow::epoch(self.height)); crate::pow::hash(&self.hash(), &mut |i| crate::pow::element(&s, i)) }
+    /// Whether a proof-of-work hash of this header (`pow`, or a miner's table's) meets its target.
+    pub fn meets(&self, pow: &[u8; 32]) -> bool { U256::from_le_bytes(pow) < U256::from_compact(self.bits) }
+    /// The proof-of-work rule, checked once per header (pow::verified) wherever the header turns up.
+    pub fn meets_target(&self) -> bool {
+        let id = self.hash();
+        if crate::pow::verified(&id) { return true; }
+        let s = crate::pow::seed(crate::pow::epoch(self.height));
+        let ok = self.meets(&crate::pow::hash(&id, &mut |i| crate::pow::element(&s, i)));
+        if ok { crate::pow::remember(id); }
+        ok
+    }
     /// Search nonces until the header meets its target.
     pub fn mine(&mut self) { while !self.meets_target() { self.nonce = self.nonce.wrapping_add(1); } }
 }
@@ -196,8 +209,9 @@ pub type Sent = (u32, u16, u32, u64, u64);
 pub struct Totals { pub txs: u64, pub pieces: u64, pub registrations: u64, pub transfers: u64, pub rewards: u64 }
 
 /// Target with stall relief: when `stall_relief` is on and the chain has been silent for more than two
-/// targets, the allowed target doubles for every further two targets of silence (never easier than
-/// `min_bits`). So a chain abandoned at a high difficulty can be restarted by whoever is left (DESIGN.md §12.3).
+/// targets, the allowed target doubles for every further target of silence (never easier than `min_bits`).
+/// So a chain abandoned at a high difficulty can be restarted by whoever is left (DESIGN.md §12.3): from one
+/// graphics card's difficulty (~2^34 tries) to the research floor in about 40 minutes.
 /// Silence is measured from the latest time among the last 11 headers, and a block may claim no relief
 /// for the `max_future_seconds` it could have faked: otherwise a miner could alternate a low and a
 /// far-future timestamp and mine every other block at minimum difficulty (Bitcoin testnet's 20-minute bug).
@@ -207,7 +221,7 @@ pub fn relieved_bits(p: &Params, headers: &[Header], time: u32) -> u32 {
     let t2 = 2 * p.block_target_seconds;
     let start = last.saturating_add(p.max_future_seconds).saturating_add(t2);
     if !p.stall_relief || time <= start { return base; }
-    let steps = ((time - start) / t2 + 1).min(255);
+    let steps = ((time - start) / p.block_target_seconds + 1).min(255);
     let max = U256::from_compact(p.min_bits);
     let mut t = U256::from_compact(base);
     for _ in 0..steps { t = t.shl(1); if t > max { t = max; break; } }
@@ -260,7 +274,7 @@ impl Chain {
     /// Block 0 (§12): coinbase to number 0, zero state root by definition, mined.
     pub fn genesis(p: &Params, time: u32, message: &[u8]) -> Block {
         let cb = Tx::Coinbase { height: 0, payee: 0, message: message.to_vec() };
-        let mut header = Header { version: 1, prev: [0; 32], tx_root: tx_root(std::slice::from_ref(&cb)), state_root: [0; 32], time, bits: p.initial_bits, nonce: 0 };
+        let mut header = Header { height: 0, prev: [0; 32], tx_root: tx_root(std::slice::from_ref(&cb)), state_root: [0; 32], time, bits: p.initial_bits, nonce: 0 };
         header.mine();
         Block { header, txs: vec![cb] }
     }
@@ -293,6 +307,7 @@ impl Chain {
         let height = self.height() + 1;
         let h = &b.header;
         if h.prev != self.tip() { return Err("prev hash"); }
+        if h.height != height { return Err("height"); }
         if h.time <= self.median_time() || h.time > now.saturating_add(p.max_future_seconds) { return Err("time"); }
         if !bits_ok(p, &self.headers, h) { return Err("bits"); }
         if !h.meets_target() { return Err("pow"); }
@@ -351,7 +366,7 @@ impl Chain {
         let height = self.height() + 1;
         let mut all = vec![Tx::Coinbase { height, payee, message: Vec::new() }];
         all.extend(txs);
-        let mut header = Header { version: 1, prev: self.tip(), tx_root: tx_root(&all), state_root: [0; 32], time, bits: relieved_bits(p, &self.headers, time), nonce: 0 };
+        let mut header = Header { height, prev: self.tip(), tx_root: tx_root(&all), state_root: [0; 32], time, bits: relieved_bits(p, &self.headers, time), nonce: 0 };
         let mut s = self.state.clone();
         s.begin_block(p, height);
         let mut fees = 0u64;

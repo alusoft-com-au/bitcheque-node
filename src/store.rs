@@ -110,8 +110,9 @@ impl Store {
                 let mut h = snap.tip;
                 while h != genesis.header.hash() { match by_hash.get(&h) { Some(&i) => { path_idx.push(i); h = recs[i].2.prev; } None => break } }
                 let root_ok = path_idx.first().is_some_and(|&i| recs[i].2.state_root == snap.state.root() && snap.state.height == snap.height);
-                if h == genesis.header.hash() && path_idx.len() as u32 == snap.height && root_ok {
-                    path_idx.reverse();
+                path_idx.reverse();
+                let heights_ok = path_idx.iter().enumerate().all(|(k, &i)| recs[i].2.height == k as u32 + 1);
+                if h == genesis.header.hash() && path_idx.len() as u32 == snap.height && root_ok && heights_ok {
                     for (k, &i) in path_idx.iter().enumerate() {
                         let (off, len, hd) = &recs[i];
                         s.chain.headers.push(hd.clone()); s.chain.hashes.push(hd.hash());
@@ -163,6 +164,7 @@ impl Store {
         for h in &hs { if h.prev != prev { return Ok(s); } prev = h.hash(); }
         if prev != snap.tip || hs[n - 1].state_root != snap.state.root() || snap.state.height != snap.height { return Ok(s); }
         let first = (k - n + 1) as u32;
+        if hs.iter().enumerate().any(|(i, h)| h.height != first + i as u32) { return Ok(s); }
         if n < k { s.chain.headers.clear(); s.chain.hashes.clear(); s.index.clear(); s.chain.base = first; }
         for (i, h) in hs.into_iter().enumerate() { s.index.insert(h.hash(), first + i as u32); s.chain.hashes.push(h.hash()); s.chain.headers.push(h); }
         s.chain.blocks = Blocks::Host { genesis: genesis.clone(), n: k + 1, io };
@@ -177,7 +179,7 @@ impl Store {
     pub fn knows(&self, h: &[u8; 32]) -> bool { self.index.contains_key(h) || self.side.contains_key(h) }
     /// The height of a stored block, on the main chain (while its header is in memory) or off it.
     pub fn height_of(&self, h: &[u8; 32]) -> Option<u32> {
-        self.index.get(h).copied().or_else(|| self.side.get(h).and_then(|(b, _, _)| match b.txs.first() { Some(Tx::Coinbase { height, .. }) => Some(*height), _ => None }))
+        self.index.get(h).copied().or_else(|| self.side.get(h).map(|(b, _, _)| b.header.height))
     }
     /// Flush the data file to the disk if blocks written to it have waited 10 s or more (called now and then, so a
     /// block that arrives alone reaches the disk within about that, not only when the next one is written).
@@ -207,8 +209,11 @@ impl Store {
         let p = &self.chain.params;
         // a target easier than any block may have is invalid wherever the block would go (and cheap to fake)
         if U256::from_compact(b.header.bits) > p.easiest_target() { return Err("bits"); }
+        // what a lookup settles comes before the proof of work (milliseconds to check): a block on nothing we know, or
+        // lying about its height, costs nothing to make and nothing to refuse
+        let Some(parent) = self.height_of(&b.header.prev) else { return Err("prev unknown") };
+        if b.header.height != parent + 1 { return Err("height"); }
         if !b.header.meets_target() { return Err("pow"); }
-        if b.header.prev != self.chain.tip() && !self.index.contains_key(&b.header.prev) && !self.side.contains_key(&b.header.prev) { return Err("prev unknown"); }
         // the header commits to the body only through the tx root: checked before anything is remembered by hash
         if b.header.tx_root != crate::block::tx_root(&b.txs) { return Err("tx root"); }
         let r = self.accept_checked(b, h, now, loc);
@@ -284,6 +289,7 @@ impl Store {
         let depth = self.chain.height().saturating_sub(fork);
         if fork < self.chain.base || depth as usize > SIDE_CAP { return Err("reorg too deep"); }
         let height = fork + anc.len() as u32 + 1;
+        if h.height != height { return Err("height"); }
         let new_work: u128 = anc.iter().chain([h]).map(|x| work(x.bits)).sum();
         if depth > p.max_reorg {
             let span: u128 = self.chain.headers_from(fork + 1).iter().take((height - fork) as usize).map(|x| work(x.bits)).sum();

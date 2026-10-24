@@ -2,7 +2,7 @@
 name = "bitcheque-edge"
 version = "0.1.0"
 edition = "2021"
-description = "Edge node: the node's chain, mempool and RPC compiled to WebAssembly for a Cloudflare Durable Object. No networking, no mining. No dependencies."
+description = "Edge node: the node's chain, mempool and RPC compiled to WebAssembly for a Cloudflare Durable Object. No networking; mines only as a backup. No dependencies."
 license = "MIT"
 
 [lib]

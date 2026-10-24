@@ -57,8 +57,9 @@ fn limit_key(ip: std::net::IpAddr) -> std::net::IpAddr {
 /// A path spelt one way: empty segments dropped ("//template/0" and "/check/" are "/template/0" and "/check"), so what
 /// is routed is what is charged.
 fn normal(path: &str) -> String { format!("/{}", path.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("/")) }
-/// The routes that cost real work whoever asks (proofs of work and hash checks, state proofs, block building).
-fn costly(path: &str) -> bool { path == "/check" || path.starts_with("/proof/") || path.starts_with("/template/") }
+/// The routes that cost real work whoever asks (proofs of work and hash checks, state proofs, block building, a block's
+/// verification).
+fn costly(path: &str) -> bool { path == "/check" || path == "/block" || path.starts_with("/proof/") || path.starts_with("/template/") }
 
 /// The networks a connection is counted against, with the most each may hold at once: an IPv4 address, or the /56, /48
 /// and /32 an IPv6 address is in. Each key is tagged with its prefix length, so a /48 and a /32 never share a count.
