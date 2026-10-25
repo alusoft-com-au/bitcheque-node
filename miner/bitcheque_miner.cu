@@ -345,7 +345,10 @@ int main(int argc, char** argv) {
     if (devs.empty()) for (int d = 0; d < count; d++) use.push_back(d);
     else { size_t at = 0; while (at < devs.size()) { size_t e = devs.find(',', at); if (e == std::string::npos) e = devs.size(); int d = atoi(devs.substr(at, e - at).c_str()); if (d < 0 || d >= count) { fprintf(stderr, "no GPU %d\n", d); return 1; } use.push_back(d); at = e + 1; } }
     if (use.empty()) { fprintf(stderr, "no CUDA device\n"); return 1; }
-    if (!fetch_template()) return 1;
+    // no template yet (the node is down, restarting, or the account is not registered yet): asked again every few seconds,
+    // as `bitcheque mine` does; the message above says why
+    while (!fetch_template() && !g_stop) std::this_thread::sleep_for(std::chrono::seconds(5));
+    if (g_stop) return 0;
     fprintf(stderr, "mining for account %u on %zu GPU(s) against %s (next block %u, epoch %u)\n", g_to, use.size(), rpc.c_str(), g_tpl.height, g_tpl.height / EPOCH);
     std::vector<std::atomic<uint64_t>> tries(use.size()); for (auto& t : tries) t = 0;
     std::vector<std::thread> threads;
