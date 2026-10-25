@@ -519,7 +519,16 @@ export default {
       // of 64 (1,920 transactions) without registrations, or two carrying 28 (the chain itself takes far fewer)
       const ls = !peer && path === '/tx' ? linesOf(body) : [], regs = ls.flatMap((l, i) => isReg(l) ? [i] : []);
       const most = Math.min(regs.length, TX_REGS), take = most ? await heavy(most) : 0, skip = new Set(regs.slice(take));
-      if (!skip.size) return seen(await ask({ method: 'POST', body, headers: fwd }));   // a peer's forward is not passed on again
+      if (!skip.size) {   // (a peer's forward is not passed on again)
+        const res = await ask({ method: 'POST', body, headers: fwd });
+        // a block the public had taken here: this colo's cached template for its payee, tip and height are stale now, so
+        // they go, and the miner's next ask gets a fresh template instead of the same one for another second or two
+        if (path === '/block' && !peer && res.ok) {
+          const b = unhex(body), payee = b && b.length >= 129 ? (b[125] | b[126] << 8 | b[127] << 16 | b[128] << 24) >>> 0 : null;
+          if (payee !== null) ctx.waitUntil(Promise.all([`/template/${payee}`, '/tip', '/height'].map(p => caches.default.delete(new Request(`${url.origin}/${CHAIN_VERSION}${p}`)))));
+        }
+        return seen(res);
+      }
       const kept = ls.flatMap((_, i) => skip.has(i) ? [] : [i]), wait = take < most ? 60 : 1;
       const why = `not taken, send it again: ${kept.length} of ${ls.length} lines taken (at most ${TX_REGS} registrations in one request` +
         (wait > 1 ? ', and this address has sent its registrations for the minute)' : ')');

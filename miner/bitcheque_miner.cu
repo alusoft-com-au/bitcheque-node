@@ -239,7 +239,7 @@ static void selftest() {
     printf("%-28s %s %s\n", "block 0 pow (processor)", gp.c_str(), gok ? "ok" : "MISMATCH");
     printf(ok ? "self-test passed\n" : "SELF-TEST FAILED\n"); exit(ok ? 0 : 1);
 }
-/// Fetch a template; false (with a message) if the node's cannot be mined for `to`.
+/// Fetch a template; false if the node gave none that can be mined for `to` (with a message), or the same one again.
 static bool fetch_template() {
     int st; std::string hex = http(g_host, g_port, "GET", "/template/" + std::to_string(g_to), "", st);
     while (!hex.empty() && (hex.back() == '\n' || hex.back() == '\r')) hex.pop_back();
@@ -256,6 +256,9 @@ static bool fetch_template() {
       while (!ph.empty() && (ph.back() == '\n' || ph.back() == '\r')) ph.pop_back();
       if (ps == 200 && unhex(ph, pb) && pb.size() >= 112) parent_time = le32(&pb[96]); }
     std::lock_guard<std::mutex> lk(g_mu);
+    // the same template again (a cache in front of the node, for a second or two after a block): not fresh, so the cards
+    // idle rather than do the same work and send the same block twice; the main thread asks again on its next poll
+    if (b == g_tpl.block) return false;
     g_tpl.block = b; g_tpl.height = le32(&b[0]); g_tpl.time = le32(&b[100]); g_tpl.bits = le32(&b[104]); g_tpl.parent_time = parent_time; g_tpl.generation++;
     return true;
 }
