@@ -61,6 +61,46 @@ fn reorg_and_persist() {
 }
 
 #[test]
+fn a_data_file_of_another_chain_is_set_aside() {
+    let p = params();
+    let (g, other) = (Chain::genesis(&p, now() - 100_000, b"store test"), Chain::genesis(&p, now() - 100_000, b"another chain"));
+    assert_ne!(g.header.hash(), other.header.hash());
+    let path = std::env::temp_dir().join(format!("bitcheque-old-{}.dat", std::process::id()));
+    let name = |s: &str| std::path::PathBuf::from(format!("{}{s}", path.display()));
+    let snap = path.with_extension("snap");
+    let (snap_old, snap_old2) = (std::path::PathBuf::from(format!("{}.old", snap.display())), std::path::PathBuf::from(format!("{}.old2", snap.display())));
+    for f in [&path, &snap, &snap_old, &snap_old2, &name(".old"), &name(".old2")] { let _ = std::fs::remove_file(f); }
+    // three blocks of one chain in the file, and a snapshot file (any bytes: it is this chain's too)
+    { let a = Node::new(Store::open(p.clone(), &g, Some(&path)).unwrap()); for _ in 0..3 { mine(&a, 0).unwrap(); } }
+    let len = std::fs::metadata(&path).unwrap().len();
+    assert!(len > 3 * 116);
+    std::fs::write(&snap, b"an old snapshot").unwrap();
+    // opened for another genesis: both are moved aside whole and a fresh file is started from block 0
+    let a = Node::new(Store::open(p.clone(), &other, Some(&path)).unwrap());
+    assert_eq!(a.height(), 0);
+    assert_eq!(std::fs::metadata(name(".old")).unwrap().len(), len);
+    assert_eq!(std::fs::read(&snap_old).unwrap(), b"an old snapshot");
+    assert!(!snap.exists());
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    let b1 = mine(&a, 0).unwrap();
+    assert_eq!(a.store.lock().unwrap().chain.blocks.get(1).map(|b| b.header.hash()), Some(b1.header.hash()), "block 1 is read back from the fresh file through its offset");
+    drop(a);
+    // the fresh file is this chain's: opened again it is kept and continued
+    let s = Store::open(p.clone(), &other, Some(&path)).unwrap();
+    assert_eq!(s.chain.height(), 1);
+    drop(s);
+    // a second file of another chain never goes over a first one set aside, not even one of which only the snapshot is left
+    std::fs::remove_file(name(".old")).unwrap();
+    std::fs::write(&snap, b"a second snapshot").unwrap();
+    let a = Node::new(Store::open(p.clone(), &g, Some(&path)).unwrap());
+    assert_eq!(a.height(), 0);
+    assert_eq!(std::fs::read(&snap_old).unwrap(), b"an old snapshot");
+    assert_eq!(std::fs::read(&snap_old2).unwrap(), b"a second snapshot");
+    assert!(name(".old2").exists());
+    for f in [&path, &snap, &snap_old, &snap_old2, &name(".old"), &name(".old2")] { let _ = std::fs::remove_file(f); }
+}
+
+#[test]
 fn proof_and_rpc() {
     let p = params();
     let g = Chain::genesis(&p, now() - 100_000, b"rpc test");

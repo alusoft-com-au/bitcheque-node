@@ -414,7 +414,15 @@ The edge nodes form a mesh among themselves: each pushes what it accepts to
 the other four and pulls only as a safety net (not while pushed blocks keep
 arriving). Their calls carry a shared secret and the chain version; a peer
 on another version (an old node after a reset) is neither pulled from nor
-pushed to, and without the secret nobody counts as a peer. A peer that
+pushed to, and without the secret nobody counts as a peer. A reset of the
+research network is a new chain version: the edge nodes forget their chains
+and start again from block 0, whose coinbase message names the version
+(`params::CHAIN_VERSION`, checked against the edge's by the tests and its
+build), so block 0 itself changes. A node left with the old chain's data
+file sets it aside (§13 `store`); one left running finds every upstream on
+another block 0, says so and hands out no template, so nothing mines the
+old chain through it; and the front worker relays nothing from a region
+still on the old version while it restarts, nor keeps it in its cache. A peer that
 times out is left alone for three minutes; one that sends a refused block,
 or claims a greater height but sends nothing that moves the chain, is not
 pulled from for ten. A fork is found by comparing block hashes, stepping
@@ -1220,7 +1228,9 @@ the RPC), `store` (blocks left in the data file and read by offset; at
 startup the file is scanned header by header and only blocks after the
 snapshot are read and checked; a torn last record is cut off, but a record
 length no block can have stops the node and moves the file aside to
-`<data>.corrupt` rather than cutting off every block after it; state
+`<data>.corrupt` rather than cutting off every block after it; a file whose
+blocks build on another genesis (an old chain, after a reset) is moved to
+`<data>.old` with its snapshots and a fresh one started; state
 snapshots every 1,000 blocks to disk and, on a node, one in memory every
 `max_reorg` blocks (as many kept as a reorg of `max_reorg` could need), so
 an ordinary reorg replays at most about 2 × `max_reorg` blocks; with no

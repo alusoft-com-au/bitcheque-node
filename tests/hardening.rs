@@ -133,8 +133,10 @@ fn a_data_file_from_another_genesis_is_reported() {
     let g2 = Chain::genesis(&p, now() - 100_000, b"two");
     let path = tmp("genesis");
     { let n = Node::new(Store::open(p.clone(), &g1, Some(&path)).unwrap()); mine(&n, 0).unwrap(); }
-    assert_eq!(Store::open(p.clone(), &g2, Some(&path)).unwrap().chain.height(), 0);   // warns on stderr, does not panic
-    let _ = std::fs::remove_file(&path);
+    assert_eq!(Store::open(p.clone(), &g2, Some(&path)).unwrap().chain.height(), 0);   // sets the file aside, does not panic
+    let old = format!("{}.old", path.display());
+    assert!(std::path::Path::new(&old).exists());
+    let _ = std::fs::remove_file(&path); let _ = std::fs::remove_file(&old);
 }
 
 fn frame(magic: &[u8; 4], kind: u8, payload: &[u8]) -> Vec<u8> { [&magic[..], &[kind], &(payload.len() as u32).to_le_bytes(), payload].concat() }

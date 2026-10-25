@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -68,6 +68,7 @@ const MEMPOOL_BYTES: usize = 64 << 20; // waiting transactions kept, in encoded 
 const HTTP_MAX: usize = 32 << 20;      // largest reply the HTTP client reads
 const HTTP_DEADLINE: Duration = Duration::from_secs(60);   // ...and the longest it waits for one, in all
 const UPSTREAM_QUEUE: usize = 1000;    // posts waiting for one upstream; past this the newest are dropped (the pull catches up)
+const OTHER_CHAIN: Duration = Duration::from_secs(3600);   // an upstream on another block 0 is left alone this long before it is asked again
 const UPSTREAM_BYTES: usize = 16 << 20; // ...and bytes waiting for it
 const UPSTREAM_LINES: usize = 64;      // transactions per POST /tx (what an RPC takes in one request),
 const UPSTREAM_REGS: usize = 16;       // ...registrations among them (an edge node refuses a whole post with more),
@@ -334,6 +335,7 @@ pub struct Node {
     pub mempool_text: Mutex<Option<((usize, [u8; 32]), String)>>,   // /mempool's reply for (mempool version, tip)
     params: Params,
     upstream: Mutex<Vec<(SyncSender<(&'static str, String)>, Arc<AtomicUsize>)>>,   // per upstream: (path, body) to POST to it, in order; bytes waiting
+    stranded: AtomicBool,   // every upstream serves another block 0 (a network reset this node was not restarted for): no template is handed out
     mempool_cap: AtomicUsize,
     tpl_cache: Mutex<Option<Tpl>>,
     own: Mutex<VecDeque<[u8; 32]>>,    // txids that came in through our own RPC, oldest first: offered again until mined (rebroadcast)
@@ -393,7 +395,7 @@ impl Node {
                         book: Mutex::new(BTreeMap::new()), book_path: Mutex::new(None), advertise: Mutex::new(None),
                         sync: Mutex::new(None), rpc_limit: Mutex::default(), top_cache: Mutex::new(None), proof_cache: Mutex::new(None),
                         next: Mutex::new(None), banned: Mutex::default(), strikes: Mutex::default(), bars: Mutex::default(), shunned: Mutex::default(), addr_sources: Mutex::default(), bad_txs: Mutex::default(),
-                        mempool_text: Mutex::new(None), params, upstream: Mutex::new(Vec::new()),
+                        mempool_text: Mutex::new(None), params, upstream: Mutex::new(Vec::new()), stranded: AtomicBool::new(false),
                         mempool_cap: AtomicUsize::new(MEMPOOL_BYTES), tpl_cache: Mutex::new(None), own: Mutex::default() })
     }
     /// Keep at most this many bytes of waiting transactions (the edge node, with 128 MB in all, keeps far fewer).
@@ -947,25 +949,52 @@ impl Node {
             }
         }
         let node = self.clone();
-        let r = spawn(move || loop {
-            // asked in parallel: one slow upstream does not hold up the round
-            let mut hs: Vec<(u32, &String)> = std::thread::scope(|sc| {
-                let asks: Vec<_> = ups.iter().filter_map(|up| std::thread::Builder::new().spawn_scoped(sc, move || (http(up, "GET", "/height", ""), up)).ok()).collect();
-                asks.into_iter().filter_map(|a| a.join().ok()).filter_map(|(r, up)| match r.map(|t| t.trim().parse::<u32>()) {
-                    Ok(Ok(h)) => Some((h, up)),
-                    Ok(Err(_)) => { eprintln!("upstream {up}: bad height"); None }
-                    Err(e) => { eprintln!("upstream {up}: {e}"); None }
-                }).collect()
-            });
-            hs.sort_by(|a, b| b.0.cmp(&a.0));
-            // the highest first; one that is behind, stuck or lying, and so brings nothing new, does not end the round
-            for (theirs, up) in hs {
-                if theirs <= node.height() { break; }
-                match node.pull_from(up, theirs) { Ok(true) => break, Ok(false) => {} Err(e) => eprintln!("upstream {up}: {e}") }
+        let r = spawn(move || {
+            // an upstream on another block 0 (another network; ours after a reset, while this node still holds the old
+            // chain) is left alone for OTHER_CHAIN; while every upstream is, this node is stranded on an old chain: it
+            // says so and hands out no template (template_paid), so nothing mines the old chain through it
+            let mut other: HashMap<String, Instant> = HashMap::new();
+            loop {
+                other.retain(|_, t| t.elapsed() < OTHER_CHAIN);
+                // asked in parallel: one slow upstream does not hold up the round
+                let mut hs: Vec<(u32, &String)> = std::thread::scope(|sc| {
+                    let asks: Vec<_> = ups.iter().filter(|up| !other.contains_key(*up)).filter_map(|up| std::thread::Builder::new().spawn_scoped(sc, move || (http(up, "GET", "/height", ""), up)).ok()).collect();
+                    asks.into_iter().filter_map(|a| a.join().ok()).filter_map(|(r, up)| match r.map(|t| t.trim().parse::<u32>()) {
+                        Ok(Ok(h)) => Some((h, up)),
+                        Ok(Err(_)) => { eprintln!("upstream {up}: bad height"); None }
+                        Err(e) => { eprintln!("upstream {up}: {e}"); None }
+                    }).collect()
+                });
+                hs.sort_by(|a, b| b.0.cmp(&a.0));
+                // the highest first; one that is behind, stuck or lying, and so brings nothing new, does not end the round.
+                // The highest one behind us (it ends the round), or one whose blocks do not join ours, is asked for its
+                // block 0: another chain's is left alone
+                for (theirs, up) in hs {
+                    if theirs <= node.height() { if node.other_chain(up) { other.insert(up.clone(), Instant::now()); } break; }
+                    match node.pull_from(up, theirs) {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(e) => { eprintln!("upstream {up}: {e}"); if e.contains("prev unknown") && node.other_chain(up) { other.insert(up.clone(), Instant::now()); } }
+                    }
+                }
+                let stranded = ups.iter().all(|u| other.contains_key(u));
+                if stranded && !node.stranded.swap(true, Ordering::Relaxed) { eprintln!("every upstream is on another chain (a network reset?): this node is left on an old one and hands out no template. Restart it with the current release"); }
+                if !stranded { node.stranded.store(false, Ordering::Relaxed); }
+                std::thread::sleep(every);
             }
-            std::thread::sleep(every);
         });
         if let Err(e) = r { eprintln!("follow: {e}"); }
+    }
+    /// Whether every upstream this node follows serves another block 0 (a network reset it was not restarted for).
+    pub fn stranded(&self) -> bool { self.stranded.load(Ordering::Relaxed) }
+    /// Whether `up` serves another block 0 than ours: another network, or ours reset while this node still holds the old
+    /// chain. One that cannot be asked, or answers badly, is not "other": it is just down.
+    fn other_chain(&self, up: &str) -> bool {
+        let Some(theirs) = http(up, "GET", "/block/0", "").ok().and_then(|r| crate::rpc::unhex(r.trim())).and_then(|r| Block::decode(&r).ok()) else { return false };
+        let ours = { let st = self.store.lock().unwrap(); if st.chain.base != 0 { return false; } st.chain.hashes[0] };
+        let other = theirs.header.hash() != ours;
+        if other { eprintln!("upstream {up} is on another chain (its block 0 is not ours): left alone for an hour"); }
+        other
     }
     /// Fetch the blocks `up` has above our tip, up to its height `theirs`, oldest first; on a fork, walk back (up to 200)
     /// to where we agree. True when our chain changed.
@@ -1175,6 +1204,7 @@ impl Node {
         let my = self.height();
         if self.peers.lock().unwrap().iter().any(|p| *p.height.lock().unwrap() > my.saturating_add(SYNC_AHEAD) && p.barred.lock().unwrap().map_or(true, |t| t < Instant::now())
             && p.delivered.lock().unwrap().is_some_and(|t| t.elapsed() < DELIVERING)) { return Err("syncing"); }
+        if self.stranded.load(Ordering::Relaxed) { return Err("every upstream is on another chain (a network reset?): restart this node with the current release"); }
         let st = self.store.lock().unwrap(); let c = &st.chain;
         let m = self.mempool.lock().unwrap();
         // for the same tip, mempool and second the transactions are chosen once, and a block is built once per payee

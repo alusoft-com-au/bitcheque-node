@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use bitcheque::block::{Block, Chain, HostBlocks};
 use bitcheque::net::{Node, NOW};
-use bitcheque::params::{Params, GENESIS_MESSAGE, LOCAL_TIME, TESTNET_TIME};
+use bitcheque::params::{genesis_message, Params, LOCAL_TIME, TESTNET_TIME};
 use bitcheque::store::Store;
 
 static mut IO: Vec<u8> = Vec::new();
@@ -60,7 +60,7 @@ pub extern "C" fn set_now(t: u32) { NOW.store(t, Ordering::Relaxed) }
 #[no_mangle]
 pub extern "C" fn open(net: u32, every: u32) -> u32 {
     let (p, t) = if net == 1 { (Params::local(), LOCAL_TIME) } else { (Params::testnet(), TESTNET_TIME) };
-    let g = Chain::genesis(&p, t, GENESIS_MESSAGE);
+    let g = Chain::genesis(&p, t, &genesis_message(&p));
     let raw = std::mem::take(io());
     let n = if raw.len() >= 4 { u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize } else { 0 };
     let (sn, headers) = if n > 0 && raw.len() >= 4 + n { (Some(&raw[4..4 + n]), &raw[4 + n..]) } else { (None, &raw[raw.len().min(4 + n)..]) };

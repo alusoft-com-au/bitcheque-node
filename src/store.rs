@@ -135,8 +135,20 @@ impl Store {
                 f.seek(SeekFrom::Start(off))?; f.read_exact(&mut buf)?;
                 if let Ok(b) = Block::decode(&buf) { let _ = s.accept_inner(&b, now, Some((off, len))); }
             }
+            // a file of another network or genesis (an old chain after a reset, say) is set aside whole, with its
+            // snapshots, and a fresh one started: nothing here builds on it, and its blocks would otherwise be scanned
+            // and refused at every start, with the new chain written after them
             if s.chain.height() == 0 && !recs.is_empty() && !recs.iter().any(|r| r.2.prev == genesis.header.hash()) {
-                eprintln!("warning: {} holds {} blocks, but none builds on this network's genesis block: it belongs to another network or genesis. Starting from block 0.", path.display(), recs.len());
+                drop(f);
+                let snap = s.snap_path();
+                let taken = |x: &str| PathBuf::from(format!("{}{x}", path.display())).exists() || snap.as_ref().is_some_and(|sn| PathBuf::from(format!("{}{x}", sn.display())).exists());
+                let mut suffix = ".old".to_string();
+                for k in 2.. { if !taken(&suffix) { break; } suffix = format!(".old{k}"); }
+                let aside = PathBuf::from(format!("{}{suffix}", path.display()));
+                std::fs::rename(path, &aside)?;
+                if let Some(sn) = &snap { let _ = std::fs::rename(sn, format!("{}{suffix}", sn.display())); }
+                s.file_len = 0; s.snaps.clear(); s.bad.clear(); s.bad_order.clear();
+                eprintln!("{} held {} blocks of another network or genesis (an old chain?): moved to {}. Starting from block 0.", path.display(), recs.len(), aside.display());
             }
             s.file = Some(OpenOptions::new().create(true).append(true).open(path)?);
         }

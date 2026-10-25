@@ -125,8 +125,17 @@ impl Params {
     }
 }
 
-// genesis blocks (Chain::genesis(params, time, GENESIS_MESSAGE)); shared by the node and the edge node
+// genesis blocks (Chain::genesis(params, time, &genesis_message(&params))); shared by the node and the edge node
 pub const GENESIS_MESSAGE: &[u8] = b"Bitcheque genesis. Message text and launch timestamp to be set (DESIGN.md 12.4).";
+/// The research network's chain version: how many times it has been reset. The edge nodes reset by naming a new one
+/// (edge/worker.js CHAIN_VERSION, the same number: tests/chain.rs and edge/build.sh check), and block 0 names it too
+/// (`genesis_message`), so every reset changes block 0: a node left with the old chain's data file sets it aside
+/// (store.rs), and one left running sees its upstreams on another block 0 (net.rs) instead of carrying the old chain on
+pub const CHAIN_VERSION: u32 = 12;
+/// Block 0's coinbase message: the research network's names its chain version; mainnet's and a local network's is fixed
+pub fn genesis_message(p: &Params) -> Vec<u8> {
+    if p.magic == TESTNET_MAGIC { format!("Bitcheque research network, chain {CHAIN_VERSION}").into_bytes() } else { GENESIS_MESSAGE.to_vec() }
+}
 pub const LAUNCH_TIME: u32 = 1_798_761_600; // placeholder: 2027-01-01 00:00 UTC (no block may precede it, §12.2)
 pub const TESTNET_TIME: u32 = 1792245600; // launch of the public research network, 2026-10-17 14:00 UTC
 pub const LOCAL_TIME: u32 = 1_790_000_000; // local devnet genesis, fixed so it never moves with the research network

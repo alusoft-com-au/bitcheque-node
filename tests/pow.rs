@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use bitcheque::block::{Chain, Header};
 use bitcheque::crypto::{hex, sha256};
 use bitcheque::net::Node;
-use bitcheque::params::{Params, GENESIS_MESSAGE, LAUNCH_TIME, TESTNET_TIME};
+use bitcheque::params::{genesis_message, Params, LAUNCH_TIME, TESTNET_TIME};
 use bitcheque::pow::{element, epoch, hash, indices, seed, Table, EPOCH, K, N, ROUNDS};
 use bitcheque::store::Store;
 use bitcheque::u256::U256;
@@ -181,9 +181,9 @@ fn floors_and_block_zero() {
     assert_eq!(Params::mainnet().easiest_target(), U256::one_shl(250), "block 0's target is the easiest any mainnet block may carry");
     assert_eq!(Params::local().easiest_target(), U256::from_compact(0x207F_FFFF));
     let t = Instant::now();
-    let g = Chain::genesis(&Params::testnet(), TESTNET_TIME, GENESIS_MESSAGE);
-    assert_eq!((g.header.height, g.header.nonce), (0, 174));
-    assert_eq!(Chain::genesis(&Params::mainnet(), LAUNCH_TIME, GENESIS_MESSAGE).header.nonce, 60);
+    let g = Chain::genesis(&Params::testnet(), TESTNET_TIME, &genesis_message(&Params::testnet()));
+    assert_eq!((g.header.height, g.header.nonce), (0, 25));
+    assert_eq!(Chain::genesis(&Params::mainnet(), LAUNCH_TIME, &genesis_message(&Params::mainnet())).header.nonce, 60);
     assert!(t.elapsed() < Duration::from_secs(30), "two block 0s took {:?}", t.elapsed());
     // a light verification is a few milliseconds (far more would mean the hash was changed by mistake)
     let t = Instant::now();

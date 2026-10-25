@@ -12,14 +12,16 @@ It is a separate program on purpose: the node stays dependency-free Rust, and th
 
 `--to` is the account number the reward goes to (0 burns it). A new template is taken when the node's tip moves and every
 20 seconds anyway. Each card checks three table elements against the processor's after building, and every block it finds
-is verified on the processor without the table before it is sent; a disagreement stops the miner, so a wrong kernel can
-never send a bad block. Past 2^32 nonces on one template a card moves the header's time on by a second (a block's time may
-run up to 12 minutes ahead of a node's clock).
+is verified on the processor without the table before it is sent; a table that disagrees stops the miner and a find the
+processor does not confirm is not sent, so a wrong kernel can never send a bad block. Past its share of a template's 2^32
+nonces a card moves the header's time on by a second and starts over (a block's time may run up to 12 minutes ahead of a
+node's clock), so a node is asked for a template a few times a minute, not once per share; while the chain is in stall
+relief (silent for over 14 minutes), when the header's time sets its target, the card takes a fresh template instead. A
+node that gives no template (busy, restarting, another chain) leaves the cards idle until it gives one: no work is redone.
 
 The table (2^26 elements of 512 chained SHA-256s) takes about six seconds to build on a card and is rebuilt every 1,024
 blocks. One GA100-class card (CMP 170HX) does 0.3-0.45 billion tries a second (these passive cards throttle when hot: keep
-air moving over them); the processor without the table does about 250 a second per core, with it a few million. A card's
-2^32 nonces last about 10 seconds; when its share is used up the miner takes a fresh template (the node stamps the time).
+air moving over them); the processor without the table does about 250 a second per core, with it a few million.
 
 Conventions a port must match bit for bit (see `tests/pow.rs` for the vectors): the block id is SHA-256d of the 112-byte
 header; the table seed is SHA-256("bitcheque table" ‖ epoch as u32 LE), epoch = height / 1024; element i is

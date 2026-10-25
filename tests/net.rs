@@ -148,3 +148,23 @@ fn a_follower_pulls_blocks_and_pushes_what_it_accepts() {
     for _ in 0..3 { mine(&a, 0).unwrap(); }
     wait(|| b.height() == 9);
 }
+
+/// A node left running through a network reset (its upstreams now serve another block 0): it pulls nothing from them
+/// (no 200-block walk back every round), says so, and hands out no template, so nothing mines the old chain through it.
+#[test]
+fn a_follower_stranded_on_another_chain_hands_out_no_template() {
+    let p = Params { initial_bits: 0x207F_FFFF, min_bits: 0x207F_FFFF, reg_pow_target: U256::MAX.shr(4), launch_blocks: 0, ..Params::mainnet() };
+    let now = bitcheque::net::now() - 100_000;
+    let old = Node::new(Store::open(p.clone(), &Chain::genesis(&p, now, b"the old chain"), None).unwrap());   // ours, on the old chain
+    let up = Node::new(Store::open(p.clone(), &Chain::genesis(&p, now, b"the new chain"), None).unwrap());    // the upstream, reset onto a new one
+    for _ in 0..3 { mine(&old, 0).unwrap(); }
+    let addr = up.serve_rpc("127.0.0.1:0").unwrap().to_string();
+    assert!(old.template(0).is_ok());
+    old.follow(vec![addr], Duration::from_millis(100));
+    wait(|| old.stranded());
+    assert_eq!(old.template(0), Err("every upstream is on another chain (a network reset?): restart this node with the current release"));
+    // the upstream grows past us: its blocks are another chain's, still not pulled
+    for _ in 0..5 { mine(&up, 0).unwrap(); }
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!((old.height(), old.stranded()), (3, true));
+}

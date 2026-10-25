@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Bitcheque block 0. Deterministic from the parameters in DESIGN.md §12.
 Run: python3 genesis.py            -> prints the header fields and hash (mainnet parameters)
-     python3 genesis.py --testnet  -> same with the research network's parameters
-The timestamp is the mainnet placeholder; the node's `bitcheque genesis` prints the live research network's block 0.
+     python3 genesis.py --testnet  -> the research network's block 0 (its message names the chain version, src/params.rs
+                                      CHAIN_VERSION, so every reset changes block 0), the same as the node's `bitcheque genesis`
 """
 import calendar, hashlib, struct, sys, time
 
-MESSAGE   = b"Bitcheque genesis. Message text and launch timestamp to be set (DESIGN.md 12.4)."
-TIMESTAMP = calendar.timegm(time.strptime("2027-01-01 00:00:00", "%Y-%m-%d %H:%M:%S"))  # placeholder launch time, UTC
+MESSAGE   = {"mainnet": b"Bitcheque genesis. Message text and launch timestamp to be set (DESIGN.md 12.4).",
+             "testnet": b"Bitcheque research network, chain 12"}
+TIMESTAMP = {"mainnet": calendar.timegm(time.strptime("2027-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")),  # placeholder launch time, UTC
+             "testnet": 1792245600}                                                                   # the research network's launch, 2026-10-17 14:00 UTC
 HEIGHT    = 0
 INITIAL_BITS = {"mainnet": 0x20040000, "testnet": 0x20040000}   # 2^250 targets (about 2^6 tries), compact form
 # the proof of work (DESIGN.md 1.1, src/pow.rs): a table of N elements per EPOCH blocks, K of them summed per try
@@ -47,19 +49,19 @@ def header(prev, txroot, stateroot, t, bits, nonce):
 def main():
     net = "testnet" if "--testnet" in sys.argv else "mainnet"
     bits = INITIAL_BITS[net]
-    cb = coinbase_tx(0, REWARD_PAYEE, MESSAGE)
+    cb = coinbase_tx(0, REWARD_PAYEE, MESSAGE[net])
     txroot = sha256d(b"\x00" + sha256d(cb))     # single-tx Merkle tree: the leaf, SHA256d(0 || txid)
     stateroot = bytes(32)                        # empty state
     prev = bytes(32)
     target = target_from_bits(bits)
     nonce = 0
     while True:
-        h = header(prev, txroot, stateroot, TIMESTAMP, bits, nonce)
+        h = header(prev, txroot, stateroot, TIMESTAMP[net], bits, nonce)
         hsh = sha256d(h)
         if int.from_bytes(pow_hash(hsh, HEIGHT), "little") < target: break
         nonce += 1
     print(f"network     {net}")
-    print(f"timestamp   {TIMESTAMP}")
+    print(f"timestamp   {TIMESTAMP[net]}")
     print(f"bits        {bits:#010x}")
     print(f"nonce       {nonce}")
     print(f"coinbase    {cb.hex()}")

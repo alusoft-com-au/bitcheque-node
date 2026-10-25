@@ -1,7 +1,8 @@
 // Bitcheque GPU miner (CUDA) for the table proof of work of DESIGN.md §1.1 / src/pow.rs. It holds the 2 GiB table of the
 // current epoch on every card and tries nonces (and, past 2^32 of them, the header's time) against templates from any
 // node's RPC, the same way `bitcheque mine` does: GET /template/<number>, GET /tip, POST /block. The cards share a
-// template's 2^32 nonces; a card that has used its share takes a fresh template (the node stamps a later time). A found
+// template's 2^32 nonces; a card that has used its share moves the header's time on by a second (while the chain is not
+// in stall relief, when only the node can stamp a time and target that agree; then it takes a fresh template). A found
 // block is checked on the processor, without the table, before it is sent. Nothing here is consensus: the node decides.
 //
 // Build: ./build.sh   (nvcc -O3 -std=c++17 -arch=sm_80; the CUDA toolkit and an NVIDIA driver, nothing else)
@@ -24,6 +25,9 @@
 // ---- the proof of work's constants (src/pow.rs) ----
 static const uint32_t N = 1u << 26, K = 32, ROUNDS = 512, EPOCH = 1024;
 static const uint32_t TEMPLATE_SECONDS = 20;   // a fresh template this often (new transactions, a fresh time)
+static const uint32_t RELIEF_S = 720 + 2 * 60;  // max_future_seconds + two block targets (src/params.rs): a header time past the latest recent
+                                               // block's by more may set its own target (stall relief, src/block.rs relieved_bits), so a card moves
+                                               // its time on its own only while it stays within RELIEF_S of the parent's
 static const uint32_t LAUNCH = 1u << 24;        // nonces per kernel launch (about 40 ms on one card)
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "cuda: %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(2); } } while (0)
@@ -213,7 +217,7 @@ static std::string http(const std::string& host, const std::string& port, const 
     status = atoi(reply.c_str() + 9);
     size_t at = reply.find("\r\n\r\n"); return at == std::string::npos ? "" : reply.substr(at + 4);
 }
-struct Template { std::vector<uint8_t> block; uint32_t height = 0, time = 0, bits = 0, generation = 0; };
+struct Template { std::vector<uint8_t> block; uint32_t height = 0, time = 0, bits = 0, parent_time = 0, generation = 0; };   // parent_time 0: unknown (no roll)
 static std::mutex g_mu; static Template g_tpl; static std::atomic<bool> g_stop{false};
 static std::string g_host, g_port; static uint32_t g_to = 0;
 
@@ -246,8 +250,13 @@ static bool fetch_template() {
     if (b[120] != 0 || le32(&b[125]) != g_to) { fprintf(stderr, "the node's template pays someone else: use another node\n"); exit(1); }
     uint32_t t[8], easiest[8]; target_limbs(le32(&b[104]), t); target_limbs(0x207FFFFF, easiest);
     if (target_gt(t, easiest)) { fprintf(stderr, "the node's template asks for less work than any block may have: use another node\n"); exit(1); }
+    // the parent's time (the latest recent block's is at least it): how far a card may move the header's time on its own
+    uint32_t parent_time = 0;
+    { int ps; std::string ph = http(g_host, g_port, "GET", "/block/" + std::to_string(le32(&b[0]) - 1), "", ps); std::vector<uint8_t> pb;
+      while (!ph.empty() && (ph.back() == '\n' || ph.back() == '\r')) ph.pop_back();
+      if (ps == 200 && unhex(ph, pb) && pb.size() >= 112) parent_time = le32(&pb[96]); }
     std::lock_guard<std::mutex> lk(g_mu);
-    g_tpl.block = b; g_tpl.height = le32(&b[0]); g_tpl.time = le32(&b[100]); g_tpl.bits = le32(&b[104]); g_tpl.generation++;
+    g_tpl.block = b; g_tpl.height = le32(&b[0]); g_tpl.time = le32(&b[100]); g_tpl.bits = le32(&b[104]); g_tpl.parent_time = parent_time; g_tpl.generation++;
     return true;
 }
 static std::string tip() { int st; std::string s = http(g_host, g_port, "GET", "/tip", "", st); while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back(); return st == 200 ? s : ""; }
@@ -261,10 +270,12 @@ static void device_loop(int dev, uint32_t ordinal, uint32_t ndev, std::atomic<ui
     uint4* table; CK(cudaMalloc(&table, (size_t)N * 32));
     uint32_t *found, *dseed; CK(cudaMalloc(&found, 8)); CK(cudaMalloc(&dseed, 32));
     uint32_t table_epoch = 0xFFFFFFFFu, gen = 0;
-    const uint32_t share = (uint32_t)((1ull << 32) / ndev), first = ordinal * share;   // this card's nonces of every template
-    Template tpl; uint32_t nonce = 0;
+    const uint64_t share = (1ull << 32) / ndev; const uint32_t first = (uint32_t)(ordinal * share);   // this card's nonces of every template (all 2^32 for one card)
+    Template tpl; uint32_t nonce = 0; uint64_t done = 0;   // nonces tried at this header time
+    // no fresh template from the node: this one is dropped, and the card idles until the main thread's next (never the same work twice)
+    auto fresh = [&] { if (!fetch_template()) tpl.block.clear(); };
     while (!g_stop) {
-        { std::lock_guard<std::mutex> lk(g_mu); if (g_tpl.generation != gen) { tpl = g_tpl; gen = tpl.generation; nonce = first; } }
+        { std::lock_guard<std::mutex> lk(g_mu); if (g_tpl.generation != gen) { tpl = g_tpl; gen = tpl.generation; nonce = first; done = 0; } }
         if (tpl.block.empty()) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
         uint32_t epoch = tpl.height / EPOCH;
         if (epoch != table_epoch) {
@@ -282,10 +293,15 @@ static void device_loop(int dev, uint32_t ordinal, uint32_t ndev, std::atomic<ui
           for (int k = 0; k < 12; k++) job.tail[k] = be32(&tpl.block[64 + 4 * k]); target_limbs(tpl.bits, job.target); }
         CK(cudaMemcpyToSymbol(JOB, &job, sizeof job));
         const uint32_t none[2] = {0xFFFFFFFFu, 0};
-        // this card's share of the template's nonces, LAUNCH at a time; when it is used up, a fresh template
+        // this card's share of the template's nonces, LAUNCH at a time, until the main thread takes a fresh template
         while (!g_stop) {
             { std::lock_guard<std::mutex> lk(g_mu); if (g_tpl.generation != gen) break; }
-            if (nonce - first >= share) { fetch_template(); break; }
+            if (done >= share) {
+                // this card's nonces are used up: the next second of the same template (a block's time may run twelve minutes
+                // ahead of the node's clock), unless that second could set its own target (stall relief): then a fresh template
+                if (tpl.parent_time && tpl.time + 1 <= tpl.parent_time + RELIEF_S) { tpl.time++; nonce = first; done = 0; }
+                else { fresh(); break; }
+            }
             CK(cudaMemcpy(found, none, 8, cudaMemcpyHostToDevice));
             mine<<<LAUNCH / 256, 256>>>(nonce, tpl.time, table, found); CK(cudaDeviceSynchronize());
             tries->fetch_add(LAUNCH);
@@ -300,11 +316,11 @@ static void device_loop(int dev, uint32_t ordinal, uint32_t ndev, std::atomic<ui
                     if (st == 200 && r == "accepted") fprintf(stderr, "GPU %d: mined block %u (nonce %u)\n", dev, tpl.height, got[0]);
                     else if (st == 200) fprintf(stderr, "GPU %d: block %u found, but another came first (%s)\n", dev, tpl.height, r.c_str());
                     else fprintf(stderr, "GPU %d: block %u refused: %s\n", dev, tpl.height, st == 0 ? "no answer" : r.c_str());
-                    fetch_template();   // a fresh template either way (the tip moved, or this one is no good)
+                    fresh();   // a fresh template either way (the tip moved, or this one is no good)
                     break;
                 }
             }
-            nonce += LAUNCH;
+            nonce += LAUNCH; done += LAUNCH;
         }
     }
 }

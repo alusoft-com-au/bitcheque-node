@@ -30,7 +30,7 @@
 //!   zero cheque on the next number so the earlier one can never complete (DESIGN.md §10.13).
 //!   The RPC is plain HTTP: anyone on the path can withhold or forge replies (never forge a cheque). Use --rpc A --rpc B with
 //!   nodes reached over different paths.
-use bitcheque::{block::Chain, crypto::hex, net::Node, params::{Params, GENESIS_MESSAGE as MESSAGE, LAUNCH_TIME, LOCAL_TIME, TESTNET_TIME}, rpc::unhex, store::Store,
+use bitcheque::{block::Chain, crypto::hex, net::Node, params::{Params, genesis_message, LAUNCH_TIME, LOCAL_TIME, TESTNET_TIME}, rpc::unhex, store::Store,
                 u256::U256};
 mod cli_wallet;
 
@@ -41,7 +41,7 @@ fn main() {
     let local = args.iter().any(|a| a == "--local");
     let testnet = !local && !args.iter().any(|a| a == "--mainnet");
     let p = if local { Params::local() } else if testnet { Params::testnet() } else { Params::mainnet() };
-    let g = Chain::genesis(&p, if local { LOCAL_TIME } else if testnet { TESTNET_TIME } else { LAUNCH_TIME }, MESSAGE);
+    let g = Chain::genesis(&p, if local { LOCAL_TIME } else if testnet { TESTNET_TIME } else { LAUNCH_TIME }, &genesis_message(&p));
     let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1).cloned());
     match args.get(1).map(String::as_str) {
         Some("genesis") => {

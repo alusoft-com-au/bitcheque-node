@@ -252,3 +252,17 @@ fn launch_year_is_ten_percent() {
     assert_eq!((p.next_halving(1), p.next_halving(525_000 + 2_100_000)), (525_000 + 2_100_001, 525_000 + 2_100_001));
     assert_eq!(p.next_halving(525_000 + 2_100_001), 525_000 + 4_200_001);
 }
+
+/// The chain version the edge nodes reset by (edge/worker.js CHAIN_VERSION) is the one block 0 of the research network
+/// names, so a reset is a change of block 0: nodes with the old chain tell it apart (store.rs, net.rs).
+#[test]
+fn the_edge_names_the_chain_version_block_0_carries() {
+    use bitcheque::params::{genesis_message, CHAIN_VERSION, TESTNET_TIME};
+    let js = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/edge/worker.js")).unwrap();
+    let edge = js.lines().find_map(|l| l.strip_prefix("const CHAIN_VERSION = '")?.split('\'').next()).expect("edge/worker.js names its CHAIN_VERSION");
+    assert_eq!(edge, CHAIN_VERSION.to_string());
+    let g = Chain::genesis(&Params::testnet(), TESTNET_TIME, &genesis_message(&Params::testnet()));
+    let want = format!("Bitcheque research network, chain {CHAIN_VERSION}");
+    assert!(matches!(&g.txs[0], bitcheque::tx::Tx::Coinbase { message, .. } if *message == want.as_bytes()), "block 0's message names the chain version");
+    assert_ne!(genesis_message(&Params::mainnet()), genesis_message(&Params::testnet()));
+}

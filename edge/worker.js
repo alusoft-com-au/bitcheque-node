@@ -31,7 +31,7 @@ const MINE_MS = 4000;            // at most this long per wake (the floor is ~2^
                                  // table, src/pow.rs: about two seconds here)
 const MINE_TRIES = 50;           // nonces per call into the wasm, between clock checks (~0.3 s)
 const RETRY_MS = 10_000;         // a quiet wake that mined nothing tries again after this, not after SYNC_MS
-const CHAIN_VERSION = '12';        // bump to reset the network: each region forgets its chain and starts from block 0
+const CHAIN_VERSION = '12';        // bump, with params::CHAIN_VERSION (block 0 names it: tests/chain.rs and build.sh check they agree), to reset the network: each region forgets its chain and starts from block 0
 const FALLBACK_S = 120;          // each further region in MINE_REGIONS waits this much longer (if the first is down)
 const RERELAY_MAX = 50;          // waiting transactions offered again to each other region per wake
 const RERELAY_TIMES = 2;         // ...each only if the public sent it here, after it waited a wake, and at most this often
@@ -501,6 +501,11 @@ export default {
     const stub = env.NODE.get(env.NODE.idFromName(region), { locationHint: R[region] });
     // a reply from the Durable Object, its X-Edge-Height (for the cache below) taken off
     const seen = res => { const out = new Response(res.body, res); out.headers.delete('X-Edge-Height'); return out; };
+    // a Durable Object still on another chain version (it restarts onto new code moments after this worker does, and names
+    // its version on every reply) is not relayed to the public: a miner or wallet would take the old chain for the new one,
+    // and nothing of it may enter the cache. Peers are answered by the object itself (409)
+    const ask = async init => { const r = await stub.fetch(inner, init); const c = r.headers.get('X-Edge-Chain');
+      return peer || c === null || c === CHAIN_VERSION ? r : text(`this node is moving to chain ${CHAIN_VERSION}: try again in a moment`, 503, { 'Retry-After': '10' }); };
     const inner = new URL(path + `?region=${region}`, 'https://edge');
     if (req.method === 'POST') {
       if (await limited()) return busy();
@@ -514,13 +519,13 @@ export default {
       // of 64 (1,920 transactions) without registrations, or two carrying 28 (the chain itself takes far fewer)
       const ls = !peer && path === '/tx' ? linesOf(body) : [], regs = ls.flatMap((l, i) => isReg(l) ? [i] : []);
       const most = Math.min(regs.length, TX_REGS), take = most ? await heavy(most) : 0, skip = new Set(regs.slice(take));
-      if (!skip.size) return seen(await stub.fetch(inner, { method: 'POST', body, headers: fwd }));   // a peer's forward is not passed on again
+      if (!skip.size) return seen(await ask({ method: 'POST', body, headers: fwd }));   // a peer's forward is not passed on again
       const kept = ls.flatMap((_, i) => skip.has(i) ? [] : [i]), wait = take < most ? 60 : 1;
       const why = `not taken, send it again: ${kept.length} of ${ls.length} lines taken (at most ${TX_REGS} registrations in one request` +
         (wait > 1 ? ', and this address has sent its registrations for the minute)' : ')');
       const extra = { 'Retry-After': String(wait), 'X-Edge-Taken': String(kept.length) };
       if (!kept.length) return text(merge(ls, [], '', why), 429, extra);
-      const res = await stub.fetch(inner, { method: 'POST', body: kept.map(i => ls[i]).join('\n'), headers: fwd }), reply = await res.text();
+      const res = await ask({ method: 'POST', body: kept.map(i => ls[i]).join('\n'), headers: fwd }), reply = await res.text();
       // a refusal of the whole request (edge full, a bad line in a batch) stands as it is
       if (res.status >= 500 || res.status !== 200 && kept.length > 1) return seen(new Response(reply, res));
       return text(merge(ls, kept, reply, why), 429, extra);
@@ -528,13 +533,15 @@ export default {
     // GET and HEAD share the cache (HEAD answers with the headers only)
     const head = r => req.method === 'HEAD' ? new Response(null, r) : r;
     // peers skip the cache: after a reorg a cached /block/<h> would be the abandoned one for a few seconds. /edge differs
-    // for peers and the public, and a wallet asks /queued right before it signs: never cached
-    const fresh = FRESH.has(path.split('/')[1]), cache = caches.default, ck = new Request(url.origin + path);
+    // for peers and the public, and a wallet asks /queued right before it signs: never cached. The key carries the chain
+    // version (and `ask` relays no reply of another), so a reset never serves a reply of the old chain, not even for the
+    // few seconds one is kept
+    const fresh = FRESH.has(path.split('/')[1]), cache = caches.default, ck = new Request(`${url.origin}/${CHAIN_VERSION}${path}`);
     const cached = !peer && path !== '/edge' && !path.startsWith('/queued/');
     const hit = cached ? await cache.match(ck) : null;
     if (hit) return head(hit);
     if (await limited()) return busy();
-    const res = await stub.fetch(inner, { headers: fwd }), out = seen(res), h = +(res.headers.get('X-Edge-Height') ?? NaN);
+    const res = await ask({ headers: fwd }), out = seen(res), h = +(res.headers.get('X-Edge-Height') ?? NaN);
     // a refusal (400: no account...) is kept briefly too, so asking again and again costs nothing; but not "no such block"
     // for one above the region's height (as it answered just now): that one is due within minutes, and is not kept at all
     const soon = res.status === 400 && +(path.match(/^\/(?:block|summary)\/(\d+)$/)?.[1] ?? -1) > (Number.isFinite(h) ? h : -1);
