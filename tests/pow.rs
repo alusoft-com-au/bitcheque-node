@@ -1,4 +1,4 @@
-//! The table proof of work (DESIGN.md §1.1, src/pow.rs): vectors shared with the Python cross-check and the CUDA miner,
+//! The table proof of work (DESIGN.md §1.1, src/pow.rs): vectors shared with the Python cross-check and bitcheque-miner,
 //! the header's height rule, the epoch boundary, what a lying or workless header costs its sender, and the floors.
 mod common;
 use std::io::{Read, Write};
@@ -30,7 +30,7 @@ fn mine_with_wrong_table(h: &mut Header, wrong: u32) {
     }
 }
 
-/// The values genesis.py computes with its own code (and the CUDA miner's self-test checks on the card).
+/// The values genesis.py computes with its own code (and bitcheque-miner's self-test checks on every card).
 #[test]
 fn vectors_match_the_python_cross_check() {
     assert_eq!((N, K, ROUNDS, EPOCH), (1 << 26, 32, 512, 1024));

@@ -114,10 +114,10 @@ design, but it is bound by memory bandwidth, which graphics cards have most of
   table (about 170 tries a second in WebAssembly, 4 s a wake: a floor block in
   most wakes); mainnet's about 2^20 (§12.1).
 - Miners: `bitcheque mine` builds the table on every core (`--light` does
-  without it) and `miner/` is a CUDA miner for NVIDIA cards, kept outside the
-  dependency-free crate. `genesis.py` recomputes block 0 and its proof-of-work
-  hash independently, and the CUDA miner's self-test checks the same vectors
-  (`tests/pow.rs`) on the card.
+  without it); bitcheque-miner, a separate program built on this crate, mines
+  on graphics cards through OpenCL (or on the processor) and checks the same
+  vectors (`tests/pow.rs`) on every card in its self-test. `genesis.py`
+  recomputes block 0 and its proof-of-work hash independently.
 - Consequences: merge-mining with Bitcoin is impossible (§8 item 1). A card
   arriving at a floor-difficulty chain mines a burst of blocks until the LWMA
   window (60 blocks) is full of hard targets, as any large hashrate always did
@@ -1255,8 +1255,8 @@ account from one Merkle tree built per tip, so a proof costs microseconds
 rather than a hash per account), `wallet` (§4.2
 derivation, registration mining, non-consensus), `main` (`bitcheque
 genesis | node | mine | wallet`; `mine` builds the proof of work's table on
-every core, or runs without it with `--light`). `miner/` is a CUDA miner for
-NVIDIA cards, outside the crate (it needs the CUDA toolkit), speaking the
+every core, or runs without it with `--light`). The graphics-card miner is
+the separate bitcheque-miner repository, built on this crate and speaking the
 same RPC. Tests: `tests/chain.rs` (life of the chain), `tests/pow.rs` (the
 proof of work: vectors, the height rule, the epoch boundary, strikes),
 `tests/net.rs` (sync and relay), `tests/store.rs` (reorg, persistence,

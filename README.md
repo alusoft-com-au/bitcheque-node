@@ -12,8 +12,9 @@ hand-copied cheques printed offline from a hash-based cheque book (256 cheques o
   HTTP: anyone between you and the node can withhold or forge replies (never a cheque), so give it two nodes reached
   over different paths (`--rpc A,B`). If a send fails part way, run the same command again, or `wallet void`.
 - `bitcheque mine --rpc ADDR --to NUMBER` mines on the processor (it builds the proof of work's 2 GiB table on every
-  core; `--light` does without it); `miner/` is a CUDA miner for NVIDIA cards (`miner/build.sh`, needs the CUDA
-  toolkit; the node itself stays dependency-free). See `DESIGN.md` §1.1.
+  core; `--light` does without it). The miner for graphics cards is its own program,
+  [bitcheque-miner](https://github.com/alusoft-com-au/bitcheque-miner): one binary that mines on any card through
+  OpenCL, or on the processor, built on this crate for the rules. See `DESIGN.md` §1.1.
 - `tests/`: `cargo test --release` (debug builds hash slowly).
 - `wallet-wasm/`: the same Rust book and registration code compiled to WebAssembly for the website:
   `cd wallet-wasm && cargo build --release --target wasm32-unknown-unknown`.
